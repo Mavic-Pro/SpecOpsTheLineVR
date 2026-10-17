@@ -105,8 +105,8 @@ back to the previous version (it also turns automatic updates off).
 
 ## Gunstock
 
-Hold the stock as when aiming, look along it at something far away and hold
-**B + Y** for one second. The angle between the stock and the controller is
+Aim the stock at something far away, looking at it through the sights in the
+middle of your view, and hold **B + Y** for one second. The angle between the stock and the controller is
 measured, applied and saved (`aimpitch` in `specopsvr.ini`). Repeat if you
 move the controllers on the stock.
 

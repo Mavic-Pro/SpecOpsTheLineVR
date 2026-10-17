@@ -450,6 +450,12 @@ void Execute(const std::string& line) {
     } else if (cmd == "aimpitch") {
         float v = 0.0f;
         in >> v;
+        // Oltre +-45 gradi: valore della calibrazione sbagliata della 0.9.3
+        // (anche -67/-96): si torna a 0.
+        if (v < -45.0f || v > 45.0f) {
+            vr::log::Line("CONFIG: aimpitch " + std::to_string(v) + " out of range (bad 0.9.3 calibration), using 0.");
+            v = 0.0f;
+        }
         g_aimPitchOffsetDeg = v;
     } else if (cmd == "synthaim") {
         float y = 0.0f, p = 0.0f;

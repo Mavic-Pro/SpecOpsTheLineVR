@@ -234,9 +234,11 @@ Useful offsets (`ue3.py props`):
 ## Gunstock calibration
 
 B + Y held for 1 s (buttons not passed to the game while both are held):
-with the stock held as when aiming, the line from the headset to the right
-controller is the real aiming direction; `aimpitch` = its pitch minus the
-controller's pitch, applied at once and written to `specopsvr.ini`.
+the stock is aimed at a distant target looked at in the middle of the view, so
+the head direction is the real aiming direction; `aimpitch` = head pitch
+minus controller pitch, applied at once and written to `specopsvr.ini`
+(results beyond +-45 degrees are rejected). 0.9.3 used the eye-to-controller
+line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
 
 ## Diagnostics added in 0.9.3
 

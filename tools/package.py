@@ -145,8 +145,8 @@ CONTROLS (Touch controllers, shown to the game as an Xbox pad)
   You aim with the gun in your right hand: shots leave the barrel and land
   on the green marker. Put your left hand on the barrel to aim two-handed.
   Bring the gun up to your eye to aim down the sights.
-  Gunstock users: hold the stock as when aiming, look along it at something
-  far away and hold B + Y for 1 second (calibrates the gun angle).
+  Gunstock users: aim the stock at something far away, looking at it in the
+  middle of your view, and hold B + Y for 1 second (calibrates the gun angle).
 
 GESTURES
   Grenade: quick forward throw with the left hand.

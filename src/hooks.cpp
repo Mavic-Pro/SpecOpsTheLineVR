@@ -2502,19 +2502,24 @@ void UpdateHeadTracking() {
         if (ri != vr::k_unTrackedDeviceIndexInvalid && ri < vr::k_unMaxTrackedDeviceCount && handPoses[ri].bPoseIsValid) {
             const vr::HmdMatrix34_t& c = handPoses[ri].mDeviceToAbsoluteTracking;
             if (vr::control::g_stockCalibRequest.exchange(false)) {
-                // Calcio in posizione di mira: la direzione vera e' la linea
-                // dall'occhio (centro del visore) al controller; l'inclinazione
-                // da aggiungere e' la differenza col beccheggio del controller.
+                // Calcio in posizione di mira, bersaglio lontano guardato al
+                // centro della vista: la direzione vera di mira e' quella della
+                // testa. (La linea occhio-controller non va: sul calcio la mano
+                // sta all'impugnatura, ~25 cm sotto l'occhio; dava -67 gradi.)
                 float d[3] = {c.m[0][3] - pos[0], c.m[1][3] - pos[1], c.m[2][3] - pos[2]};
-                float horiz = std::sqrt(d[0] * d[0] + d[2] * d[2]);
-                float dist = std::sqrt(horiz * horiz + d[1] * d[1]);
+                float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
                 if (dist > 0.15f) {
-                    float linePitch = std::atan2(d[1], horiz) * 57.2957795f;
+                    float linePitch = hmdPitch * 57.2957795f;
                     float ctrlPitch = PitchFromOpenVrPose(c) * 57.2957795f;
                     float offset = std::round((linePitch - ctrlPitch) * 2.0f) / 2.0f;
+                    if (offset < -45.0f || offset > 45.0f) {
+                        vr::log::Line("STOCK: calibration out of range (" + std::to_string(offset) +
+                                      " deg), ignored: look at the target along the stock and try again.");
+                        offset = vr::control::g_aimPitchOffsetDeg;
+                    }
                     vr::control::g_aimPitchOffsetDeg = offset;
                     char b[200];
-                    snprintf(b, sizeof(b), "STOCK: calibrated, eye-to-controller %.1f deg, controller %.1f deg -> aimpitch %.1f",
+                    snprintf(b, sizeof(b), "STOCK: calibrated, head %.1f deg, controller %.1f deg -> aimpitch %.1f",
                              linePitch, ctrlPitch, offset);
                     vr::log::Line(b);
                     char val[32];
