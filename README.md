@@ -2,30 +2,45 @@
 
 An unofficial **full VR mod for Spec Ops: The Line** (2012, Unreal Engine 3,
 Direct3D 9): stereoscopic 6DOF first person, motion-controller aiming with
-Walker's own arms, gestures, and cutscenes on a virtual cinema screen.
+Walker's own arms, VR cover, gestures, external haptics, and cutscenes on a
+virtual cinema screen.
 
 > Status: **beta**. The whole campaign loads and plays; please report bugs
 > (see [Reporting bugs](#reporting-bugs)).
 
 ## Features
 
-- **Stereoscopic 3D** at the headset's resolution and field of view, synchronous
-  stereo (both eyes rendered from the same game tick).
+- **Stereoscopic 3D** at the headset's resolution, field of view and IPD,
+  synchronous stereo (both eyes rendered from the same game tick). Every frame
+  is sent to SteamVR with the head pose it was rendered with, so the headset's
+  reprojection stays stable when you move your head.
 - **6DOF head tracking**: look, lean, crouch and side-step; the head stops at
-  walls instead of clipping through them.
+  walls instead of clipping through them. Crouching and popping up from cover
+  are smoothed.
 - **First person** with Walker's body: his arms follow your controllers
   (inverse kinematics on the game's own skeleton), the gun stays in his hand,
-  the body follows you and stays opaque.
-- **Aim with the gun**: shots leave the barrel of the gun you hold and land on
-  the green marker. Two-handed aiming when your left hand is on the barrel.
+  and the body turns with you when you turn around.
+- **Aim with the gun**: shots, rockets and grenade-launcher rounds leave the
+  barrel of the gun you hold and land on the green marker (verified for every
+  campaign weapon, within 0.15 degrees). Two-handed aiming with the left hand
+  on the barrel. **Aim down the sights** by bringing the gun to your eye.
   Gamepad aim assist is disabled while aiming by hand.
-- **Gestures**: throw grenades, reload by pulling the magazine, duck into
-  cover, grab the next weapon from your shoulder.
-- **Virtual cinema screen** for cutscenes, menus and loading screens.
+- **Gunstock support**: one-button calibration of the gun angle.
+- **VR cover**: the world does not spin when Walker takes cover; lean out
+  with your body to pop out and aim.
+- **Mounted guns and the helicopter minigun** aim with your controller.
+- **Squad orders** target the enemy you point your gun at.
+- **Gestures**: throw grenades, punch (melee), reload by pulling the magazine,
+  duck into cover, grab the next weapon from your shoulder.
+- **Haptics**: controller rumble on the gun hand, **ProTubeVR**
+  (ForceTube / ProVolver) recoil and **bHaptics** vest and sleeves.
+- **Virtual cinema screen** for videos, menus and loading screens; scripted
+  in-engine scenes stay in 3D.
 - **Comfort options**: smooth or snap turning, vignette, recentering.
 - **Sniper scopes** zoom like in the game.
 - Fast GPU-to-GPU frame copy (D3D9Ex shared surfaces to Direct3D 11 / OpenVR).
-- **Automatic updates** from the GitHub releases.
+- **Automatic updates** from the GitHub releases (stable or beta channel,
+  withdrawn versions replaced automatically, `rollback.bat`).
 - Detailed **logs and crash dumps** for bug reports.
 
 ## Requirements
@@ -34,7 +49,7 @@ Walker's own arms, gestures, and cutscenes on a virtual cinema screen.
 - *Spec Ops: The Line* (Steam version; the mod checks the executable and stays
   inactive on unsupported versions).
 - SteamVR and a SteamVR headset with two motion controllers. Developed and
-  tested with a Meta Quest 3 over Link.
+  tested with a Meta Quest 3 over Link; Virtual Desktop works too.
 
 ## Install
 
@@ -52,6 +67,15 @@ Walker's own arms, gestures, and cutscenes on a virtual cinema screen.
 The game files are never modified: the mod only adds `d3d9.dll` and
 `openvr_api.dll` next to `SpecOpsTheLine.exe`. `uninstall.bat` removes them.
 
+## Updates
+
+The mod checks GitHub at start-up and installs new versions for the next
+launch. New versions can first come out as test builds (GitHub
+pre-releases): add `updatechannel beta` to `specopsvr.ini` to get them too.
+If an update causes problems, close the game and run `rollback.bat` to go
+back to the previous version (it also turns automatic updates off).
+`autoupdate off` disables updates.
+
 ## Controls
 
 | Input | Action |
@@ -60,26 +84,53 @@ The game files are never modified: the mod only adds `d3d9.dll` and
 | Right stick | Turn (smooth or snap) |
 | Right trigger / left trigger | Fire / aim |
 | Left grip | Grenade (hold: trajectory, release: throw) |
-| Right grip | Squad orders |
+| Right grip (hold, point the gun at an enemy, release) | Squad attack order |
 | A / B / X / Y | Action-cover / melee / reload / next weapon |
+| B + Y held for 1 s | Gunstock calibration |
 | Left menu button | Pause |
 | Right stick held + direction | D-pad (secondary fire, grenade type) |
 | Both sticks held for 1 s | Recenter (stand straight and look ahead) |
 
 | Gesture | Action |
 |---|---|
-| Quick forward throw with the left hand | Grenade |
+| Overhand throw with the left hand | Grenade (flies where you throw) |
+| Straight punch with the left hand (chest height) | Melee |
 | Left hand on the magazine, then pull down | Reload |
 | Duck quickly next to cover | Take cover |
+| Lean out sideways (or stand up) while in cover | Pop out and aim |
+| Gun up to your eye | Aim down the sights |
 | Right hand over the right shoulder + grip | Next weapon |
 | Left hand on the barrel | Two-handed aiming |
+| Turn your head past 45 degrees | Walker turns with you |
+
+## Gunstock
+
+Hold the stock as when aiming, look along it at something far away and hold
+**B + Y** for one second. The angle between the stock and the controller is
+measured, applied and saved (`aimpitch` in `specopsvr.ini`). Repeat if you
+move the controllers on the stock.
+
+## Haptic devices (optional)
+
+- **ProTubeVR ForceTube / ProVolver**: copy `ForceTubeVR_API_x32.dll` (from
+  the ProTubeVR software/SDK) next to `SpecOpsTheLine.exe`, pair the device,
+  start the game. Recoil on every shot, scaled by weapon.
+- **bHaptics** vest and arm sleeves: start the bHaptics Player before the
+  game. Recoil on the arms, hits taken on the vest, grenade / melee / reload
+  on the left arm.
+
+Both are off automatically when no device is found; `protube off` /
+`bhaptics off` in `specopsvr.ini` disable them.
 
 ## Configuration
 
 `specopsvr.ini` in the game's `Binaries\Win32` folder; every option is
-documented in the file (aiming, arms, comfort, cinema screen, performance,
-updates). The same commands can be sent while the game runs by writing them
-to `specopsvr_cmd.txt` in the same folder.
+documented in the file (aiming, arms, cover, comfort, cinema screen, haptics,
+performance, updates). The same commands can be sent while the game runs by
+writing them to `specopsvr_cmd.txt` in the same folder. If something looks
+wrong, most features can be switched off one by one (`submitpose off`,
+`ads off`, `coverpeek off`, `coversnap off`, `turretaim stick`,
+`cinemawalker screen`, `gesture melee off`).
 
 ## Reporting bugs
 
@@ -99,6 +150,7 @@ Requirements: Visual Studio 2022 (C++ desktop workload, 32-bit toolset), CMake
 cmake -S . -B build -A Win32
 cmake --build build --config Release
 python tools/package.py        # dist/SpecOpsTheLineVR.zip
+python tools/regress.py        # release gate (runs the game, no headset needed)
 ```
 
 How it works, the reverse-engineered engine addresses and the test tools are
@@ -109,6 +161,8 @@ described in [docs/TECHNICAL.md](docs/TECHNICAL.md).
 - [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-Clause) and the
   [OpenVR SDK](https://github.com/ValveSoftware/openvr) (BSD 3-Clause) are
   included under `vendor/`.
+- ProTubeVR and bHaptics integrations follow the public APIs of those
+  devices; their software is not included.
 - Spec Ops: The Line is © 2K Games / Yager. This project is not affiliated
   with them and ships no game files.
 - Released under the MIT License (see [LICENSE](LICENSE)).

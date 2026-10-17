@@ -3914,9 +3914,15 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
             float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
             bool ads = vr::control::g_adsActive;
             bool behind = along < -4.0f && along > -45.0f;
-            if (!vr::control::g_adsEnabled || !behind || !g_handValid) ads = false;
-            else if (!ads && off < 8.0f) ads = true;
-            else if (ads && off > 11.0f) ads = false;
+            // Si guarda lungo l'arma: canna entro 30 gradi dalla direzione della
+            // testa (un'arma girata di lato poteva passare vicino all'occhio).
+            float hy = static_cast<float>(HeadYaw()) * (6.28318530718f / 65536.0f);
+            float hp = static_cast<float>(HeadPitch()) * (6.28318530718f / 65536.0f);
+            float hf[3] = {std::cos(hp) * std::cos(hy), std::cos(hp) * std::sin(hy), std::sin(hp)};
+            bool lookingAlong = hf[0] * dir[0] + hf[1] * dir[1] + hf[2] * dir[2] > 0.966f;  // 15 gradi
+            if (!vr::control::g_adsEnabled || !behind || !g_handValid || !lookingAlong) ads = false;
+            else if (!ads && off < 6.0f) ads = true;   // 12 cm (8 dava falsi positivi col fucile al fianco)
+            else if (ads && off > 9.0f) ads = false;
             if (ads != vr::control::g_adsActive.load())
                 vr::log::Line(ads ? "ADS: gun at the eye (sights), marker hidden" : "ADS: end");
             vr::control::g_adsActive = ads;

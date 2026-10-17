@@ -22,7 +22,8 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 | `control.cpp` | `specopsvr.ini` / `specopsvr_cmd.txt` commands |
 | `display_spoof.cpp` | Lets the game create a window larger than the desktop |
 | `logger.cpp` | Per-session log with header, crash handler and minidumps |
-| `updater.cpp` | Automatic update from the GitHub releases |
+| `updater.cpp` | Automatic update from the GitHub releases (channels, revocation list) |
+| `haptics_ext.cpp` | ProTubeVR (ForceTubeVR_API_x32.dll) and bHaptics Player haptics |
 
 ## Rendering
 
@@ -212,6 +213,41 @@ Useful offsets (`ue3.py props`):
 - With the barrel inside a cover the trace starts inside it and the bullets
   hit the cover at the muzzle (`SHOT ... on StaticMeshActor`, impact at the
   start): the marker shows the same point.
+
+## Haptics
+
+- Controller rumble: the game's motor speed (XInputSetState) is remembered and
+  pulsed every frame (legacy pulses are ~4 ms) on the gun hand, and on the
+  left hand while two-handed; gestures confirm with 70 ms.
+- ProTubeVR: `ForceTubeVR_API_x32.dll` next to the game, C exports
+  `InitRifle`, `KickChannel(uint8 power, channel)`, `RumbleChannel(uint8,
+  float seconds, channel)` (channel 0 = all). Kick on every player shot
+  (`CalcWeaponFire` hook, launcher projectiles), strength by weapon class,
+  one kick per shotgun blast.
+- bHaptics: WebSocket `ws://127.0.0.1:15881/v2/feedbacks` of the bHaptics
+  Player, `{"Submit":[{"Type":"frame","Key":...,"Frame":{"position":
+  "ForearmR"|"ForearmL"|"Vest","dotPoints":[{"index":i,"intensity":0-100}],
+  "durationMillis":ms}}]}`. Shots on the forearms, damage (Walker's health
+  drop) on the whole vest, gestures on the left forearm. Reconnects every
+  10 s.
+
+## Gunstock calibration
+
+B + Y held for 1 s (buttons not passed to the game while both are held):
+with the stock held as when aiming, the line from the headset to the right
+controller is the real aiming direction; `aimpitch` = its pitch minus the
+controller's pitch, applied at once and written to `specopsvr.ini`.
+
+## Diagnostics added in 0.9.3
+
+- `STATS` every 300 ticks: presents per eye, repeated eyes, frame tag
+  agreement, cinema switches, largest per-tick view jump, main-view FOV.
+- `VISCHECK`: enemies within 2500 units and 35 degrees of the view that are
+  not drawn for more than 0.3 s (investigation of enemies disappearing when
+  leaning out of cover).
+- `camlog N`, `bodysize`, `SHOT ... on <actor>`, `GRENADE`, `COVER`, `ADS`.
+- `tools/regress.py`: release gate (eye pairing, view stability while the gun
+  sweeps, checkpoint/cutscene transition, shot accuracy, stalls).
 
 ## Input
 

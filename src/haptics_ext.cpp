@@ -158,7 +158,7 @@ float WeaponStrength(const std::string& cls) {
 
 void Start() {
     std::thread([] {
-        Sleep(8000);  // dopo la lettura dell'ini e fuori dal blocco del loader
+        Sleep(15000);  // dopo la lettura dell'ini (come l'aggiornamento) e fuori dal blocco del loader
         StartProTube();
         if (vr::control::g_bhaptics) BHapticsThread();
     }).detach();
