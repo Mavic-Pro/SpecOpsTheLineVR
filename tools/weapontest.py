@@ -11,6 +11,7 @@ la variazione delle munizioni per capire se hanno sparato.
 
     python tools/weapontest.py                     # tutte
     python tools/weapontest.py YWeapon_M4Carbine   # solo alcune
+    python tools/weapontest.py --map SP_Desert02_p YWeapon_AK74   # in un altro livello
 Rapporto: shots/weapons/rapporto.json e foto per arma.
 """
 import json
@@ -142,7 +143,12 @@ def test_weapon(cls, d):
     a0 = ammo(cls)
     fpos = ls.log_size()
     g.focus()
-    g.send_cmds(['pad fake 0 0 0 0 0 1 0 900'])
+    if 'RPG' in cls:  # l'RPG spara solo mirando (LT tenuto, poi RT)
+        g.send_cmds(['pad fake 0 0 0 0 1 0 0 1500'])
+        time.sleep(1.2)
+        g.send_cmds(['pad fake 0 0 0 0 1 1 0 900'])
+    else:
+        g.send_cmds(['pad fake 0 0 0 0 0 1 0 900'])
     time.sleep(0.5)
     g.send_cmds(['shot wt_' + cls])
     time.sleep(2.0)
@@ -174,8 +180,23 @@ def test_weapon(cls, d):
         ok = angs and max(angs) < 0.5 and max(offs) < 1.0 and errs and max(errs) < 5.0
         r['esito'] = 'OK' if ok else 'DA VERIFICARE'
     else:
+        proj = re.findall(r'PROJECTILE redirected: (\w+) velocity ' + VEC + r' -> ' + VEC + r', barrel ' + VEC,
+                          ls.log_since(fpos))
         fired = a0 is not None and a1 is not None and a1 < a0
-        r['esito'] = 'a proiettile (ha sparato)' if fired else 'non ha sparato'
+        if proj:
+            # direzione del proiettile (in pianta) rispetto alla canna: il pallonetto
+            # del lanciagranate resta, conta solo la deviazione laterale
+            devs = []
+            for pr in proj:
+                v = [float(x) for x in pr[4:7]]
+                b = [float(x) for x in pr[7:10]]
+                d = math.degrees(math.atan2(v[1], v[0]) - math.atan2(b[1], b[0]))
+                devs.append(round(abs((d + 180) % 360 - 180), 2))
+            r['proiettili'] = [pr[0] for pr in proj]
+            r['deviazione_laterale'] = devs
+            r['esito'] = 'proiettile OK' if max(devs) < 1.0 else 'proiettile DA VERIFICARE'
+        else:
+            r['esito'] = 'a proiettile (ha sparato)' if fired else 'non ha sparato'
     src = os.path.join(g.SHOT_DIR, 'wt_%s.bmp' % cls)
     try:
         from PIL import Image
@@ -187,7 +208,7 @@ def test_weapon(cls, d):
 
 
 MAP = 'SP_Gorge02_P'
-SETUP = ['cheats', 'ucall cheat God', 'firelog on', 'synth 0 -30 0', 'synthaim 0 -35', 'synthhand 40 20 -30',
+SETUP = ['cheats', 'ucall cheat God', 'firelog on', 'spread off', 'synth 0 -30 0', 'synthaim 0 -35', 'synthhand 40 20 -30',
          'synthleft 0 0 0', 'mode synth']
 
 
@@ -212,7 +233,12 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     ls.backup_saves()
     ls.ensure_game()
-    classes = sys.argv[1:] or weapon_classes()
+    global MAP
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == '--map':
+        MAP, args = args[1], args[2:]
+    out_json = os.path.join(OUT, 'rapporto.json' if MAP == 'SP_Gorge02_P' else 'rapporto_%s.json' % MAP)
+    classes = args or weapon_classes()
     print('armi da provare:', len(classes), flush=True)
     fresh_level()
     report = []
@@ -220,7 +246,9 @@ def main():
     def show(cls, r):
         print('%-32s %-26s colpi=%s impatto-mirino max/medio=%s/%s angolo=%s fuori asse=%s munizioni=%s' % (
             cls, r.get('esito'), r.get('colpi'), r.get('errore_impatto_max'), r.get('errore_impatto_medio'),
-            r.get('angolo_max'), r.get('partenza_fuori_asse_max'), r.get('munizioni')), flush=True)
+            r.get('angolo_max'), r.get('partenza_fuori_asse_max'), r.get('munizioni')) +
+            (' proiettili=%s deviazione=%s' % (r['proiettili'], r['deviazione_laterale']) if 'proiettili' in r else ''),
+            flush=True)
 
     try:
         for cls in classes:
@@ -233,7 +261,7 @@ def main():
                 fresh_level()
             report.append(r)
             show(cls, r)
-            json.dump(report, open(os.path.join(OUT, 'rapporto.json'), 'w', encoding='utf-8'), indent=1,
+            json.dump(report, open(out_json, 'w', encoding='utf-8'), indent=1,
                       ensure_ascii=False)
     finally:
         g.send_cmds(['synthaim 0 0', 'synth 0 0 0', 'mode hmd'])

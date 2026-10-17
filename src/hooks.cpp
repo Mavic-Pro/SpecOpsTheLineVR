@@ -2972,6 +2972,15 @@ void RedirectNewProjectiles(void* pawn) {
         float f = v[0] * af[0] + v[1] * af[1] + v[2] * af[2];
         float r = v[0] * ar[0] + v[1] * ar[1] + v[2] * ar[2];
         float u = v[0] * au[0] + v[1] * au[1] + v[2] * au[2];
+        // Componente laterale tolta (il gioco converge dal punto di lancio verso
+        // il mirino del corpo: lungo la canna non serve, a 20 m erano ~40 cm);
+        // resta il pallonetto verticale, con la stessa velocita'.
+        float speed = std::sqrt(f * f + r * r + u * u), fu = std::sqrt(f * f + u * u);
+        if (fu > 1.0f) {
+            f *= speed / fu;
+            u *= speed / fu;
+        }
+        r = 0.0f;
         float nv[3];
         for (int k = 0; k < 3; ++k) nv[k] = cf[k] * f + cr[k] * r + cu[k] * u;
         SafeCopy(static_cast<char*>(obj) + kOffActorVelocity, nv, 12);
@@ -3349,13 +3358,17 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
         // FImpactInfo: HitActor +0, HitLocation +4.
         float hit[3] = {0, 0, 0};
         SafeCopy(hit, static_cast<char*>(impact) + 4, 12);
+        uint32_t hitActor = 0;
+        TrySafeReadUint32(impact, &hitActor);
+        std::string hitName = hitActor ? vr::script::ClassName(reinterpret_cast<void*>(hitActor)) : "none";
         if (!GunBarrel(pawn, bo, bd)) bo[0] = bo[1] = bo[2] = bd[0] = bd[1] = bd[2] = 0.0f;
-        char b[512];
+        char b[600];
         snprintf(b, sizeof(b),
                  "SHOT: from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f), game wanted (%.1f, %.1f, %.1f), barrel -> (%.1f, %.1f, %.1f), "
-                 "barrel origin (%.1f, %.1f, %.1f) axis (%.3f, %.3f, %.3f), impact (%.1f, %.1f, %.1f)",
+                 "barrel origin (%.1f, %.1f, %.1f) axis (%.3f, %.3f, %.3f), impact (%.1f, %.1f, %.1f) on %s",
                  start.x, start.y, start.z, end.x, end.y, end.z, origEnd.x, origEnd.y, origEnd.z, g_muzzleTarget[0],
-                 g_muzzleTarget[1], g_muzzleTarget[2], bo[0], bo[1], bo[2], bd[0], bd[1], bd[2], hit[0], hit[1], hit[2]);
+                 g_muzzleTarget[1], g_muzzleTarget[2], bo[0], bo[1], bo[2], bd[0], bd[1], bd[2], hit[0], hit[1], hit[2],
+                 hitName.c_str());
         vr::log::Line(b);
     }
 }

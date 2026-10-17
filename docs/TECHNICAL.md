@@ -141,11 +141,22 @@ Useful offsets (`ue3.py props`):
   aiming by hand.
 - Verification (`firelog on` + `tools/weapontest.py` + `tools/shotreport.py`):
   the impact point of every shot is compared with the marker as an angle at
-  the muzzle. Measured with spread off, median error 0.03-0.3 degrees (AA12,
-  AK47, Barrett M99, Benelli M1014, FAMAS, P90, HK417, UMP45, M4, M9,
-  Micro Uzi, Python); RPG rocket direction equal to the barrel within 0.01.
-  Weapons whose assets are not loaded in the test level cannot fire there
-  and still need testing in the levels where they appear.
+  the muzzle. Measured with spread off, median error 0.03-0.3 degrees, max
+  under 0.15 degrees for: AA12, AK47, Barrett M99, Benelli M1014, Desert
+  Eagle, FAMAS, HK417, M4, M9, Micro Uzi, P90, Python, SAW (Adams), SCAR,
+  Sawed-off shotgun, Steyr Elite (+ Lugo's), TAR21, UMP45. Launchers: RPG
+  rocket and Milkor grenades (also the truck Milkor) leave along the barrel
+  within 0.1 degrees horizontally (the Milkor keeps its vertical lob; the
+  game's small sideways convergence towards the body crosshair is removed).
+  The RPG only fires while aiming (LT held).
+- Not obtainable by the player (no weapon mesh in any campaign level, or
+  `m_weaponMeshComp` empty in the class defaults so `GiveWeapon` returns
+  None): AK74, AKS74u, FNP45, Glock18, MP7, MSG90, M110, Mossberg 590A1,
+  OTs-14 Groza, SIG P220, TDI Vector and the `_Silencer`, `_Scope`,
+  `_HPScope`, `_LaserSight`, `_Commando` variants. Cut content.
+- With the barrel inside a cover the trace starts inside it and the bullets
+  hit the cover at the muzzle (`SHOT ... on StaticMeshActor`, impact at the
+  start): the marker shows the same point.
 
 ## Input
 
