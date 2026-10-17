@@ -11,6 +11,7 @@
 #include "display_spoof.h"
 #include "vr_input.h"
 #include "updater.h"
+#include "haptics_ext.h"
 
 namespace {
 
@@ -65,6 +66,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         }
         vr::display::InstallDesktopSizeSpoof();
         vr::input::InstallXInputHooks();
+        vr::haptics::Start();
     }
     return TRUE;
 }

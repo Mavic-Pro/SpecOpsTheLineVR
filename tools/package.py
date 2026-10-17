@@ -144,12 +144,23 @@ CONTROLS (Touch controllers, shown to the game as an Xbox pad)
   Both sticks held for 1 second: recenter (stand straight, look ahead)
   You aim with the gun in your right hand: shots leave the barrel and land
   on the green marker. Put your left hand on the barrel to aim two-handed.
+  Bring the gun up to your eye to aim down the sights.
+  Gunstock users: hold the stock as when aiming, look along it at something
+  far away and hold B + Y for 1 second (calibrates the gun angle).
 
 GESTURES
   Grenade: quick forward throw with the left hand.
   Reload: left hand on the magazine (below the right hand), then pull down.
   Cover: duck quickly next to cover.
   Weapon: right hand over your right shoulder + right grip = next weapon.
+  Melee: punch forward with the left hand at chest height.
+  Cover: lean out sideways (or stand up) to pop out and aim.
+
+HAPTIC DEVICES (optional)
+  ProTubeVR ForceTube / ProVolver: copy ForceTubeVR_API_x32.dll (from the
+  ProTubeVR software/SDK) next to SpecOpsTheLine.exe, pair the device, start
+  the game. bHaptics vest and sleeves: start the bHaptics Player before the
+  game. Both can be turned off in specopsvr.ini (protube off / bhaptics off).
 
 CONFIGURATION
   specopsvr.ini in the game's Binaries\\Win32 folder (every option is

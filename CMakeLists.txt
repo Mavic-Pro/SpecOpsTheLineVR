@@ -30,6 +30,7 @@ add_library(d3d9proxy SHARED
     src/vr_session.cpp
     src/script_call.cpp
     src/updater.cpp
+    src/haptics_ext.cpp
     src/updater.h
     src/version.h
     src/vr_input.h

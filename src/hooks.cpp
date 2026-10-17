@@ -6,6 +6,7 @@
 #include "vr_session.h"
 #include "script_call.h"
 #include "display_spoof.h"
+#include "haptics_ext.h"
 
 #include <tlhelp32.h>
 #include <intrin.h>
@@ -1772,6 +1773,11 @@ double ProfMs() {
 
 void UpdateFirstPersonBody(void* pawn);
 void UpdateSquadCommandAim(char* cam, void* pawn);
+void VisibilityCheck(void* pawn);
+// Ultima vista dell'occhio sinistro (posizione e rotazione, per VisibilityCheck).
+float g_lastViewLoc[3] = {0, 0, 0};
+int32_t g_lastViewRot[3] = {0, 0, 0};
+float g_lastViewBase[3] = {0, 0, 0};
 void UpdateProjectileLog();
 void RedirectNewProjectiles(void* pawn);
 void RedirectThrownGrenade(void* pawn);
@@ -1815,6 +1821,19 @@ public:
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        {
+            // Danno subito (giubbotto bHaptics / ProTube): salute di Walker in calo.
+            static void* lastPawn = nullptr;
+            static int32_t lastHealth = 0;
+            void* pw = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
+            int32_t hp = 0;
+            if (pw && TrySafeReadUint32(static_cast<char*>(pw) + 0x304, reinterpret_cast<uint32_t*>(&hp))) {
+                if (pw == lastPawn && hp < lastHealth && hp >= 0) vr::haptics::Damage(lastHealth - hp);
+                lastPawn = pw;
+                lastHealth = hp;
+            }
+        }
         if (vr::control::g_firstPerson && HasCameraSignature(cam)) UpdatePawnViewLocation(cam);
         ApplyNearPlane(cam);
         float half = vr::control::g_stereoHalfIpd;
@@ -2397,10 +2416,15 @@ void UpdateHeadTracking() {
             lastBodyYaw += comp;
             own -= turretAdd;
         }
+        // Dopo una cinematica il gioco rimette Walker nella sua direzione
+        // (anche 90 gradi): quella rotazione e' voluta, non si compensa.
+        static ULONGLONG cinemaSeen = 0;
+        if (vr::control::g_cinemaActive || g_gameLockedScene) cinemaSeen = GetTickCount64();
+        bool afterCinema = GetTickCount64() - cinemaSeen < 2000;
         if (haveBody && !vr::control::g_cinemaActive && vr::control::g_coverSnapCompensate &&
-            !vr::control::g_stickTurning && !TurretAimActive() && !g_gameLockedScene) {
+            !vr::control::g_stickTurning && !TurretAimActive() && !g_gameLockedScene && !afterCinema) {
             int16_t d = static_cast<int16_t>(bodyYawNow - lastBodyYaw - own);
-            const int kMin = 7 * 65536 / 360, kMax = 120 * 65536 / 360;
+            const int kMin = 7 * 65536 / 360, kMax = 75 * 65536 / 360;
             if (std::abs(d) > kMin && std::abs(d) < kMax) {
                 g_hmdYawReference += vr::control::g_yawSign * d * (6.28318530718f / 65536.0f);
                 static ULONGLONG lastLog = 0;
@@ -2477,6 +2501,31 @@ void UpdateHeadTracking() {
         vr::TrackedDeviceIndex_t ri = vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
         if (ri != vr::k_unTrackedDeviceIndexInvalid && ri < vr::k_unMaxTrackedDeviceCount && handPoses[ri].bPoseIsValid) {
             const vr::HmdMatrix34_t& c = handPoses[ri].mDeviceToAbsoluteTracking;
+            if (vr::control::g_stockCalibRequest.exchange(false)) {
+                // Calcio in posizione di mira: la direzione vera e' la linea
+                // dall'occhio (centro del visore) al controller; l'inclinazione
+                // da aggiungere e' la differenza col beccheggio del controller.
+                float d[3] = {c.m[0][3] - pos[0], c.m[1][3] - pos[1], c.m[2][3] - pos[2]};
+                float horiz = std::sqrt(d[0] * d[0] + d[2] * d[2]);
+                float dist = std::sqrt(horiz * horiz + d[1] * d[1]);
+                if (dist > 0.15f) {
+                    float linePitch = std::atan2(d[1], horiz) * 57.2957795f;
+                    float ctrlPitch = PitchFromOpenVrPose(c) * 57.2957795f;
+                    float offset = std::round((linePitch - ctrlPitch) * 2.0f) / 2.0f;
+                    vr::control::g_aimPitchOffsetDeg = offset;
+                    char b[200];
+                    snprintf(b, sizeof(b), "STOCK: calibrated, eye-to-controller %.1f deg, controller %.1f deg -> aimpitch %.1f",
+                             linePitch, ctrlPitch, offset);
+                    vr::log::Line(b);
+                    char val[32];
+                    snprintf(val, sizeof(val), "%.1f", offset);
+                    vr::control::SaveIniValue("aimpitch", val);
+                    vr::TrackedDeviceIndex_t ri2 = vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+                    if (ri2 != vr::k_unTrackedDeviceIndexInvalid) vrsys->TriggerHapticPulse(ri2, 0, 3900);
+                } else {
+                    vr::log::Line("STOCK: calibration ignored, controller too close to the headset.");
+                }
+            }
             float cYaw = YawFromOpenVrPose(c);
             float cPitch = PitchFromOpenVrPose(c) + vr::control::g_aimPitchOffsetDeg * 0.01745329252f;
             g_aimDeltaYaw = vr::control::g_yawSign * RadiansToUnreal(cYaw - g_hmdYawReference);
@@ -3528,6 +3577,7 @@ void RedirectNewProjectiles(void* pawn) {
         float nh = std::sqrt(nv[0] * nv[0] + nv[1] * nv[1]);
         int32_t rot[3] = {RadiansToUnreal(std::atan2(nv[2], nh)), RadiansToUnreal(std::atan2(nv[1], nv[0])), 0};
         SafeCopy(static_cast<char*>(obj) + kOffActorRotation, rot, 12);
+        vr::haptics::Shot(g_weaponInfo.cls, g_twoHandActive);
         g_projRedirected.push_back(obj);
         if (g_projRedirected.size() > 64) g_projRedirected.erase(g_projRedirected.begin());
         if (vr::control::g_fireLog) {
@@ -3779,6 +3829,11 @@ public:
             }
             if (g_drawEye != 1) tickT = t;
             if (g_drawEye == 0) {
+                for (int i = 0; i < 3; ++i) {
+                    g_lastViewLoc[i] = outLoc[i];
+                    g_lastViewRot[i] = outRot[i];
+                    g_lastViewBase[i] = base[i];
+                }
                 static float lastView[3] = {0, 0, 0};
                 float dj = std::sqrt((outLoc[0] - lastView[0]) * (outLoc[0] - lastView[0]) +
                                      (outLoc[1] - lastView[1]) * (outLoc[1] - lastView[1]) +
@@ -3919,6 +3974,59 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     g_markerVisible[eye] = !vr::control::g_adsActive;
 }
 
+
+// --- Diagnostica: nemici davanti alla vista ma non disegnati -----------------
+//
+// 18/10: sporgendosi col corpo dalla copertura alcuni nemici (dentro un
+// pullman) sparivano. Ogni 0,5 s: nemici vivi entro 2500 unita' e 35 gradi
+// dalla direzione della vista che il motore non disegna da piu' di 0,3 s
+// (Actor.LastRenderTime) vengono scritti nel log con vista, occhi di Walker e
+// stato nascosto, per capire se e' occlusione, volumi di visibilita' o altro.
+void VisibilityCheck(void* pawn) {
+    static ULONGLONG last = 0;
+    if (!pawn || vr::control::g_cinemaActive || GetTickCount64() - last < 500) return;
+    last = GetTickCount64();
+    uint32_t worldInfo = 0, p = 0;
+    float now = 0.0f;
+    if (!TrySafeReadUint32(static_cast<char*>(pawn) + 0xEC, &worldInfo) || !worldInfo ||
+        !TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + 0x4F4, &p) ||
+        !SafeCopy(&now, reinterpret_cast<char*>(worldInfo) + 0x454, 4))
+        return;
+    float fwd[3], rt[3], up[3];
+    RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, fwd, rt, up);
+    for (int guard = 0; p && guard < 512; ++guard) {
+        char* other = reinterpret_cast<char*>(p);
+        uint32_t next = 0, flags = 0, mesh = 0, meshFlags = 0;
+        TrySafeReadUint32(other + 0x218, &next);
+        int32_t health = 0;
+        float loc[3], lastRender = 0.0f;
+        if (other != pawn && TrySafeReadUint32(other + 0x304, reinterpret_cast<uint32_t*>(&health)) && health > 0 &&
+            SafeCopy(loc, other + 0x54, 12) && SafeCopy(&lastRender, other + 0xF8, 4)) {
+            float v[3] = {loc[0] - g_lastViewLoc[0], loc[1] - g_lastViewLoc[1], loc[2] - g_lastViewLoc[2]};
+            float d = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            float cosA = d > 1.0f ? (v[0] * fwd[0] + v[1] * fwd[1] + v[2] * fwd[2]) / d : 0.0f;
+            std::string cls = vr::script::ClassName(other);
+            bool squad = cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos;
+            if (!squad && d < 2500.0f && cosA > 0.82f && now - lastRender > 0.3f) {
+                TrySafeReadUint32(other + 0x9C, &flags);
+                TrySafeReadUint32(other + kOffPawnMesh, &mesh);
+                if (mesh) TrySafeReadUint32(reinterpret_cast<char*>(mesh) + 0x134, &meshFlags);
+                float ho[3];
+                HeadOffset(ho);
+                char b[420];
+                snprintf(b, sizeof(b),
+                         "VISCHECK: %s not drawn for %.1f s, %.0f units ahead (%.0f deg) | actor hidden=%d mesh hidden=%d | "
+                         "view (%.0f %.0f %.0f) Walker eye (%.0f %.0f %.0f) head offset %.0f | enemy (%.0f %.0f %.0f) | peek=%d",
+                         cls.c_str(), now - lastRender, d, std::acos(cosA > 1 ? 1 : cosA) * 57.3f, (flags & 0x4) ? 1 : 0,
+                         (meshFlags & 0x4) ? 1 : 0, g_lastViewLoc[0], g_lastViewLoc[1], g_lastViewLoc[2], g_lastViewBase[0],
+                         g_lastViewBase[1], g_lastViewBase[2], std::sqrt(ho[0] * ho[0] + ho[1] * ho[1] + ho[2] * ho[2]),
+                         loc[0], loc[1], loc[2], (int)vr::control::g_coverPeek.load());
+                vr::log::Line(b);
+            }
+        }
+        p = next;
+    }
+}
 
 // --- Comando alla squadra lungo la canna ---------------------------------------
 //
@@ -4093,6 +4201,7 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
     }
     g_CalcWeaponFire_Original(self, start, end, impact);
     if (zeroSpread) SafeCopy(arsenal + kOffArsenalAccuracy, savedAcc, 8);
+    if (mine) vr::haptics::Shot(CurrentWeaponInfo(self).cls, g_twoHandActive);
     if (mine && vr::control::g_fireLog) {
         // FImpactInfo: HitActor +0, HitLocation +4.
         float hit[3] = {0, 0, 0};

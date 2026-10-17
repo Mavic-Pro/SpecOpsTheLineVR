@@ -1,6 +1,7 @@
 #include "vr_input.h"
 #include "logger.h"
 #include "control.h"
+#include "haptics_ext.h"
 #include "vr_session.h"
 
 #include <windows.h>
@@ -150,13 +151,33 @@ bool ReadTouchControllers(XGamepad* out) {
         if (ButtonPressed(ls, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kLThumb;
         if (ButtonPressed(ls, vr::k_EButton_System)) out->wButtons |= kStart;  // tasto menu sinistro
     }
+    // Calibrazione del calcio: B (destro) + Y (sinistro) tenuti insieme 1 s.
+    // Mentre sono tenuti insieme non arrivano al gioco (niente corpo a corpo
+    // ne' cambio d'arma per sbaglio).
+    bool calibCombo = haveL && haveR && ButtonPressed(ls, vr::k_EButton_ApplicationMenu) &&
+                      ButtonPressed(rs, vr::k_EButton_ApplicationMenu);
+    {
+        static ULONGLONG since = 0;
+        static bool fired = false;
+        if (calibCombo) {
+            if (!since) since = GetTickCount64();
+            if (!fired && GetTickCount64() - since > 1000) {
+                fired = true;
+                vr::control::g_stockCalibRequest = true;
+            }
+        } else {
+            since = 0;
+            fired = false;
+        }
+    }
+    if (calibCombo) out->wButtons &= ~kY;
     if (haveR) {
         out->sThumbRX = AxisToShort(rs.rAxis[0].x);
         out->sThumbRY = AxisToShort(rs.rAxis[0].y);
         out->bRightTrigger = TriggerToByte(rs.rAxis[1].x);
         if (GripValue(rs) > 0.6f) out->wButtons |= kRB;
         if (ButtonPressed(rs, vr::k_EButton_A)) out->wButtons |= kA;
-        if (ButtonPressed(rs, vr::k_EButton_ApplicationMenu)) out->wButtons |= kB;
+        if (ButtonPressed(rs, vr::k_EButton_ApplicationMenu) && !calibCombo) out->wButtons |= kB;
         if (ButtonPressed(rs, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kRThumb;
     }
     UpdateHaptics(sys);  // sotto lo stesso lock di sessione
@@ -207,10 +228,14 @@ public:
             m_standingY -= 0.03f * static_cast<float>(s.t - m_lastT);
         }
         m_lastT = s.t;
-        if (s.leftValid && vr::control::g_gestureGrenade && s.t > m_throwReady) {
+        // Mano sinistra sulla canna (e per 1 s dopo averla lasciata): muovendo
+        // il fucile la mano corre in avanti, non e' un lancio (18/10).
+        if (vr::control::g_twoHandEngaged) m_twoHandT = s.t;
+        if (s.leftValid && vr::control::g_gestureGrenade && s.t > m_throwReady && s.t - m_twoHandT > 1.0) {
             float vf = s.leftVel[0] * s.fwd[0] + s.leftVel[2] * s.fwd[2];
-            if (vf > 2.5f && s.left[1] > s.hmd[1] - 0.35f) {  // 3,2 m/s non scattava mai nelle sessioni reali
+            if (vf > 3.2f && s.left[1] > s.hmd[1] - 0.20f) {  // 2,5 m/s e -0,35 m: troppo sensibile (18/10)
                 Press(kLB, s.t, 0.30, "lancio della granata", vf);
+                vr::haptics::GrenadeThrow();
                 m_throwReady = s.t + 1.0;
                 // Direzione del lancio = velocita' della mano (la granata la segue).
                 float sp = std::sqrt(s.leftVel[0] * s.leftVel[0] + s.leftVel[1] * s.leftVel[1] +
@@ -223,6 +248,7 @@ public:
                        s.t > m_meleeReady) {
                 // Pugno in avanti all'altezza del petto (il lancio parte dall'alto): corpo a corpo.
                 Press(kB, s.t, 0.12, "corpo a corpo", vf);
+                vr::haptics::Melee();
                 m_meleeReady = s.t + 0.8;
                 m_throwReady = s.t + 0.5;
             }
@@ -232,6 +258,7 @@ public:
             if (d < 0.18f && s.left[1] < s.right[1]) m_nearMagT = s.t;
             if (s.t > m_reloadReady && s.t - m_nearMagT < 0.6 && s.leftVel[1] < -1.0f && d > 0.2f) {
                 Press(kX, s.t, 0.12, "ricarica", -s.leftVel[1]);
+                vr::haptics::Reload();
                 m_reloadReady = s.t + 1.5;
                 m_nearMagT = -10.0;
             }
@@ -296,7 +323,7 @@ private:
     bool m_gripWasDown = false, m_gripIsSwap = false, m_hapticPending = false;
     double m_lastLogT = 0.0;
     double m_lastT = 0.0, m_throwReady = 0.0, m_reloadReady = 0.0, m_duckReady = 0.0, m_nearMagT = -10.0;
-    double m_meleeReady = 0.0;
+    double m_meleeReady = 0.0, m_twoHandT = -10.0;
 };
 
 GestureDetector g_gestures;

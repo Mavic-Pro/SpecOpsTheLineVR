@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <vector>
 #include <mutex>
 #include <array>
 #include <map>
@@ -47,8 +48,10 @@ std::atomic<bool> g_adsEnabled{true};
 std::atomic<bool> g_adsActive{false};
 std::atomic<bool> g_twoHandEngaged{false};
 std::atomic<bool> g_cinemaWalker3D{true};
+std::atomic<bool> g_stockCalibRequest{false};
+std::atomic<bool> g_protube{true}, g_bhaptics{true};
 std::atomic<float> g_predictFrames{-1.0f};
-std::atomic<float> g_handPredictMs{25.0f};
+std::atomic<float> g_handPredictMs{0.0f};
 std::atomic<bool> g_gpuCopy{true};
 std::atomic<float> g_stereoHalfIpd{1.6f};  // ~6,4 cm a ~2 cm per unita' Unreal
 std::atomic<int> g_presentEye{-1};
@@ -516,6 +519,14 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_submitWithPose = (v != "off");
+    } else if (cmd == "protube") {
+        std::string v;
+        in >> v;
+        g_protube = (v != "off");
+    } else if (cmd == "bhaptics") {
+        std::string v;
+        in >> v;
+        g_bhaptics = (v != "off");
     } else if (cmd == "cinemawalker") {
         std::string v;
         in >> v;
@@ -609,6 +620,27 @@ void Execute(const std::string& line) {
 // specopsvr.ini (accanto alla dll): stessi comandi di specopsvr_cmd.txt,
 // eseguiti una volta all'avvio. Righe vuote e '#' ignorate. Il file NON
 // viene cancellato.
+void SaveIniValue(const std::string& key, const std::string& value) {
+    std::string path = ModuleDirectory() + "\\specopsvr.ini";
+    std::vector<std::string> lines;
+    {
+        std::ifstream f(path);
+        std::string l;
+        while (std::getline(f, l)) lines.push_back(l);
+    }
+    bool done = false;
+    for (auto& l : lines) {
+        if (l.rfind(key + " ", 0) == 0 || l == key) {
+            l = key + " " + value;
+            done = true;
+        }
+    }
+    if (!done) lines.push_back(key + " " + value);
+    std::ofstream o(path, std::ios::trunc);
+    for (const auto& l : lines) o << l << "\n";
+    vr::log::Line("CONFIG: saved \"" + key + " " + value + "\" in specopsvr.ini");
+}
+
 void LoadConfigFile() {
     std::ifstream f(ModuleDirectory() + "\\specopsvr.ini");
     if (!f) {

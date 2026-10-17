@@ -198,6 +198,13 @@ extern std::atomic<bool> g_twoHandEngaged;
 // Scene "nel motore" con la camera di Walker e il giocatore bloccato
 // (bCinematicMode): in 3D ("cinemawalker 3d") o sullo schermo virtuale ("screen").
 extern std::atomic<bool> g_cinemaWalker3D;
+// Calibrazione del calcio (gunstock): B + Y tenuti 1 s con il calcio in
+// posizione di mira. La richiesta la esegue UpdateHeadTracking.
+extern std::atomic<bool> g_stockCalibRequest;
+// Feedback aptico esterno: ProTubeVR (ForceTubeVR_API_x32.dll) e bHaptics Player.
+extern std::atomic<bool> g_protube, g_bhaptics;
+// Scrive "chiave valore" in specopsvr.ini (sostituisce la riga o la aggiunge).
+void SaveIniValue(const std::string& key, const std::string& value);
 extern std::atomic<float> g_armRotDeg[3];
 // Allungamento massimo del braccio per raggiungere i controller (1 = nessuno).
 extern std::atomic<float> g_armStretch;
