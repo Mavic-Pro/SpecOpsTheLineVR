@@ -1,0 +1,25 @@
+build/
+deploy/*.dll
+deploy/*.pdb
+*.log
+*.obj
+shots/
+dist/
+savebackup_*/
+NOTES_IT.md
+deploy/Release/
+deploy/*.exe
+tools/__pycache__/
+*.bmp
+# OpenVR SDK: only headers, the 32-bit import library, the runtime dll and the license
+vendor/openvr/*
+!vendor/openvr/headers/
+!vendor/openvr/lib/
+vendor/openvr/lib/*
+!vendor/openvr/lib/win32/
+!vendor/openvr/bin/
+vendor/openvr/bin/*
+!vendor/openvr/bin/win32/
+vendor/openvr/bin/win32/*.pdb
+!vendor/openvr/LICENSE
+vendor/minhook/.git*
