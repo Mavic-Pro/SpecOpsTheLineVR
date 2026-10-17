@@ -58,6 +58,12 @@ bool g_slotPoseValid[2][kSlots] = {};
 vr::HmdMatrix34_t g_slotPose[2][kSlots] = {};
 // Posa con cui e' stato disegnato l'ultimo frame di ciascun occhio (thread di rendering).
 bool g_renderPoseValid[2] = {};
+uint32_t g_renderTick[2] = {};
+uint32_t g_slotTick[2][kSlots] = {};
+// Numero progressivo dei Present (thread di rendering): i due occhi di una
+// coppia valida sono presentati uno dopo l'altro.
+uint32_t g_presentSeq = 0;
+uint32_t g_slotSeq[2][kSlots] = {};
 vr::HmdMatrix34_t g_renderPose[2] = {};
 bool g_slotGpu[2][kSlots] = {};     // slot nella texture condivisa (niente LockRect)
 // Percorso GPU (device D3D9Ex): texture render target condivise con D3D11,
@@ -78,6 +84,8 @@ struct EyePacket {
     UINT pitch = 0, w = 0, h = 0;
     bool cinema = false;  // solo occhio 0: immagine 16:9 per lo schermo virtuale
     ID3D11Texture2D* gpuSrc = nullptr;  // percorso GPU: texture condivisa da copiare
+    uint32_t tick = 0;                  // tick stereo del frame (diagnostica)
+    uint32_t seq = 0;                   // numero del Present che l'ha prodotto
     bool poseValid = false;             // posa del visore usata per disegnarlo
     vr::HmdMatrix34_t pose = {};
 };
@@ -531,7 +539,7 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
 // specchio, cattura) stanno qui, cosi' il contesto D3D11 ha un solo thread.
 void WorkerLoop() {
     vr::log::Line("VR-OUTPUT: output thread started.");
-    int submits = 0, posedSubmits = 0;
+    int submits = 0, posedSubmits = 0, mismatchedPairs = 0;
     double windowStart = QpcMs();
     double copyMs = 0.0, waitMs = 0.0, submitMs = 0.0;
     while (!g_workerStop) {
@@ -626,6 +634,19 @@ void WorkerLoop() {
             HideCinemaOverlay();
         }
         if (!tex[0] || !tex[1]) continue;
+        // I due occhi devono essere stati presentati uno dopo l'altro: all'inizio
+        // del gameplay un occhio veniva riconosciuto come l'altro e la coppia
+        // univa un'immagine nuova a una vecchia (fucile doppio, 18/10). Coppia
+        // spaiata: niente invio, il compositor ripete il frame precedente.
+        // (Il tick dell'anello non basta: stando fermi l'origine e' uguale in
+        // piu' tick e coppie buone sembravano spaiate.)
+        uint32_t seqGap = pk[0].seq > pk[1].seq ? pk[0].seq - pk[1].seq : pk[1].seq - pk[0].seq;
+        // Sperimentale, spento di default ("pairCheck on"): non toglieva lo
+        // sdoppiamento iniziale e aggiungeva scatti (prova col visore 18/10).
+        if (vr::control::g_pairCheck && !cinema && pk[0].slot >= 0 && pk[1].slot >= 0 && seqGap > 2) {
+            ++mismatchedPairs;
+            continue;
+        }
         double ts = QpcMs();
         vr::Texture_t texL = {cinema && g_blackTex ? g_blackTex : tex[0], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
         vr::Texture_t texR = {cinema && g_blackTex ? g_blackTex : tex[1], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
@@ -666,9 +687,9 @@ void WorkerLoop() {
             char b[300];
             std::snprintf(b, sizeof(b),
                           "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
-                          "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d",
+                          "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d; mismatched pairs skipped %d",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
-                          copyMs / n, waitMs / n, submitMs / n, posedSubmits);
+                          copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs);
             vr::log::Line(b);
             windowStart = now;
             copyMs = waitMs = submitMs = 0.0;
@@ -689,8 +710,9 @@ void StartWorker() {
 
 }  // namespace
 
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose) {
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick) {
     if (eye < 0 || eye > 1) return;
+    g_renderTick[eye] = tick;
     g_renderPoseValid[eye] = pose != nullptr;
     if (pose) g_renderPose[eye] = *pose;
 }
@@ -706,6 +728,7 @@ RECT EyeCropRect(int eye) {
 
 void OnPresent(IDirect3DDevice9* device, int eye) {
     if (g_disabled || !vr::control::g_vrOutput) return;
+    ++g_presentSeq;
     // Solo da applicazione Scene (visore indossato, vedi vr_session.h).
     if (!vr::session::IsScene()) return;
     // Visore non indossato / in standby: niente invio ne' WaitGetPoses. Il 16/10,
@@ -808,6 +831,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             pk.h = g_slotH[e][g];
             pk.gpuSrc = g_shTex11[e][g];
             pk.poseValid = g_slotPoseValid[e][g];
+            pk.tick = g_slotTick[e][g];
+            pk.seq = g_slotSeq[e][g];
             pk.pose = g_slotPose[e][g];
             g_ready[e] = pk;
             g_gpuSlot[e] = -1;
@@ -824,6 +849,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
                 g_ready[e] = {g, static_cast<const uint8_t*>(lr.pBits), static_cast<UINT>(lr.Pitch),
                               g_slotW[e][g], g_slotH[e][g], g_slotCinema[e][g]};
                 g_ready[e].poseValid = g_slotPoseValid[e][g];
+                g_ready[e].tick = g_slotTick[e][g];
+                g_ready[e].seq = g_slotSeq[e][g];
                 g_ready[e].pose = g_slotPose[e][g];
             } else {
                 g_slotState[e][g] = kFree;
@@ -870,6 +897,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotCinema[e][s] = false;
             g_slotPoseValid[e][s] = g_renderPoseValid[e];
             g_slotPose[e][s] = g_renderPose[e];
+            g_slotTick[e][s] = g_renderTick[e];
+            g_slotSeq[e][s] = g_presentSeq;
             g_gpuSlot[e] = s;
             continue;
         }
@@ -885,6 +914,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         g_slotCinema[e][s] = cinema;
         g_slotPoseValid[e][s] = g_renderPoseValid[e];
         g_slotPose[e][s] = g_renderPose[e];
+        g_slotTick[e][s] = g_renderTick[e];
+        g_slotSeq[e][s] = g_presentSeq;
         g_slotGpu[e][s] = false;
         g_gpuSlot[e] = s;
     }

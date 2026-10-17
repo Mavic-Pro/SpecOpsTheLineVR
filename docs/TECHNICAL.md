@@ -45,12 +45,16 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 - **Post effects**: motion blur and depth of field are switched off in
   `GSystemSettings` (`0x014D77B0`).
 - **Near plane**: `GNearClippingPlane` (`0x0141578C`).
-- **Render pose**: head and controller poses are predicted to display time
-  (next vsync + vsync-to-photons + `predict` frames). The HMD pose of each
-  game tick travels with the eye origins (eye ring) to the frame and is
-  submitted with `Submit_TextureWithPose`, so the compositor reprojects
-  from the pose the frame was really rendered with (without it the image
-  swam when moving the head). IPD from `GetEyeToHeadTransform`.
+- **Render pose (experimental, off)**: `submitpose on` sends each frame with
+  the HMD pose of its game tick (`Submit_TextureWithPose`) and `predict <n>`
+  predicts poses to display time. Off by default since 0.9.2: the frame is
+  matched to its tick through the eye origin, which is identical in many
+  ticks while standing still, so frames went out with a wrong pose (double
+  images in 0.9.1). Needs a unique per-tick frame id first.
+- **First-person eye**: Walker's location + `fpforward` along the yaw of the
+  Pawn (not the camera rotation, which at copy time could still hold the
+  gun direction set by the mod: in cover the eyes jumped ~19 units per frame).
+- IPD from `GetEyeToHeadTransform`.
 - **Eye height** changes of the game (crouching in cover, popping up: ~20
   units in one frame) are smoothed on the view only (`eyesmooth`).
 - **Cinema screen**: entered only after 0.6 s of cinematic mode (0.15 s when

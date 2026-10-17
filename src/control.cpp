@@ -33,10 +33,11 @@ std::atomic<bool> g_cinemaForce{false};
 std::atomic<float> g_cinemaWidthM{3.2f}, g_cinemaDistM{2.6f};
 std::atomic<int> g_outputTest{0};
 std::atomic<float> g_outputScale{1.0f};
-std::atomic<bool> g_submitWithPose{true};
+std::atomic<bool> g_submitWithPose{false};
+std::atomic<bool> g_pairCheck{false};
 std::atomic<bool> g_commandFollowsGun{true};
 std::atomic<float> g_turnWithHeadDeg{45.0f};
-std::atomic<float> g_predictFrames{1.0f};
+std::atomic<float> g_predictFrames{-1.0f};
 std::atomic<bool> g_gpuCopy{true};
 std::atomic<float> g_stereoHalfIpd{1.6f};  // ~6,4 cm a ~2 cm per unita' Unreal
 std::atomic<int> g_presentEye{-1};
@@ -487,6 +488,10 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_gpuCopy = (v != "off");
+    } else if (cmd == "paircheck") {
+        std::string v;
+        in >> v;
+        g_pairCheck = (v == "on");
     } else if (cmd == "submitpose") {
         std::string v;
         in >> v;
@@ -500,9 +505,10 @@ void Execute(const std::string& line) {
         in >> v;
         g_commandFollowsGun = (v != "head");
     } else if (cmd == "predict") {
-        float v = 1.0f;
-        in >> v;
-        g_predictFrames = v < 0.0f ? 0.0f : (v > 4.0f ? 4.0f : v);
+        std::string t;
+        in >> t;
+        float v = t == "off" ? -1.0f : static_cast<float>(std::atof(t.c_str()));
+        g_predictFrames = v > 4.0f ? 4.0f : v;
     } else if (cmd == "outputscale") {
         float v = 1.0f;
         in >> v;

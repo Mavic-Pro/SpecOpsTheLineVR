@@ -20,7 +20,8 @@ void OnBeforeReset();
 
 // Thread di rendering: posa del visore con cui e' stato disegnato l'occhio del
 // frame in corso (nullptr = sconosciuta). Viaggia col frame fino al Submit.
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose);
+// tick: tick stereo del frame; si inviano solo coppie con lo stesso tick.
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick);
 
 // Rettangolo (pixel del back buffer) della porzione di immagine dell'occhio.
 RECT EyeCropRect(int eye);

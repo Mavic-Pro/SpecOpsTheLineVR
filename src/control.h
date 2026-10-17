@@ -46,6 +46,8 @@ extern std::atomic<float> g_outputScale;
 // (Submit_TextureWithPose): la riproiezione del visore corregge dalla posa
 // giusta. Senza, l'immagine "nuotava" muovendo la testa (segnalazione 18/10).
 extern std::atomic<bool> g_submitWithPose;
+// Sperimentale: invia solo coppie di occhi presentate una dopo l'altra ("paircheck on").
+extern std::atomic<bool> g_pairCheck;
 // Comando alla squadra (tasto squadra tenuto): il bersaglio e' il nemico lungo
 // la canna, come il mirino verde. Il gioco lo sceglie al centro dello schermo,
 // cioe' dove guarda la testa (segnalazione 18/10: il cecchino sul cartellone

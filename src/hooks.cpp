@@ -607,7 +607,9 @@ struct EyeOrigin {
     int eye;
     bool poseValid;           // posa del visore del tick che ha generato l'origine
     vr::HmdMatrix34_t pose;
+    uint32_t tick;            // tick stereo (g_stereoDraws) che ha generato l'origine
 };
+extern std::atomic<uint32_t> g_stereoDraws;
 // Posa del visore usata dal tick di gioco in corso (thread di gioco).
 vr::HmdMatrix34_t g_tickHmdPose = {};
 bool g_tickHmdPoseValid = false;
@@ -620,11 +622,13 @@ constexpr UINT kViewOriginRegister = 5;
 
 void IdentifyEyeFromViewOrigin(const float* v) {
     float x = -v[0], y = -v[1], z = -v[2];
+    // Nota (18/10): cercare dal piu' recente sbagliava l'occhio in centinaia di
+    // frame (occhio ripetuto, arma sdoppiata): si resta sull'ordine dell'anello.
     for (int i = 0; i < kEyeRingSize; ++i) {
         const EyeOrigin& e = g_eyeRing[i];
         if (std::fabs(e.x - x) < 0.01f && std::fabs(e.y - y) < 0.01f && std::fabs(e.z - z) < 0.01f) {
             vr::control::g_presentEye = e.eye;
-            vr::output::SetRenderPose(e.eye, e.poseValid ? &e.pose : nullptr);
+            vr::output::SetRenderPose(e.eye, e.poseValid ? &e.pose : nullptr, e.tick);
             g_eyeMatches[e.eye & 1].fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -1506,7 +1510,15 @@ void ApplyFirstPerson(char* cam) {
     float p[3];
     if (!pawn || !TrySafeReadFloat3(static_cast<char*>(pawn) + kOffsetLocationX, p)) return;
     float* loc = reinterpret_cast<float*>(cam + 0x10);
-    float yaw = *reinterpret_cast<int32_t*>(cam + kCameraOffsetYaw) * (6.28318530718f / 65536.0f);
+    // Avanti lungo lo yaw del CORPO (Pawn.Rotation +0x64). La rotazione nella
+    // camera, al momento di questa copia, poteva essere ancora quella
+    // dell'arma messa dalla mod (mira con la canna): mirando di lato in
+    // copertura gli occhi saltavano di ~19 unita' da un frame all'altro
+    // (18/10, "le coperture fanno vibrare la camera").
+    int32_t pawnYaw = 0;
+    float yaw = TrySafeReadUint32(static_cast<char*>(pawn) + 0x64, reinterpret_cast<uint32_t*>(&pawnYaw))
+                    ? pawnYaw * (6.28318530718f / 65536.0f)
+                    : *reinterpret_cast<int32_t*>(cam + kCameraOffsetYaw) * (6.28318530718f / 65536.0f);
     float fwd = vr::control::g_fpForward;
     loc[0] = p[0] + fwd * std::cos(yaw);
     loc[1] = p[1] + fwd * std::sin(yaw);
@@ -1521,7 +1533,8 @@ std::atomic<int> g_drawEye{-1};
 
 void RecordEyeOrigin(const float* loc, int eye) {
     uint32_t slot = g_eyeRingPos.fetch_add(1) % kEyeRingSize;
-    g_eyeRing[slot] = {loc[0], loc[1], loc[2], eye, g_tickHmdPoseValid, g_tickHmdPose};
+    g_eyeRing[slot] = {loc[0], loc[1], loc[2], eye, g_tickHmdPoseValid, g_tickHmdPose,
+                       g_stereoDraws.load(std::memory_order_relaxed)};
 }
 
 // Sposta loc (gia' nella camera) di +-meta' IPD lungo il vettore "right".
@@ -1951,6 +1964,7 @@ int32_t RadiansToUnreal(float rad) {
 // fino al prossimo vsync, piu' vsync->fotoni, piu' predictFrames frame di
 // pipeline (thread di rendering, lettura del frame, thread di uscita).
 float PredictedSecondsToPhotons(vr::IVRSystem* sys) {
+    if (vr::control::g_predictFrames < 0.0f) return 0.0f;  // "predict off" (predefinito)
     static float hz = 0.0f, vsyncToPhotons = 0.0f;
     static ULONGLONG lastProps = 0;
     if (GetTickCount64() - lastProps > 2000) {
@@ -1963,6 +1977,9 @@ float PredictedSecondsToPhotons(vr::IVRSystem* sys) {
     float sinceVsync = 0.0f;
     uint64_t counter = 0;
     if (!sys->GetTimeSinceLastVsync(&sinceVsync, &counter)) sinceVsync = 0.0f;
+    // Con Link il valore puo' crescere oltre un frame (vsync non aggiornato):
+    // conta solo la posizione dentro il frame corrente.
+    sinceVsync = std::fmod(sinceVsync < 0.0f ? 0.0f : sinceVsync, frame);
     float s = frame - sinceVsync + vsyncToPhotons + frame * vr::control::g_predictFrames;
     return s < 0.0f ? 0.0f : (s > 0.1f ? 0.1f : s);
 }
@@ -2100,7 +2117,16 @@ void UpdateHeadTracking() {
     // stessa quantita', cosi' la vista non cambia.
     float turnThr = vr::control::g_turnWithHeadDeg * 0.01745329252f;
     void* pcForTurn = g_playerControllerPtr;
-    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive) {
+    // In copertura (YGamePawn.m_coverFaceState +0x498 != 0) il gioco orienta
+    // Walker verso il riparo: niente rotazione del corpo con la testa.
+    bool inCover = false;
+    {
+        char* camT = static_cast<char*>(g_cameraPtr.load());
+        void* pawnT = HasCameraSignature(camT) ? PlayerPawnIfViewTarget(camT) : nullptr;
+        uint32_t cover = 0;
+        inCover = pawnT && TrySafeReadUint32(static_cast<char*>(pawnT) + 0x498, &cover) && (cover & 0xFF) != 0;
+    }
+    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover) {
         float ex = std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f);
         if (std::fabs(ex) > turnThr) {
             float shift = ex - std::copysign(turnThr, ex);
