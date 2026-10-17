@@ -605,7 +605,12 @@ std::atomic<uint32_t> g_vsRegMatchMinus[8];  // bitmask 256 registri, -loc
 struct EyeOrigin {
     float x, y, z;
     int eye;
+    bool poseValid;           // posa del visore del tick che ha generato l'origine
+    vr::HmdMatrix34_t pose;
 };
+// Posa del visore usata dal tick di gioco in corso (thread di gioco).
+vr::HmdMatrix34_t g_tickHmdPose = {};
+bool g_tickHmdPoseValid = false;
 constexpr int kEyeRingSize = 32;
 EyeOrigin g_eyeRing[kEyeRingSize];
 std::atomic<uint32_t> g_eyeRingPos{0};
@@ -619,6 +624,7 @@ void IdentifyEyeFromViewOrigin(const float* v) {
         const EyeOrigin& e = g_eyeRing[i];
         if (std::fabs(e.x - x) < 0.01f && std::fabs(e.y - y) < 0.01f && std::fabs(e.z - z) < 0.01f) {
             vr::control::g_presentEye = e.eye;
+            vr::output::SetRenderPose(e.eye, e.poseValid ? &e.pose : nullptr);
             g_eyeMatches[e.eye & 1].fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -1515,7 +1521,7 @@ std::atomic<int> g_drawEye{-1};
 
 void RecordEyeOrigin(const float* loc, int eye) {
     uint32_t slot = g_eyeRingPos.fetch_add(1) % kEyeRingSize;
-    g_eyeRing[slot] = {loc[0], loc[1], loc[2], eye};
+    g_eyeRing[slot] = {loc[0], loc[1], loc[2], eye, g_tickHmdPoseValid, g_tickHmdPose};
 }
 
 // Sposta loc (gia' nella camera) di +-meta' IPD lungo il vettore "right".
@@ -1590,6 +1596,7 @@ double ProfMs() {
 }
 
 void UpdateFirstPersonBody(void* pawn);
+void UpdateSquadCommandAim(char* cam, void* pawn);
 void UpdateProjectileLog();
 void RedirectNewProjectiles(void* pawn);
 
@@ -1603,6 +1610,7 @@ public:
         UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateProjectileLog();
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         if (vr::control::g_firstPerson && HasCameraSignature(cam)) UpdatePawnViewLocation(cam);
         ApplyNearPlane(cam);
         float half = vr::control::g_stereoHalfIpd;
@@ -1615,9 +1623,25 @@ public:
             uint32_t pcFlags = 0;
             cinematicMode = TrySafeReadUint32(cam - 0x77C + 0x39C, &pcFlags) && (pcFlags & 0x8000);
         }
-        bool cinema = vr::control::g_cinemaEnabled &&
-                      (vr::control::g_cinemaForce || cinematicMode ||
-                       !(HasCameraSignature(cam) && PlayerPawnIfViewTarget(cam)));
+        bool noWalker = !(HasCameraSignature(cam) && PlayerPawnIfViewTarget(cam));
+        bool wanted = vr::control::g_cinemaEnabled && (vr::control::g_cinemaForce || cinematicMode || noWalker);
+        // Isteresi: momenti brevi di modalita' cinematica durante il gioco
+        // (porte, eventi scriptati) restano in VR. Passare allo schermo
+        // virtuale per mezzo secondo e tornare indietro, nel visore, e' un
+        // lampo (segnalazione 18/10: "flash of light ... during gameplay").
+        static ULONGLONG wantedSince = 0, unwantedSince = 0;
+        ULONGLONG nowMs = GetTickCount64();
+        bool cinema = vr::control::g_cinemaActive.load();
+        if (wanted) {
+            unwantedSince = 0;
+            if (!wantedSince) wantedSince = nowMs;
+            ULONGLONG need = vr::control::g_cinemaForce ? 0 : (noWalker ? 150 : 600);
+            if (nowMs - wantedSince >= need) cinema = true;
+        } else {
+            wantedSince = 0;
+            if (!unwantedSince) unwantedSince = nowMs;
+            if (nowMs - unwantedSince >= 150) cinema = false;
+        }
         if (cinema != vr::control::g_cinemaActive.load()) {
             vr::log::Line(cinema ? "CINEMA: virtual screen (outside gameplay)" : "CINEMA: end, back to VR");
             vr::control::g_cinemaActive = cinema;
@@ -1664,6 +1688,9 @@ public:
         }
         g_stereoDraws.fetch_add(1, std::memory_order_relaxed);
         vr::control::g_lastStereoDrawMs = GetTickCount64();
+        // Di nuovo dopo il disegno: la scelta del gioco (centro dello schermo)
+        // gira durante il frame e al rilascio del tasto deve valere la nostra.
+        UpdateSquadCommandAim(cam, PlayerPawnIfViewTarget(cam));
     }
 };
 
@@ -1920,7 +1947,38 @@ int32_t RadiansToUnreal(float rad) {
 
 // Thread di rendering, una volta per frame: calcola SOLO i delta (nessuna
 // scrittura sulla camera da qui, vedi MaybeApplyCameraOverride).
+// Secondi da ora a quando il frame che si sta preparando arriva sul display:
+// fino al prossimo vsync, piu' vsync->fotoni, piu' predictFrames frame di
+// pipeline (thread di rendering, lettura del frame, thread di uscita).
+float PredictedSecondsToPhotons(vr::IVRSystem* sys) {
+    static float hz = 0.0f, vsyncToPhotons = 0.0f;
+    static ULONGLONG lastProps = 0;
+    if (GetTickCount64() - lastProps > 2000) {
+        lastProps = GetTickCount64();
+        hz = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+        vsyncToPhotons = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
+                                                            vr::Prop_SecondsFromVsyncToPhotons_Float);
+    }
+    float frame = hz > 30.0f ? 1.0f / hz : 1.0f / 90.0f;
+    float sinceVsync = 0.0f;
+    uint64_t counter = 0;
+    if (!sys->GetTimeSinceLastVsync(&sinceVsync, &counter)) sinceVsync = 0.0f;
+    float s = frame - sinceVsync + vsyncToPhotons + frame * vr::control::g_predictFrames;
+    return s < 0.0f ? 0.0f : (s > 0.1f ? 0.1f : s);
+}
+
+// AActor::Rotation.Yaw del PlayerController (+0x64): ruota il corpo.
+bool AddControllerYaw(void* pc, int32_t delta) {
+    __try {
+        *reinterpret_cast<int32_t*>(static_cast<char*>(pc) + 0x64) += delta;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void UpdateHeadTracking() {
+    g_tickHmdPoseValid = false;
     static int frame = 0;
     bool shouldLog = (++frame % 120 == 0);
 
@@ -1992,13 +2050,32 @@ void UpdateHeadTracking() {
         return;
     }
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
-    vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses, vr::k_unMaxTrackedDeviceCount);
+    float predict = PredictedSecondsToPhotons(vrsys);
+    vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, predict, poses, vr::k_unMaxTrackedDeviceCount);
     const vr::TrackedDevicePose_t& hmdPose = poses[vr::k_unTrackedDeviceIndex_Hmd];
     if (!hmdPose.bPoseIsValid) {
         if (shouldLog) vr::log::Line("UpdateHeadTracking: invalid HMD pose.");
         return;
     }
     const vr::HmdMatrix34_t& m = hmdPose.mDeviceToAbsoluteTracking;
+    g_tickHmdPose = m;
+    g_tickHmdPoseValid = true;
+    if (vr::control::g_ipdFromHmd && vr::control::g_stereoHalfIpd > 0.0f) {
+        static ULONGLONG lastIpd = 0;
+        if (GetTickCount64() - lastIpd > 2000) {
+            lastIpd = GetTickCount64();
+            float halfM = std::fabs(vrsys->GetEyeToHeadTransform(vr::Eye_Right).m[0][3]);
+            if (halfM > 0.025f && halfM < 0.040f) {
+                float half = halfM * vr::control::g_posScale;
+                if (std::fabs(half - vr::control::g_stereoHalfIpd) > 0.01f) {
+                    vr::control::g_stereoHalfIpd = half;
+                    vr::log::Line("STEREO: headset IPD " + std::to_string(halfM * 2000.0f) + " mm -> half " +
+                                  std::to_string(half) + " units");
+                }
+            }
+        }
+    }
+    if (shouldLog) vr::log::Line("UpdateHeadTracking: poses predicted " + std::to_string(predict * 1000.0f) + " ms ahead.");
     float hmdYaw = YawFromOpenVrPose(m);
     float hmdPitch = PitchFromOpenVrPose(m);
     // OpenVR: x destra, y su, -z avanti; posizione in metri nella colonna 3.
@@ -2018,7 +2095,20 @@ void UpdateHeadTracking() {
     // dall'ultimo ricentramento): abbassarsi davvero abbassa la vista, ma un
     // ricentramento fatto da chinati non solleva tutto quando ci si alza.
     if (pos[1] > posRef[1]) posRef[1] = pos[1];
-    g_deltaYaw = vr::control::g_yawSign * RadiansToUnreal(hmdYaw - g_hmdYawReference);
+    // Il corpo segue la testa: l'eccesso oltre la soglia passa dalla testa al
+    // corpo (rotazione del PlayerController) e il riferimento si sposta della
+    // stessa quantita', cosi' la vista non cambia.
+    float turnThr = vr::control::g_turnWithHeadDeg * 0.01745329252f;
+    void* pcForTurn = g_playerControllerPtr;
+    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive) {
+        float ex = std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f);
+        if (std::fabs(ex) > turnThr) {
+            float shift = ex - std::copysign(turnThr, ex);
+            if (AddControllerYaw(pcForTurn, vr::control::g_yawSign * RadiansToUnreal(shift)))
+                g_hmdYawReference += shift;
+        }
+    }
+    g_deltaYaw = vr::control::g_yawSign * RadiansToUnreal(std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f));
     g_deltaPitch = vr::control::g_pitchSign * RadiansToUnreal(hmdPitch - g_hmdPitchReference);
     if (vr::control::g_sixDof) {
         // Rollio: inclinazione del vettore "right" del visore (colonna 0).
@@ -2732,6 +2822,39 @@ void LogBones(void* mesh) {
     vr::log::Line("BONES:" + line);
 }
 
+// Scala del mondo: altezza dello scheletro (osso piu' alto - piu' basso) e
+// lunghezza delle braccia, da confrontare con un adulto vero (~1,8 m).
+void LogBodySize(void* mesh) {
+    float zmin = 1e9f, zmax = -1e9f;
+    std::string top, bottom;
+    for (int i = 0; i < 200; ++i) {
+        struct {
+            int32_t index;
+            int32_t ret[2];
+        } bn = {i, {0, 0}};
+        if (!vr::script::CallFunction(mesh, "GetBoneName", &bn) || bn.ret[0] <= 0) break;
+        struct {
+            int32_t name[2];
+            int32_t space;
+            float ret[3];
+        } bl = {{bn.ret[0], bn.ret[1]}, 0, {0, 0, 0}};
+        if (!vr::script::CallFunction(mesh, "GetBoneLocation", &bl)) continue;
+        std::string nm = vr::script::NameFromIndex(bn.ret[0]);
+        if (bl.ret[2] > zmax) {
+            zmax = bl.ret[2];
+            top = nm;
+        }
+        if (bl.ret[2] < zmin) {
+            zmin = bl.ret[2];
+            bottom = nm;
+        }
+    }
+    char b[200];
+    snprintf(b, sizeof(b), "BODYSIZE: skeleton height %.1f units (%s %.1f .. %s %.1f)", zmax - zmin, top.c_str(), zmax,
+             bottom.c_str(), zmin);
+    vr::log::Line(b);
+}
+
 void LogBoneLocation(void* mesh, const char* bone) {
     struct {
         int32_t name[2];
@@ -3036,6 +3159,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         SafeCopy(c + kOffCtrlBlendTimeToGo, zero3, 4);
     }
     if (vr::control::g_armBonesRequested.exchange(false)) LogBones(g_rig.mesh);
+    if (vr::control::g_bodySizeRequested.exchange(false)) LogBodySize(g_rig.mesh);
     bool debugNow = vr::control::g_armDebugFrames.load() > 0;
     // Relazione mano/arma: rimisurata a ogni cambio d'arma e ogni ~30 frame,
     // solo con il modello davvero nella mano (durante il cambio d'arma il
@@ -3177,6 +3301,23 @@ public:
             float b = bodyYaw * (6.28318530718f / 65536.0f);
             float f = g_headOffset[0], r = g_headOffset[1], u = g_headOffset[2];
             float base[3] = {outLoc[0], outLoc[1], outLoc[2]};
+            // Altezza della vista ammorbidita (solo la vista: la mira resta
+            // quella del gioco). Salti oltre 80 unita' (teletrasporti,
+            // checkpoint) passano subito.
+            {
+                static float smoothZ = 0.0f;
+                static double lastT = 0.0;
+                double now = ProfMs() * 0.001;
+                float tau = vr::control::g_eyeHeightSmooth;
+                if (lastT == 0.0 || tau <= 0.0f || std::fabs(base[2] - smoothZ) > 80.0f || now - lastT > 0.5) {
+                    smoothZ = base[2];
+                } else {
+                    float a = 1.0f - std::exp(-static_cast<float>(now - lastT) / tau);
+                    smoothZ += (base[2] - smoothZ) * a;
+                }
+                lastT = now;
+                base[2] = smoothZ;
+            }
             // UE3: X avanti, Y destra, Z su.
             float target[3] = {base[0] + f * std::cos(b) - r * std::sin(b), base[1] + f * std::sin(b) + r * std::cos(b),
                                base[2] + u};
@@ -3201,6 +3342,13 @@ public:
             outLoc[0] = base[0] + dx * t;
             outLoc[1] = base[1] + dy * t;
             outLoc[2] = base[2] + dz * t;
+            if (vr::control::g_camLogFrames.load() > 0 && g_drawEye != 1) {
+                vr::control::g_camLogFrames.fetch_sub(1);
+                char b[260];
+                snprintf(b, sizeof(b), "CAMLOG: base (%.2f, %.2f, %.2f) view (%.2f, %.2f, %.2f) head t=%.2f rot (%d, %d, %d)",
+                         base[0], base[1], base[2], outLoc[0], outLoc[1], outLoc[2], t, outRot[0], outRot[1], outRot[2]);
+                vr::log::Line(b);
+            }
             // Il rendering usa questa origine (testa 6DOF compresa): va nella
             // lista delle origini per occhio, altrimenti col visore vero (testa
             // spostata) nessun frame viene riconosciuto e il visore non riceve
@@ -3293,6 +3441,112 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     g_markerNdc[eye][0] = (x / z) / th;
     g_markerNdc[eye][1] = (y / z) / tv;
     g_markerVisible[eye] = true;
+}
+
+
+// --- Comando alla squadra lungo la canna ---------------------------------------
+//
+// Tenendo il tasto squadra il gioco sceglie il bersaglio dell'ordine tra gli
+// oggetti "marcabili" piu' vicini al centro dello schermo
+// (m_currentSelectedTacticalMarkableBestScreenDist): in VR e' il centro della
+// vista, cioe' la testa, mentre si mira con l'arma (18/10, provato: testa sul
+// nemico -> selezionato, arma sul nemico -> niente). Qui, finche' la modalita'
+// comando e' attiva, si sceglie il nemico vivo e visibile piu' vicino alla
+// linea della canna e lo si passa al gioco con SetAsCurrentSelectedMarkable
+// (distanza dal centro 0: vince sulla scelta dello schermo).
+constexpr uintptr_t kOffPcSelectedMarkable = 0xE98;  // m_currentSelectedTacticalMarkable
+constexpr uintptr_t kOffWorldInfoPawnList = 0x4F4;
+constexpr uintptr_t kOffPawnNextPawn = 0x218;
+constexpr uintptr_t kOffPawnHealth = 0x304;
+constexpr uintptr_t kOffActorWorldInfo = 0xEC;
+
+void UpdateSquadCommandAim(char* cam, void* pawn) {
+    static void* lastPick = nullptr;
+    // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
+    // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
+    if (!vr::control::g_commandFollowsGun || !pawn || !vr::control::g_aimHand || !g_armsActive ||
+        !vr::control::g_squadButtonHeld) {
+        lastPick = nullptr;
+        return;
+    }
+    // Raggio dagli occhi verso il punto in cui arriva la canna (il mirino
+    // verde): lo stesso della camera logica del gioco. La visibilita' si
+    // controlla dagli occhi, come fa il gioco: la canna all'altezza del fianco
+    // dietro una copertura "vede" solo la copertura.
+    float bo[3], bd[3];
+    if (!g_muzzleAimValid) return;
+    std::memcpy(bo, cam + 0x10, sizeof(bo));
+    float dl = std::sqrt((g_muzzleTarget[0] - bo[0]) * (g_muzzleTarget[0] - bo[0]) +
+                         (g_muzzleTarget[1] - bo[1]) * (g_muzzleTarget[1] - bo[1]) +
+                         (g_muzzleTarget[2] - bo[2]) * (g_muzzleTarget[2] - bo[2]));
+    if (dl < 1.0f) return;
+    for (int i = 0; i < 3; ++i) bd[i] = (g_muzzleTarget[i] - bo[i]) / dl;
+    uint32_t worldInfo = 0, p = 0;
+    if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo ||
+        !TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + kOffWorldInfoPawnList, &p))
+        return;
+    void* best = nullptr;
+    float bestScore = 1e9f;
+    static ULONGLONG lastDiag = 0;
+    bool diag = vr::control::g_fireLog && GetTickCount64() - lastDiag > 1000;
+    if (diag) lastDiag = GetTickCount64();
+    for (int guard = 0; p && guard < 512; ++guard) {
+        char* other = reinterpret_cast<char*>(p);
+        uint32_t next = 0;
+        TrySafeReadUint32(other + kOffPawnNextPawn, &next);
+        int32_t health = 0;
+        float loc[3];
+        if (other != pawn && TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&health)) &&
+            health > 0 && SafeCopy(loc, other + 0x54, 12)) {
+            std::string cls = vr::script::ClassName(other);
+            bool friendOrCivil = cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos ||
+                                 cls.find("Walker") != std::string::npos || cls.find("Civil") != std::string::npos ||
+                                 cls.find("Refugee") != std::string::npos;
+            loc[2] += 30.0f;  // petto
+            float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
+            float along = v[0] * bd[0] + v[1] * bd[1] + v[2] * bd[2];
+            if (!friendOrCivil && along > 50.0f) {
+                float perp[3] = {v[0] - bd[0] * along, v[1] - bd[1] * along, v[2] - bd[2] * along};
+                float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+                // Tolleranza: 3 gradi, e almeno ~45 unita' (un corpo) da vicino.
+                float tol = std::fmax(along * 0.0524f, 45.0f);
+                float score = off / along;
+                float hitTime = 1.0f;
+                bool blocked = TraceLine(pawn, bo, loc, &hitTime) &&
+                               hitTime * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) <
+                                   std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - 60.0f;
+                if (diag) {
+                    char b[200];
+                    snprintf(b, sizeof(b), "SQUAD check: %s along=%.0f off=%.0f tol=%.0f blocked=%d (hit %.2f)",
+                             cls.c_str(), along, off, tol, (int)blocked, hitTime);
+                    vr::log::Line(b);
+                }
+                if (off < tol && score < bestScore) {
+                    if (!blocked) {
+                        best = other;
+                        bestScore = score;
+                    }
+                }
+            }
+        }
+        p = next;
+    }
+    if (!best) {
+        lastPick = nullptr;
+        return;
+    }
+    struct {
+        void* markable;
+        float screenDist;
+    } parms = {best, 0.0f};
+    vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
+    if (best != lastPick) {
+        lastPick = best;
+        uint32_t sel = 0;
+        TrySafeReadUint32(cam - 0x77C + kOffPcSelectedMarkable, &sel);
+        vr::log::Line("SQUAD: command target along the barrel: " + vr::script::ClassName(best) +
+                      (reinterpret_cast<void*>(sel) == best ? " (selected)" : " (not taken by the game)"));
+    }
 }
 
 

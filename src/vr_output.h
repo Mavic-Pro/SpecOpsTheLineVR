@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d9.h>
+#include <openvr.h>
 
 // Uscita verso il visore: il back buffer D3D9 del gioco viene ritagliato per
 // occhio, copiato via CPU (lettura in pipeline) in texture Direct3D 11 create
@@ -16,6 +17,10 @@ void OnPresent(IDirect3DDevice9* device, int eye);
 // Da chiamare prima di IDirect3DDevice9::Reset: le risorse D3DPOOL_DEFAULT
 // vanno rilasciate o il Reset fallisce.
 void OnBeforeReset();
+
+// Thread di rendering: posa del visore con cui e' stato disegnato l'occhio del
+// frame in corso (nullptr = sconosciuta). Viaggia col frame fino al Submit.
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose);
 
 // Rettangolo (pixel del back buffer) della porzione di immagine dell'occhio.
 RECT EyeCropRect(int eye);

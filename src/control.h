@@ -42,6 +42,18 @@ extern std::atomic<int> g_outputTest;
 // Scala dell'immagine per occhio inviata al visore (1 = piena risoluzione):
 // meno pixel da leggere dalla GPU, piu' fps, meno nitidezza.
 extern std::atomic<float> g_outputScale;
+// Ogni frame inviato a SteamVR con la posa della testa usata per disegnarlo
+// (Submit_TextureWithPose): la riproiezione del visore corregge dalla posa
+// giusta. Senza, l'immagine "nuotava" muovendo la testa (segnalazione 18/10).
+extern std::atomic<bool> g_submitWithPose;
+// Comando alla squadra (tasto squadra tenuto): il bersaglio e' il nemico lungo
+// la canna, come il mirino verde. Il gioco lo sceglie al centro dello schermo,
+// cioe' dove guarda la testa (segnalazione 18/10: il cecchino sul cartellone
+// non si riusciva a indicare).
+extern std::atomic<bool> g_commandFollowsGun;
+// Pose di testa e controller predette per l'istante in cui il frame arriva
+// sul display: fino al prossimo vsync + vsync->fotoni + predictFrames frame.
+extern std::atomic<float> g_predictFrames;
 // Con il device D3D9Ex (file specopsvr_gpushare): copia GPU->GPU degli occhi
 // tramite superfici condivise invece della lettura via CPU.
 extern std::atomic<bool> g_gpuCopy;  // diagnostica: 1 = salta la copia, 2 = salta copia e WaitGetPoses, 3 = solo senza WaitGetPoses
@@ -138,6 +150,8 @@ extern std::atomic<bool> g_fireLog;
 extern std::atomic<int> g_projLogSeconds;
 // Grilletto destro premuto (letto dall'input VR): innesca la ricerca dei proiettili lanciati.
 extern std::atomic<bool> g_rightTriggerHeld;
+// Tasto squadra (RB) premuto nell'input passato al gioco: comando alla squadra.
+extern std::atomic<bool> g_squadButtonHeld;
 // Aggiornamento automatico (updater.cpp): "autoupdate on|off", "updaterepo proprietario/nome".
 extern std::atomic<bool> g_autoUpdate;
 std::string UpdateRepo();
@@ -150,6 +164,10 @@ extern std::atomic<float> g_bodyBack;
 extern std::atomic<float> g_bodyBackLook;
 // Il corpo segue gli spostamenti orizzontali della testa (6DOF).
 extern std::atomic<bool> g_bodyFollowsHead;
+// Girandosi fisicamente oltre questi gradi il corpo di Walker segue la testa
+// (la vista non cambia): lo stick "avanti" torna verso dove si guarda.
+// 0 = mai (solo stick). Segnalazione 18/10: "still had to use the right stick".
+extern std::atomic<float> g_turnWithHeadDeg;
 extern std::atomic<float> g_armRotDeg[3];
 // Allungamento massimo del braccio per raggiungere i controller (1 = nessuno).
 extern std::atomic<float> g_armStretch;
@@ -159,6 +177,17 @@ extern std::atomic<float> g_armOffsetCm[3];
 std::string ArmControlName(int i);
 extern std::atomic<int> g_armDebugFrames;
 extern std::atomic<bool> g_armBonesRequested;
+// "bodysize": altezza dello scheletro di Walker (ossa piu' alta e piu' bassa) nel log.
+extern std::atomic<bool> g_bodySizeRequested;
+// "camlog N": per N frame, posizione di base della vista (gioco) e finale (6DOF) nel log.
+extern std::atomic<int> g_camLogFrames;
+// Costante di tempo (s) con cui l'altezza della vista segue quella del gioco:
+// accovacciarsi in copertura o sporgersi abbassa/alza Walker di ~40 cm in un
+// frame (18/10, "when taking cover my screen is shaking"). 0 = immediato.
+extern std::atomic<float> g_eyeHeightSmooth;
+// Distanza tra gli occhi letta dal visore (GetEyeToHeadTransform) invece del
+// valore fisso di "stereo"; "ipd auto|fixed".
+extern std::atomic<bool> g_ipdFromHmd;
 extern std::atomic<float> g_synthHandCm[3];
 // Mira a due mani: con la mano sinistra davanti alla destra (impugnatura da
 // fucile) la mira va dalla mano destra alla sinistra. synthleft = mano

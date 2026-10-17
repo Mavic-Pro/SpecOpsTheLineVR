@@ -33,6 +33,10 @@ std::atomic<bool> g_cinemaForce{false};
 std::atomic<float> g_cinemaWidthM{3.2f}, g_cinemaDistM{2.6f};
 std::atomic<int> g_outputTest{0};
 std::atomic<float> g_outputScale{1.0f};
+std::atomic<bool> g_submitWithPose{true};
+std::atomic<bool> g_commandFollowsGun{true};
+std::atomic<float> g_turnWithHeadDeg{45.0f};
+std::atomic<float> g_predictFrames{1.0f};
 std::atomic<bool> g_gpuCopy{true};
 std::atomic<float> g_stereoHalfIpd{1.6f};  // ~6,4 cm a ~2 cm per unita' Unreal
 std::atomic<int> g_presentEye{-1};
@@ -84,6 +88,7 @@ std::atomic<bool> g_spread{true};
 std::atomic<bool> g_fireLog{false};
 std::atomic<int> g_projLogSeconds{0};
 std::atomic<bool> g_rightTriggerHeld{false};
+std::atomic<bool> g_squadButtonHeld{false};
 std::atomic<bool> g_autoUpdate{true};
 static std::mutex g_updateRepoMutex;
 static std::string g_updateRepo;
@@ -100,6 +105,10 @@ std::atomic<float> g_armRotDeg[3];
 std::atomic<float> g_armOffsetCm[3];
 std::atomic<int> g_armDebugFrames{0};
 std::atomic<bool> g_armBonesRequested{false};
+std::atomic<bool> g_bodySizeRequested{false};
+std::atomic<int> g_camLogFrames{0};
+std::atomic<float> g_eyeHeightSmooth{0.12f};
+std::atomic<bool> g_ipdFromHmd{true};
 static std::mutex g_armNamesMutex;
 static std::string g_armNames[4] = {"IK_RightHand", "IK_LeftHand", "IKRot_RightHand", "IKRot_LeftHand"};
 std::string ArmControlName(int i) {
@@ -358,6 +367,20 @@ void Execute(const std::string& line) {
         g_armDebugFrames = 1;
     } else if (cmd == "armbones") {
         g_armBonesRequested = true;
+    } else if (cmd == "ipd") {
+        std::string v;
+        in >> v;
+        g_ipdFromHmd = (v != "fixed");
+    } else if (cmd == "eyesmooth") {
+        float v = 0.12f;
+        in >> v;
+        g_eyeHeightSmooth = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    } else if (cmd == "camlog") {
+        int v = 60;
+        in >> v;
+        g_camLogFrames = v;
+    } else if (cmd == "bodysize") {
+        g_bodySizeRequested = true;
     } else if (cmd == "twohand") {
         std::string v;
         in >> v;
@@ -464,6 +487,22 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_gpuCopy = (v != "off");
+    } else if (cmd == "submitpose") {
+        std::string v;
+        in >> v;
+        g_submitWithPose = (v != "off");
+    } else if (cmd == "turnwithhead") {
+        float v = 45.0f;
+        in >> v;
+        g_turnWithHeadDeg = v < 0.0f ? 0.0f : (v > 170.0f ? 170.0f : v);
+    } else if (cmd == "commandaim") {
+        std::string v;
+        in >> v;
+        g_commandFollowsGun = (v != "head");
+    } else if (cmd == "predict") {
+        float v = 1.0f;
+        in >> v;
+        g_predictFrames = v < 0.0f ? 0.0f : (v > 4.0f ? 4.0f : v);
     } else if (cmd == "outputscale") {
         float v = 1.0f;
         in >> v;

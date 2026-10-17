@@ -45,6 +45,16 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 - **Post effects**: motion blur and depth of field are switched off in
   `GSystemSettings` (`0x014D77B0`).
 - **Near plane**: `GNearClippingPlane` (`0x0141578C`).
+- **Render pose**: head and controller poses are predicted to display time
+  (next vsync + vsync-to-photons + `predict` frames). The HMD pose of each
+  game tick travels with the eye origins (eye ring) to the frame and is
+  submitted with `Submit_TextureWithPose`, so the compositor reprojects
+  from the pose the frame was really rendered with (without it the image
+  swam when moving the head). IPD from `GetEyeToHeadTransform`.
+- **Eye height** changes of the game (crouching in cover, popping up: ~20
+  units in one frame) are smoothed on the view only (`eyesmooth`).
+- **Cinema screen**: entered only after 0.6 s of cinematic mode (0.15 s when
+  the camera leaves Walker), so short scripted moments stay in VR.
 
 ## Camera and head tracking
 
@@ -136,6 +146,15 @@ Useful offsets (`ue3.py props`):
   the warhead loaded in the tube, owned by the weapon) and rotates their
   velocity from the body frame to the barrel frame, so rockets fly along the
   barrel and Milkor grenades keep their lob relative to the barrel.
+- Squad orders: the game selects the order target natively among tactical
+  markables nearest to the screen centre
+  (`m_currentSelectedTacticalMarkableBestScreenDist`), i.e. where the head
+  looks. While the squad button (RB) is held the mod picks the live,
+  visible enemy nearest to the eye-to-marker ray and passes it to
+  `YPlayerController.SetAsCurrentSelectedMarkable` (screen distance 0), before
+  and after the frame is drawn.
+- Turning: past `turnwithhead` degrees of head yaw the excess moves to the
+  PlayerController rotation and to the yaw reference (view unchanged).
 - Aim assist (`YWeapon` friction / snap-on flags at +0x260,
   `YPlayerController.m_aimSnapOnActiveByUser` +0x734) is disabled while
   aiming by hand.

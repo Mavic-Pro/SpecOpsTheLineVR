@@ -477,6 +477,7 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
                 state->Gamepad = g_fake;
                 ApplyVrStickRules(&state->Gamepad);
                 vr::control::g_rightTriggerHeld = state->Gamepad.bRightTrigger > 100;
+                vr::control::g_squadButtonHeld = (state->Gamepad.wButtons & kRB) != 0;
                 return ERROR_SUCCESS;
             }
         }
@@ -491,12 +492,14 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
             state->dwPacketNumber = g_packet.fetch_add(1);
             state->Gamepad = pad;
             vr::control::g_rightTriggerHeld = pad.bRightTrigger > 100;
+            vr::control::g_squadButtonHeld = (pad.wButtons & kRB) != 0;
             return ERROR_SUCCESS;
         }
     }
     if (user == 0) {
         vr::control::g_motionAmount = 0.0f;  // nessun input VR: niente vignettatura
         vr::control::g_rightTriggerHeld = false;
+        vr::control::g_squadButtonHeld = false;
     }
     return g_GetState_Real ? g_GetState_Real(user, state) : ERROR_DEVICE_NOT_CONNECTED;
 }

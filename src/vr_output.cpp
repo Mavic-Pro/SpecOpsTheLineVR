@@ -54,6 +54,11 @@ IDirect3DSurface9* g_sysmem[2][kSlots] = {};
 SlotState g_slotState[2][kSlots] = {};
 UINT g_slotW[2][kSlots] = {}, g_slotH[2][kSlots] = {};
 bool g_slotCinema[2][kSlots] = {};  // lettura fatta in modalita' schermo virtuale
+bool g_slotPoseValid[2][kSlots] = {};
+vr::HmdMatrix34_t g_slotPose[2][kSlots] = {};
+// Posa con cui e' stato disegnato l'ultimo frame di ciascun occhio (thread di rendering).
+bool g_renderPoseValid[2] = {};
+vr::HmdMatrix34_t g_renderPose[2] = {};
 bool g_slotGpu[2][kSlots] = {};     // slot nella texture condivisa (niente LockRect)
 // Percorso GPU (device D3D9Ex): texture render target condivise con D3D11,
 // una query evento per sapere quando la GPU ha finito lo StretchRect.
@@ -73,6 +78,8 @@ struct EyePacket {
     UINT pitch = 0, w = 0, h = 0;
     bool cinema = false;  // solo occhio 0: immagine 16:9 per lo schermo virtuale
     ID3D11Texture2D* gpuSrc = nullptr;  // percorso GPU: texture condivisa da copiare
+    bool poseValid = false;             // posa del visore usata per disegnarlo
+    vr::HmdMatrix34_t pose = {};
 };
 std::mutex g_mutex;
 std::condition_variable g_cv;
@@ -524,7 +531,7 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
 // specchio, cattura) stanno qui, cosi' il contesto D3D11 ha un solo thread.
 void WorkerLoop() {
     vr::log::Line("VR-OUTPUT: output thread started.");
-    int submits = 0;
+    int submits = 0, posedSubmits = 0;
     double windowStart = QpcMs();
     double copyMs = 0.0, waitMs = 0.0, submitMs = 0.0;
     while (!g_workerStop) {
@@ -623,8 +630,34 @@ void WorkerLoop() {
         vr::Texture_t texL = {cinema && g_blackTex ? g_blackTex : tex[0], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
         vr::Texture_t texR = {cinema && g_blackTex ? g_blackTex : tex[1], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
         vr::VRTextureBounds_t full = {0.0f, 0.0f, 1.0f, 1.0f};
-        vr::EVRCompositorError errL = compositor->Submit(vr::Eye_Left, &texL, cinema ? &full : &bounds[0]);
-        vr::EVRCompositorError errR = compositor->Submit(vr::Eye_Right, &texR, cinema ? &full : &bounds[1]);
+        vr::EVRCompositorError errL, errR;
+        if (!cinema && vr::control::g_submitWithPose && pk[0].poseValid && pk[1].poseValid) {
+            // Con la posa usata per disegnare: il compositor riproietta da
+            // quella alla posa reale al momento della visualizzazione.
+            vr::VRTextureWithPose_t pl = {}, pr = {};
+            static_cast<vr::Texture_t&>(pl) = texL;
+            static_cast<vr::Texture_t&>(pr) = texR;
+            pl.mDeviceToAbsoluteTracking = pk[0].pose;
+            pr.mDeviceToAbsoluteTracking = pk[1].pose;
+            errL = compositor->Submit(vr::Eye_Left, &pl, &bounds[0], vr::Submit_TextureWithPose);
+            errR = compositor->Submit(vr::Eye_Right, &pr, &bounds[1], vr::Submit_TextureWithPose);
+            ++posedSubmits;
+            // Rete di sicurezza: se il compositor rifiuta l'invio con la posa
+            // (errore diverso da "nessun focus"), si torna all'invio normale.
+            auto bad = [](vr::EVRCompositorError e) {
+                return e != vr::VRCompositorError_None && e != vr::VRCompositorError_DoNotHaveFocus;
+            };
+            if (bad(errL) || bad(errR)) {
+                vr::control::g_submitWithPose = false;
+                vr::log::Line("VR-OUTPUT: submit with render pose refused (L=" + std::to_string(static_cast<int>(errL)) +
+                              " R=" + std::to_string(static_cast<int>(errR)) + "), back to plain submit.");
+                errL = compositor->Submit(vr::Eye_Left, &texL, &bounds[0]);
+                errR = compositor->Submit(vr::Eye_Right, &texR, &bounds[1]);
+            }
+        } else {
+            errL = compositor->Submit(vr::Eye_Left, &texL, cinema ? &full : &bounds[0]);
+            errR = compositor->Submit(vr::Eye_Right, &texR, cinema ? &full : &bounds[1]);
+        }
         submitMs += QpcMs() - ts;
         ++submits;
         if (submits == 1 || submits % 300 == 0 || (errL != vr::VRCompositorError_None && submits % 120 == 0)) {
@@ -633,9 +666,9 @@ void WorkerLoop() {
             char b[300];
             std::snprintf(b, sizeof(b),
                           "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
-                          "copy=%.2f headset wait=%.2f Submit=%.2f",
+                          "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
-                          copyMs / n, waitMs / n, submitMs / n);
+                          copyMs / n, waitMs / n, submitMs / n, posedSubmits);
             vr::log::Line(b);
             windowStart = now;
             copyMs = waitMs = submitMs = 0.0;
@@ -655,6 +688,12 @@ void StartWorker() {
 }
 
 }  // namespace
+
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose) {
+    if (eye < 0 || eye > 1) return;
+    g_renderPoseValid[eye] = pose != nullptr;
+    if (pose) g_renderPose[eye] = *pose;
+}
 
 RECT EyeCropRect(int eye) {
     RECT r = g_eyeCrop[eye == 1 ? 1 : 0];
@@ -768,6 +807,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             pk.w = g_slotW[e][g];
             pk.h = g_slotH[e][g];
             pk.gpuSrc = g_shTex11[e][g];
+            pk.poseValid = g_slotPoseValid[e][g];
+            pk.pose = g_slotPose[e][g];
             g_ready[e] = pk;
             g_gpuSlot[e] = -1;
         } else if (g >= 0) {
@@ -782,6 +823,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
                 }
                 g_ready[e] = {g, static_cast<const uint8_t*>(lr.pBits), static_cast<UINT>(lr.Pitch),
                               g_slotW[e][g], g_slotH[e][g], g_slotCinema[e][g]};
+                g_ready[e].poseValid = g_slotPoseValid[e][g];
+                g_ready[e].pose = g_slotPose[e][g];
             } else {
                 g_slotState[e][g] = kFree;
             }
@@ -825,6 +868,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotW[e][s] = sw;
             g_slotH[e][s] = sh;
             g_slotCinema[e][s] = false;
+            g_slotPoseValid[e][s] = g_renderPoseValid[e];
+            g_slotPose[e][s] = g_renderPose[e];
             g_gpuSlot[e] = s;
             continue;
         }
@@ -838,6 +883,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         g_slotW[e][s] = sw;
         g_slotH[e][s] = sh;
         g_slotCinema[e][s] = cinema;
+        g_slotPoseValid[e][s] = g_renderPoseValid[e];
+        g_slotPose[e][s] = g_renderPose[e];
         g_slotGpu[e][s] = false;
         g_gpuSlot[e] = s;
     }
