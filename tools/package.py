@@ -33,7 +33,7 @@ function Find-Game([string]$game) {
       $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
       if (Test-Path $vdf) {
         foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' -AllMatches).Matches) {
-          $libs += ($m.Groups[1].Value -replace '\\', '\')
+          $libs += ($m.Groups[1].Value -replace '\\+', '\')
         }
       }
     }

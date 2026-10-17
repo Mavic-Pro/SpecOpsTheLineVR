@@ -11,12 +11,14 @@
 #include <intrin.h>
 #include <MinHook.h>
 #include <openvr.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace vr::hooks {
 
@@ -1588,6 +1590,8 @@ double ProfMs() {
 }
 
 void UpdateFirstPersonBody(void* pawn);
+void UpdateProjectileLog();
+void RedirectNewProjectiles(void* pawn);
 
 class ViewportDrawThunk {
 public:
@@ -1597,6 +1601,8 @@ public:
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        UpdateProjectileLog();
+        RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         if (vr::control::g_firstPerson && HasCameraSignature(cam)) UpdatePawnViewLocation(cam);
         ApplyNearPlane(cam);
         float half = vr::control::g_stereoHalfIpd;
@@ -2201,6 +2207,108 @@ bool StillAlive(void* obj, uint32_t cls) {
     return slot == reinterpret_cast<uint32_t>(obj) && ObjClass(obj) == cls;
 }
 
+
+// --- Diagnostica dei proiettili (projlog) ---------------------------------------
+//
+// Razzi e granate (RPG, Milkor) non passano da CalcWeaponFire: per N secondi
+// ogni frame si cercano in GObjects gli oggetti di classe Projectile e si
+// registrano posizione e velocita' alla nascita e l'ultima posizione prima che
+// spariscano (esplosione), da confrontare con l'asse della canna e il mirino.
+constexpr uintptr_t kOffActorVelocity = 0x140;
+bool SafeCopy(void* dst, const void* src, size_t n);
+struct ProjTrack {
+    void* obj;
+    uint32_t cls;
+    float start[3], vel[3], last[3];
+    bool seen;
+};
+std::vector<ProjTrack> g_proj;
+ULONGLONG g_projUntil = 0;
+void* g_projClass = nullptr;
+
+bool IsProjectile(void* obj) {
+    uint32_t c = ObjClass(obj);
+    for (int i = 0; c && i < 10; ++i) {
+        if (reinterpret_cast<void*>(c) == g_projClass) return true;
+        if (!TrySafeReadUint32(reinterpret_cast<char*>(c) + 0x3C, &c)) return false;
+    }
+    return false;
+}
+
+void LogProjectile(const ProjTrack& t, const char* what) {
+    char b[400];
+    snprintf(b, sizeof(b), "PROJECTILE %s: %s start=(%.1f, %.1f, %.1f) velocity=(%.1f, %.1f, %.1f) last=(%.1f, %.1f, %.1f)",
+             what, vr::script::ObjectName(reinterpret_cast<void*>(t.cls)).c_str(), t.start[0], t.start[1], t.start[2],
+             t.vel[0], t.vel[1], t.vel[2], t.last[0], t.last[1], t.last[2]);
+    vr::log::Line(b);
+}
+
+void UpdateProjectileLog() {
+    int secs = vr::control::g_projLogSeconds.exchange(0);
+    ULONGLONG now = GetTickCount64();
+    if (secs > 0) {
+        g_projUntil = now + secs * 1000ULL;
+        if (!g_projClass) {
+            uint32_t data = 0, num = 0;
+            TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data);
+            TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num);
+            for (uint32_t i = 0; i < num && !g_projClass; ++i) {
+                uint32_t o = 0;
+                if (TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) && o &&
+                    vr::script::ObjectName(reinterpret_cast<void*>(o)) == "Projectile" &&
+                    vr::script::ClassName(reinterpret_cast<void*>(o)) == "Class")
+                    g_projClass = reinterpret_cast<void*>(o);
+            }
+        }
+        // Proiettili gia' presenti: non vanno registrati come nuovi.
+        g_proj.clear();
+        vr::log::Line(std::string("PROJECTILE: watching for ") + std::to_string(secs) + " s");
+    }
+    if (!g_projUntil || !g_projClass) return;
+    for (auto& t : g_proj) t.seen = false;
+    uint32_t data = 0, num = 0;
+    TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data);
+    TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num);
+    bool first = secs > 0;
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
+        void* obj = reinterpret_cast<void*>(o);
+        if (!IsProjectile(obj)) continue;
+        ProjTrack* t = nullptr;
+        for (auto& x : g_proj)
+            if (x.obj == obj) t = &x;
+        if (!t) {
+            ProjTrack n = {obj, ObjClass(obj), {}, {}, {}, true};
+            SafeCopy(n.start, static_cast<char*>(obj) + 0x54, 12);
+            SafeCopy(n.vel, static_cast<char*>(obj) + kOffActorVelocity, 12);
+            std::memcpy(n.last, n.start, 12);
+            g_proj.push_back(n);
+            if (!first) LogProjectile(n, "spawned");
+            continue;
+        }
+        t->seen = true;
+        SafeCopy(t->last, static_cast<char*>(obj) + 0x54, 12);
+    }
+    if (first) return;  // all'avvio si prendono solo quelli gia' in volo, senza registrarli
+    for (auto it = g_proj.begin(); it != g_proj.end();) {
+        if (!it->seen) {
+            LogProjectile(*it, "gone");
+            it = g_proj.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (now > g_projUntil) {
+        for (auto& t : g_proj) LogProjectile(t, "still flying");
+        g_proj.clear();
+        g_projUntil = 0;
+        vr::log::Line("PROJECTILE: watch ended");
+    }
+}
+
+constexpr uintptr_t kOffCompLocalToWorld = 0x70;  // PrimitiveComponent.LocalToWorld (righe X, Y, Z, T)
+
 // --- Arma nella mano ---------------------------------------------------------
 //
 // Il modello dell'arma (YWeapon.m_weaponMeshComp, SkeletalMeshComponent) e'
@@ -2245,6 +2353,7 @@ struct WeaponInfo {
     void* weapon = nullptr;
     std::string cls;
     bool stationary = false;
+    bool launcher = false;  // YWeapon_Launcher: RPG, Milkor (proiettili veri)
 };
 WeaponInfo g_weaponInfo;
 
@@ -2253,6 +2362,7 @@ const WeaponInfo& CurrentWeaponInfo(void* weapon) {
         g_weaponInfo.weapon = weapon;
         g_weaponInfo.cls = weapon ? vr::script::ClassName(weapon) : std::string();
         g_weaponInfo.stationary = weapon && vr::script::IsA(weapon, "YWeapon_Stationary");
+        g_weaponInfo.launcher = weapon && vr::script::IsA(weapon, "YWeapon_Launcher");
         if (weapon)
             vr::log::Line("WEAPON: " + g_weaponInfo.cls + (g_weaponInfo.stationary ? " (mounted weapon: left in place)" : ""));
     }
@@ -2342,7 +2452,8 @@ constexpr uintptr_t kOffCtrlStrength = 0x68, kOffCtrlFlags = 0x78, kOffCtrlStren
                     kOffCtrlBlendTimeToGo = 0x80;     // SkelControlBase
 constexpr uint32_t kCtrlByAnimMetadata = 0x8;
 constexpr uintptr_t kOffLimbEffector = 0xBC, kOffLimbEffectorSpace = 0xC8, kOffLimbJointSpace = 0xC9,
-                    kOffLimbJoint = 0xD4;             // SkelControlLimb
+                    kOffLimbJoint = 0xD4, kOffLimbFlags = 0xE8, kOffLimbStretchLimits = 0xEC;  // SkelControlLimb
+constexpr uint32_t kLimbAllowStretching = 0x10;
 constexpr uintptr_t kOffSingleFlags = 0xBC, kOffSingleRotSpace = 0xCD, kOffSingleRot = 0xD8;  // SkelControlSingleBone
 constexpr uint32_t kSingleApplyTranslation = 0x1, kSingleApplyRotation = 0x2, kSingleAddRotation = 0x8;
 constexpr uint8_t kBcsActorSpace = 1;
@@ -2351,9 +2462,14 @@ constexpr size_t kCtrlSaveFrom = 0x68, kCtrlSaveLen = 0x90;  // campi modificati
 struct ArmRig {
     void* mesh = nullptr;
     uint32_t meshCls = 0;
-    void* ctrl[4] = {};  // limb destra, limb sinistra, rot destra, rot sinistra
-    uint32_t ctrlCls[4] = {};
-    uint8_t saved[4][kCtrlSaveLen];
+    // limb destra, limb sinistra, rot destra, rot sinistra, e gli IK sulle ossa
+    // ausiliarie (IKBone_*), che il gioco usa per alcune armi (RPG in spalla):
+    // applicati dopo i nostri riporterebbero la mano sull'animazione, quindi
+    // restano a forza 0 finche' le braccia seguono i controller.
+    static constexpr int kCount = 6;
+    void* ctrl[kCount] = {};
+    uint32_t ctrlCls[kCount] = {};
+    uint8_t saved[kCount][kCtrlSaveLen];
 };
 ArmRig g_rig;
 // Assi della mano espressi nel riferimento dell'osso dell'arma (Weapon_Right /
@@ -2383,7 +2499,7 @@ void* FindSkelControl(void* mesh, const std::string& name) {
 }
 
 void ReleaseArms() {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < ArmRig::kCount; ++i) {
         if (g_rig.ctrl[i] && StillAlive(g_rig.ctrl[i], g_rig.ctrlCls[i]))
             SafeCopy(static_cast<char*>(g_rig.ctrl[i]) + kCtrlSaveFrom, g_rig.saved[i], kCtrlSaveLen);
         g_rig.ctrl[i] = nullptr;
@@ -2396,10 +2512,10 @@ void ReleaseArms() {
 bool AcquireArms(void* mesh) {
     ReleaseArms();
     std::string names;
-    for (int i = 0; i < 4; ++i) {
-        std::string n = vr::control::ArmControlName(i);
+    for (int i = 0; i < ArmRig::kCount; ++i) {
+        std::string n = i < 4 ? vr::control::ArmControlName(i) : (i == 4 ? "IKBone_RightHand" : "IKBone_LeftHand");
         void* c = FindSkelControl(mesh, n);
-        names += " " + n + (c ? "=ok" : "=assente");
+        names += " " + n + (c ? "=ok" : "=missing");
         if (!c || !SafeCopy(g_rig.saved[i], static_cast<char*>(c) + kCtrlSaveFrom, kCtrlSaveLen)) {
             g_rig.ctrl[i] = nullptr;
             continue;
@@ -2442,6 +2558,11 @@ bool WriteHandControls(void* limb, void* rotc, const float* eff, const float* jo
         *reinterpret_cast<uint32_t*>(l + kOffCtrlFlags) &= ~kCtrlByAnimMetadata;
         std::memcpy(l + kOffLimbEffector, eff, 12);
         l[kOffLimbEffectorSpace] = kBcsActorSpace;
+        // Braccio un po' allungabile (fino al 25%): con le mani tese in avanti
+        // il braccio di Walker (~24 unita') non arriverebbe ai controller.
+        *reinterpret_cast<uint32_t*>(l + kOffLimbFlags) |= kLimbAllowStretching;
+        const float stretch[2] = {1.0f, vr::control::g_armStretch};
+        std::memcpy(l + kOffLimbStretchLimits, stretch, 8);
         std::memcpy(l + kOffLimbJoint, joint, 12);
         l[kOffLimbJointSpace] = kBcsActorSpace;
         if (rotc) {
@@ -2552,15 +2673,40 @@ bool BoneAxes(void* mesh, const char* bone, float axes[3][3]) {
     return true;
 }
 
-void MeasureHandInWeapon(void* mesh, int side) {
+// Riferimento dell'arma: per la mano destra il modello dell'arma in mano
+// (LocalToWorld del componente: righe X, Y, Z), che puo' essere agganciato con
+// una rotazione propria (17/10: l'RPG, portato in spalla, puntava 50 gradi in
+// basso usando l'osso Weapon_Right); altrimenti l'osso Weapon_Right/Left.
+bool WeaponAxes(void* mesh, int side, void* gunComp, float w[3][3]) {
+    if (side == 0 && gunComp) {
+        float m[16];
+        if (SafeCopy(m, static_cast<char*>(gunComp) + kOffCompLocalToWorld, sizeof(m))) {
+            bool ok = true;
+            for (int r = 0; r < 3 && ok; ++r) {
+                float len = std::sqrt(m[4 * r] * m[4 * r] + m[4 * r + 1] * m[4 * r + 1] + m[4 * r + 2] * m[4 * r + 2]);
+                if (!(len > 0.5f && len < 2.0f)) ok = false;
+                for (int c = 0; c < 3 && ok; ++c) w[r][c] = m[4 * r + c] / len;
+            }
+            if (ok) return true;
+        }
+    }
+    return BoneAxes(mesh, side == 0 ? "Weapon_Right" : "Weapon_Left", w);
+}
+
+void MeasureHandInWeapon(void* mesh, int side, void* gunComp) {
     float h[3][3], w[3][3];
     const char* hand = side == 0 ? "Hand_Right" : "Hand_Left";
-    const char* weap = side == 0 ? "Weapon_Right" : "Weapon_Left";
-    if (!BoneAxes(mesh, hand, h) || !BoneAxes(mesh, weap, w)) return;
+    const char* weap = side == 0 ? (gunComp ? "weapon mesh" : "Weapon_Right") : "Weapon_Left";
+    if (!BoneAxes(mesh, hand, h) || !WeaponAxes(mesh, side, gunComp, w)) return;
+    float change = 0.0f;
     for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b)
-            g_handInWeapon[side][a][b] = h[a][0] * w[b][0] + h[a][1] * w[b][1] + h[a][2] * w[b][2];
+        for (int b = 0; b < 3; ++b) {
+            float v = h[a][0] * w[b][0] + h[a][1] * w[b][1] + h[a][2] * w[b][2];
+            change += std::fabs(v - g_handInWeapon[side][a][b]);
+            g_handInWeapon[side][a][b] = v;
+        }
     g_handInWeaponValid[side] = true;
+    if (change < 0.05f && !vr::control::g_armDebugFrames.load()) return;  // nel log solo i cambiamenti
     char buf[200];
     snprintf(buf, sizeof(buf), "ARMS: %s in the frame of %s: X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)",
              hand, weap, g_handInWeapon[side][0][0], g_handInWeapon[side][0][1], g_handInWeapon[side][0][2],
@@ -2680,10 +2826,18 @@ void UpdateFirstPersonBody(void* pawn) {
         int32_t actorYaw = 0;
         SafeCopy(&actorYaw, static_cast<char*>(pawn) + kOffActorRotation + 4, 4);
         float a = (g_bodyYaw.load() - actorYaw) * (6.28318530718f / 65536.0f);
-        float xy[2] = {g_fpSavedMeshX - vr::control::g_bodyBack + f * std::cos(a) - r * std::sin(a),
+        // Indietro di bodyback (le braccia devono arrivare ai controller) e di
+        // altre bodybacklook unita' guardando in basso oltre 30 gradi (fino a 60),
+        // cosi' si vedono petto e gambe e non l'interno del colletto.
+        float pitchDeg = static_cast<float>(g_bodyPitch.load() + g_deltaPitch.load()) * (360.0f / 65536.0f);
+        if (pitchDeg > 180.0f) pitchDeg -= 360.0f;
+        float look = (-pitchDeg - 30.0f) / 30.0f;
+        look = look < 0.0f ? 0.0f : (look > 1.0f ? 1.0f : look);
+        float back = vr::control::g_bodyBack + vr::control::g_bodyBackLook * look;
+        float xy[2] = {g_fpSavedMeshX - back + f * std::cos(a) - r * std::sin(a),
                        g_fpSavedMeshY + f * std::sin(a) + r * std::cos(a)};
         if (!vr::control::g_bodyFollowsHead) {
-            xy[0] = g_fpSavedMeshX - vr::control::g_bodyBack;
+            xy[0] = g_fpSavedMeshX - back;
             xy[1] = g_fpSavedMeshY;
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xy, 8);
@@ -2704,6 +2858,134 @@ void DisableAimAssist(char* cam, void* weapon) {
         if (weapon) *reinterpret_cast<uint32_t*>(static_cast<char*>(weapon) + kOffWeaponAssistFlags) &= ~kWeaponAssistBits;
         if (HasCameraSignature(cam)) *(cam - 0x77C + kOffPcAimSnapByUser) = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+
+// --- Proiettili lungo la canna (RPG, Milkor) ---------------------------------
+//
+// I colpi istantanei passano da CalcWeaponFire; razzi e granate invece il gioco
+// li lancia nella direzione del corpo (17/10: con il controller girato di 30
+// gradi il razzo partiva a 30 gradi dalla canna). Quando le munizioni dell'arma
+// in mano calano, per qualche frame si cercano i proiettili nuovi lanciati da
+// Walker (Instigator) e se ne ruota la velocita' dal riferimento del corpo a
+// quello della canna: il razzo va dove punta la canna e la granata del Milkor
+// conserva il suo tiro a parabola rispetto alla canna.
+constexpr uintptr_t kOffActorInstigator = 0xE8;
+int g_projRedirectFrames = 0;
+std::vector<void*> g_projRedirected;
+
+void RedirectNewProjectiles(void* pawn) {
+    static void* lastWeapon = nullptr;
+    static int32_t lastAmmo[2] = {-1, -1};
+    uint32_t weapon = 0;
+    int32_t ammo[2] = {-1, -1};
+    if (!pawn || !TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) || !weapon) return;
+    // Solo lanciatori (RPG, Milkor): la scansione non costa nulla con le altre armi.
+    bool launcher = CurrentWeaponInfo(reinterpret_cast<void*>(weapon)).launcher;
+    if (vr::control::g_fireLog) {
+        static ULONGLONG last = 0;
+        if (GetTickCount64() - last > 1000) {
+            last = GetTickCount64();
+            char b[160];
+            snprintf(b, sizeof(b), "PROJECTILE redirect check: weapon=%s launcher=%d trigger=%d frames=%d",
+                     g_weaponInfo.cls.c_str(), (int)launcher, (int)vr::control::g_rightTriggerHeld.load(), g_projRedirectFrames);
+            vr::log::Line(b);
+        }
+    }
+    if (!launcher) return;
+    // Innesco: grilletto premuto (e qualche frame dopo) o caricatore/munizioni in calo
+    // (m_currentAmmoCount +0x764, m_currentMagAmmo +0x778; con l'RPG il primo resta a 1).
+    SafeCopy(&ammo[0], reinterpret_cast<char*>(weapon) + 0x764, 4);
+    SafeCopy(&ammo[1], reinterpret_cast<char*>(weapon) + 0x778, 4);
+    bool dropped = reinterpret_cast<void*>(weapon) == lastWeapon &&
+                   ((lastAmmo[0] >= 0 && ammo[0] < lastAmmo[0]) || (lastAmmo[1] >= 0 && ammo[1] < lastAmmo[1]));
+    if (dropped || vr::control::g_rightTriggerHeld) g_projRedirectFrames = 20;
+    lastWeapon = reinterpret_cast<void*>(weapon);
+    lastAmmo[0] = ammo[0];
+    lastAmmo[1] = ammo[1];
+    if (g_projRedirectFrames <= 0 || !vr::control::g_muzzleAim || !g_armsActive || !pawn) {
+        if (g_projRedirectFrames > 0 && vr::control::g_fireLog) {
+            static ULONGLONG last = 0;
+            if (GetTickCount64() - last > 500) {
+                last = GetTickCount64();
+                vr::log::Line(std::string("PROJECTILE scan skipped: muzzleaim=") + (vr::control::g_muzzleAim ? "1" : "0") +
+                              " arms=" + (g_armsActive ? "1" : "0"));
+            }
+        }
+        return;
+    }
+    --g_projRedirectFrames;
+    if (!g_projClass) {
+        uint32_t data = 0, num = 0;
+        TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data);
+        TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num);
+        for (uint32_t i = 0; i < num && !g_projClass; ++i) {
+            uint32_t o = 0;
+            if (TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) && o &&
+                vr::script::ObjectName(reinterpret_cast<void*>(o)) == "Projectile" &&
+                vr::script::ClassName(reinterpret_cast<void*>(o)) == "Class")
+                g_projClass = reinterpret_cast<void*>(o);
+        }
+        if (!g_projClass) return;
+    }
+    float bo[3], bd[3];
+    if (!GunBarrel(pawn, bo, bd)) return;
+    // Riferimento in cui il gioco ha lanciato (corpo) e riferimento della canna.
+    float af[3], ar[3], au[3], cf[3], cr[3], cu[3];
+    RotatorToAxes(g_bodyPitch.load(), g_bodyYaw.load(), 0, af, ar, au);
+    float horiz = std::sqrt(bd[0] * bd[0] + bd[1] * bd[1]);
+    RotatorToAxes(RadiansToUnreal(std::atan2(bd[2], horiz)), RadiansToUnreal(std::atan2(bd[1], bd[0])), 0, cf, cr, cu);
+    uint32_t data = 0, num = 0;
+    TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data);
+    TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num);
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0, inst = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
+        void* obj = reinterpret_cast<void*>(o);
+        if (!IsProjectile(obj)) continue;
+        // Del giocatore: Instigator = Walker, oppure Owner = arma in mano o Walker
+        // (il razzo dell'RPG e' la testata caricata nel tubo, di proprieta'
+        // dell'arma, che al lancio viene staccata e accelerata).
+        uint32_t projOwner = 0;
+        TrySafeReadUint32(static_cast<char*>(obj) + 0xA8, &projOwner);  // Actor.Owner
+        TrySafeReadUint32(static_cast<char*>(obj) + kOffActorInstigator, &inst);
+        bool mineProj = reinterpret_cast<void*>(inst) == pawn || reinterpret_cast<void*>(projOwner) == pawn ||
+                        projOwner == weapon;
+        static ULONGLONG lastScanLog = 0;
+        if (vr::control::g_fireLog && mineProj && GetTickCount64() - lastScanLog > 1000) {
+            lastScanLog = GetTickCount64();
+            std::string pcls = vr::script::ClassName(obj);
+            uint32_t owner = projOwner;
+            float vv[3] = {0, 0, 0};
+            SafeCopy(vv, static_cast<char*>(obj) + kOffActorVelocity, 12);
+            char b[240];
+            snprintf(b, sizeof(b), "PROJECTILE scan: %s instigator=0x%08X owner=0x%08X pawn=%p mine=%d vel=(%.0f %.0f %.0f)",
+                     pcls.c_str(), inst, owner, pawn, (int)mineProj, vv[0], vv[1], vv[2]);
+            vr::log::Line(b);
+        }
+        if (!mineProj) continue;
+        if (std::find(g_projRedirected.begin(), g_projRedirected.end(), obj) != g_projRedirected.end()) continue;
+        float v[3];
+        if (!SafeCopy(v, static_cast<char*>(obj) + kOffActorVelocity, 12)) continue;
+        if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] < 100.0f * 100.0f) continue;  // non ancora lanciato
+        float f = v[0] * af[0] + v[1] * af[1] + v[2] * af[2];
+        float r = v[0] * ar[0] + v[1] * ar[1] + v[2] * ar[2];
+        float u = v[0] * au[0] + v[1] * au[1] + v[2] * au[2];
+        float nv[3];
+        for (int k = 0; k < 3; ++k) nv[k] = cf[k] * f + cr[k] * r + cu[k] * u;
+        SafeCopy(static_cast<char*>(obj) + kOffActorVelocity, nv, 12);
+        float nh = std::sqrt(nv[0] * nv[0] + nv[1] * nv[1]);
+        int32_t rot[3] = {RadiansToUnreal(std::atan2(nv[2], nh)), RadiansToUnreal(std::atan2(nv[1], nv[0])), 0};
+        SafeCopy(static_cast<char*>(obj) + kOffActorRotation, rot, 12);
+        g_projRedirected.push_back(obj);
+        if (g_projRedirected.size() > 64) g_projRedirected.erase(g_projRedirected.begin());
+        if (vr::control::g_fireLog) {
+            char b[300];
+            snprintf(b, sizeof(b), "PROJECTILE redirected: %s velocity (%.1f, %.1f, %.1f) -> (%.1f, %.1f, %.1f), barrel (%.3f, %.3f, %.3f)",
+                     vr::script::ClassName(obj).c_str(), v[0], v[1], v[2], nv[0], nv[1], nv[2], bd[0], bd[1], bd[2]);
+            vr::log::Line(b);
+        }
     }
 }
 
@@ -2734,12 +3016,49 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         g_armsActive = false;
         return;
     }
-    for (int i = 1; i < 4; ++i)
+    for (int i = 1; i < ArmRig::kCount; ++i)
         if (g_rig.ctrl[i] && !StillAlive(g_rig.ctrl[i], g_rig.ctrlCls[i])) g_rig.ctrl[i] = nullptr;
+    for (int i = 4; i < ArmRig::kCount; ++i) {
+        if (!g_rig.ctrl[i]) continue;
+        static const float zero3[3] = {0, 0, 0};
+        char* c = static_cast<char*>(g_rig.ctrl[i]);
+        SafeCopy(c + kOffCtrlStrength, zero3, 4);
+        SafeCopy(c + kOffCtrlStrengthTarget, zero3, 4);
+        SafeCopy(c + kOffCtrlBlendTimeToGo, zero3, 4);
+    }
     if (vr::control::g_armBonesRequested.exchange(false)) LogBones(g_rig.mesh);
     bool debugNow = vr::control::g_armDebugFrames.load() > 0;
+    // Relazione mano/arma: rimisurata a ogni cambio d'arma e ogni ~30 frame,
+    // solo con il modello davvero nella mano (durante il cambio d'arma il
+    // fucile puo' stare sulla schiena o nella fondina).
+    void* gunComp = CurrentGunComponent(pawn);
+    static void* lastGunComp = nullptr;
+    static int remeasure = 0;
+    if (gunComp != lastGunComp) {
+        lastGunComp = gunComp;
+        g_handInWeaponValid[0] = false;
+    }
+    bool gunInHand = false;
+    if (gunComp) {
+        struct {
+            int32_t name[2];
+            int32_t space;
+            float ret[3];
+        } hp = {{vr::script::NameIndex("Hand_Right"), 0}, 0, {0, 0, 0}};
+        float gm[16];
+        if (hp.name[0] >= 0 && vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &hp) &&
+            SafeCopy(gm, static_cast<char*>(gunComp) + kOffCompLocalToWorld, sizeof(gm))) {
+            float dx = gm[12] - hp.ret[0], dy = gm[13] - hp.ret[1], dz = gm[14] - hp.ret[2];
+            gunInHand = dx * dx + dy * dy + dz * dz < 20.0f * 20.0f;
+        }
+    }
+    if (++remeasure >= 30) {
+        remeasure = 0;
+        if (gunInHand) g_handInWeaponValid[0] = false;
+    }
     for (int side = 0; side < 2; ++side)
-        if (!g_handInWeaponValid[side] || debugNow) MeasureHandInWeapon(g_rig.mesh, side);
+        if ((!g_handInWeaponValid[side] || debugNow) && (side == 1 || gunInHand || !gunComp))
+            MeasureHandInWeapon(g_rig.mesh, side, side == 0 ? gunComp : nullptr);
     // Punto medio tra gli occhi, come per l'arma.
     float center[3] = {base[0], base[1], base[2]};
     if (g_drawEye == 0) {
@@ -2786,10 +3105,11 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     if (debug) {
         float mo[3], md[3];
         if (GunBarrel(pawn, mo, md)) {
-            char b5[200];
-            snprintf(b5, sizeof(b5), "ARMS: barrel origin=(%.1f, %.1f, %.1f) axis=(%.2f %.2f %.2f) barrel aim=%d (%d, %d)",
+            char b5[300];
+            snprintf(b5, sizeof(b5),
+                     "ARMS: barrel origin=(%.1f, %.1f, %.1f) axis=(%.3f %.3f %.3f) barrel aim=%d (%d, %d) marker=(%.1f, %.1f, %.1f)",
                      mo[0], mo[1], mo[2], md[0], md[1], md[2], (int)g_muzzleAimValid.load(), g_muzzleAimPitch.load(),
-                     g_muzzleAimYaw.load());
+                     g_muzzleAimYaw.load(), g_muzzleTarget[0], g_muzzleTarget[1], g_muzzleTarget[2]);
             vr::log::Line(b5);
         }
         char buf[200];
@@ -2886,7 +3206,6 @@ public:
 
 // Volata e asse della canna del fucile in mano (LocalToWorld del componente
 // dell'arma, PrimitiveComponent +0x70: righe X, Y, Z, traslazione).
-constexpr uintptr_t kOffCompLocalToWorld = 0x70;
 bool GunBarrel(void* pawn, float* origin, float* axis) {
     if (!pawn) return false;
     void* comp = CurrentGunComponent(pawn);

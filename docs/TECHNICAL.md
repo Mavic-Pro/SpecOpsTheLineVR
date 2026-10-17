@@ -93,9 +93,25 @@ Useful offsets (`ue3.py props`):
 - The gun is attached to bone `Weapon_Right`, a child of `Hand_Right`. The
   hand is oriented so that the weapon bone matches the controller frame; the
   hand/weapon relation is measured from the skeleton (`GetBoneQuaternion`).
+- The orientation is measured against the actual weapon mesh in the hand
+  (re-measured on every weapon change and every ~30 frames while the mesh is
+  in the hand): some weapons (RPG) are attached with their own rotation.
+- `IKBone_RightHand` / `IKBone_LeftHand` (IK on the helper bones, used by the
+  game e.g. for the RPG on the shoulder) are evaluated after our controls and
+  pull the hands back to the animation: they are kept at strength 0 while
+  the arms follow the controllers.
+- Walker's arm is ~24 units (shoulder to wrist): the limb IK may stretch up
+  to 25% (`bAllowStretching`, `StretchLimits` = 1.0..`armstretch`) so the
+  hands reach the controllers with the arms extended.
 - `YGamePawn` fades Walker when the camera is inside his "camera invisibility
   cylinders"; in first person they are set to zero, the `head` bone is hidden
-  (`HideBoneByName`) and the mesh is moved back (`bodyback`).
+  (`HideBoneByName`) and the mesh is moved back (`bodyback`, plus up to 10
+  more units when looking down past 30 degrees so the inside of the collar is
+  not visible).
+- Directly loading a mission (`open TheLine_P?mission=SP_Gorge01_P`) leaves
+  the Gorge01 intro stuck on a transition movie (`YSeqAct_FullscreenMoviePlayer`
+  `03a_transition`) also **without** the mod: an artefact of the direct load,
+  not a mod bug.
 - Every cached engine pointer is validated (still in `GObjects` at its index,
   same class) before being written: objects die on level changes.
 
@@ -103,13 +119,33 @@ Useful offsets (`ue3.py props`):
 
 - `YWeapon::CalcWeaponFire(FVector Start, FVector End, FImpactInfo*)`
   (`0x004A3D50`, called by `execCalcWeaponFire` `0x00C27130`) receives every
-  instant-hit trace. For the player's weapon the mod redirects the trace to
-  the point hit by a ray along the visible barrel (weapon mesh
-  `LocalToWorld` X axis), so shots go where the barrel points regardless of
-  the script's own aim (which follows the body and adds spread).
+  instant-hit trace. For the player's weapon the mod replaces the trace with
+  the ray of the visible barrel (weapon mesh `LocalToWorld` X axis, from the
+  point of that axis closest to the game's own start), the same ray that
+  places the green marker. The game's start point is 25-30 units off the
+  barrel axis and its direction follows the body: without this, shots went
+  to the left of the marker and sometimes stopped on obstacles the barrel
+  does not "see".
+- Spread: `YArsenalManager.m_accuracy` (+0x81C, 0 = perfect, rises while
+  firing) is applied inside `CalcWeaponFire`. Kept by default (`spread on`);
+  `spread off` zeroes it for the duration of the player's shot.
+- Projectiles (`YWeapon_Launcher`: RPG, Milkor) do not use `CalcWeaponFire`:
+  the game launches them along the body direction. While the trigger is held
+  (or the magazine drops) the mod looks for new projectiles of the player
+  (`Instigator` = Walker, or `Owner` = Walker / the weapon: the RPG rocket is
+  the warhead loaded in the tube, owned by the weapon) and rotates their
+  velocity from the body frame to the barrel frame, so rockets fly along the
+  barrel and Milkor grenades keep their lob relative to the barrel.
 - Aim assist (`YWeapon` friction / snap-on flags at +0x260,
   `YPlayerController.m_aimSnapOnActiveByUser` +0x734) is disabled while
   aiming by hand.
+- Verification (`firelog on` + `tools/weapontest.py` + `tools/shotreport.py`):
+  the impact point of every shot is compared with the marker as an angle at
+  the muzzle. Measured with spread off, median error 0.03-0.3 degrees (AA12,
+  AK47, Barrett M99, Benelli M1014, FAMAS, P90, HK417, UMP45, M4, M9,
+  Micro Uzi, Python); RPG rocket direction equal to the barrel within 0.01.
+  Weapons whose assets are not loaded in the test level cannot fire there
+  and still need testing in the levels where they appear.
 
 ## Input
 

@@ -134,6 +134,10 @@ extern std::atomic<bool> g_noAimAssist;
 extern std::atomic<bool> g_spread;
 // Diagnostica: riga COLPO per ogni colpo del giocatore.
 extern std::atomic<bool> g_fireLog;
+// Diagnostica: "projlog N" registra per N secondi i proiettili sparati (PROJECTILE ...).
+extern std::atomic<int> g_projLogSeconds;
+// Grilletto destro premuto (letto dall'input VR): innesca la ricerca dei proiettili lanciati.
+extern std::atomic<bool> g_rightTriggerHeld;
 // Aggiornamento automatico (updater.cpp): "autoupdate on|off", "updaterepo proprietario/nome".
 extern std::atomic<bool> g_autoUpdate;
 std::string UpdateRepo();
@@ -142,9 +146,13 @@ extern std::atomic<bool> g_fpBody;
 // Mano sinistra sull'astina con la mira a due mani: la tiene il gioco (dita chiuse sull'arma).
 extern std::atomic<bool> g_leftGrip;
 extern std::atomic<float> g_bodyBack;
+// Spostamento aggiuntivo del corpo guardando in basso (oltre 30 gradi).
+extern std::atomic<float> g_bodyBackLook;
 // Il corpo segue gli spostamenti orizzontali della testa (6DOF).
 extern std::atomic<bool> g_bodyFollowsHead;
 extern std::atomic<float> g_armRotDeg[3];
+// Allungamento massimo del braccio per raggiungere i controller (1 = nessuno).
+extern std::atomic<float> g_armStretch;
 extern std::atomic<float> g_armOffsetCm[3];
 // Nomi dei controlli IK nell'AnimTree (destra, sinistra, rotazione destra,
 // rotazione sinistra) e richieste di diagnostica (armdebug, armbones).

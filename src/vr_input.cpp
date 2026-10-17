@@ -69,6 +69,14 @@ bool ButtonPressed(const vr::VRControllerState_t& s, vr::EVRButtonId id) {
     return (s.ulButtonPressed & vr::ButtonMaskFromId(id)) != 0;
 }
 
+// Grip dei Touch: con i binding legacy di SteamVR (legacy_bindings_touch.json)
+// arriva come tasto Grip e come valore analogico sulla seconda componente
+// dell'asse 2 ("axis2_value1"); si accettano tutte le forme.
+float GripValue(const vr::VRControllerState_t& s) {
+    float v = s.rAxis[2].x > s.rAxis[2].y ? s.rAxis[2].x : s.rAxis[2].y;
+    return ButtonPressed(s, vr::k_EButton_Grip) ? 1.0f : v;
+}
+
 // Legge i due Touch tramite l'API "legacy" di OpenVR (SteamVR applica i
 // binding legacy_bindings_rift: asse 0 = stick, asse 1 = grilletto,
 // asse 2 = grip; A/X = k_EButton_A, B/Y = k_EButton_ApplicationMenu).
@@ -99,9 +107,9 @@ bool ReadTouchControllers(XGamepad* out) {
             std::snprintf(b, sizeof(b),
                           "INPUTLOG: L%s stick=(%.2f %.2f) trigger=%.2f grip=%.2f buttons=%llx | R%s stick=(%.2f %.2f) trigger=%.2f "
                           "grip=%.2f buttons=%llx",
-                          haveL ? "" : "(missing)", ls.rAxis[0].x, ls.rAxis[0].y, ls.rAxis[1].x, ls.rAxis[2].x,
+                          haveL ? "" : "(missing)", ls.rAxis[0].x, ls.rAxis[0].y, ls.rAxis[1].x, GripValue(ls),
                           static_cast<unsigned long long>(ls.ulButtonPressed), haveR ? "" : "(missing)", rs.rAxis[0].x,
-                          rs.rAxis[0].y, rs.rAxis[1].x, rs.rAxis[2].x, static_cast<unsigned long long>(rs.ulButtonPressed));
+                          rs.rAxis[0].y, rs.rAxis[1].x, GripValue(rs), static_cast<unsigned long long>(rs.ulButtonPressed));
             vr::log::Line(b);
         }
     }
@@ -111,7 +119,7 @@ bool ReadTouchControllers(XGamepad* out) {
         out->sThumbLX = AxisToShort(ls.rAxis[0].x);
         out->sThumbLY = AxisToShort(ls.rAxis[0].y);
         out->bLeftTrigger = TriggerToByte(ls.rAxis[1].x);
-        if (ls.rAxis[2].x > 0.6f || ButtonPressed(ls, vr::k_EButton_Grip)) out->wButtons |= kLB;
+        if (GripValue(ls) > 0.6f) out->wButtons |= kLB;
         if (ButtonPressed(ls, vr::k_EButton_A)) out->wButtons |= kX;
         if (ButtonPressed(ls, vr::k_EButton_ApplicationMenu)) out->wButtons |= kY;
         if (ButtonPressed(ls, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kLThumb;
@@ -121,7 +129,7 @@ bool ReadTouchControllers(XGamepad* out) {
         out->sThumbRX = AxisToShort(rs.rAxis[0].x);
         out->sThumbRY = AxisToShort(rs.rAxis[0].y);
         out->bRightTrigger = TriggerToByte(rs.rAxis[1].x);
-        if (rs.rAxis[2].x > 0.6f || ButtonPressed(rs, vr::k_EButton_Grip)) out->wButtons |= kRB;
+        if (GripValue(rs) > 0.6f) out->wButtons |= kRB;
         if (ButtonPressed(rs, vr::k_EButton_A)) out->wButtons |= kA;
         if (ButtonPressed(rs, vr::k_EButton_ApplicationMenu)) out->wButtons |= kB;
         if (ButtonPressed(rs, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kRThumb;
@@ -296,7 +304,7 @@ bool ReadGestureSample(GestureSample* s) {
     vr::TrackedDeviceIndex_t ri = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
     vr::VRControllerState_t rs = {};
     if (ri != vr::k_unTrackedDeviceIndexInvalid && sys->GetControllerState(ri, &rs, sizeof(rs)))
-        s->rightGrip = rs.rAxis[2].x > 0.6f || ButtonPressed(rs, vr::k_EButton_Grip);
+        s->rightGrip = GripValue(rs) > 0.6f;
     if (g_gestures.TakeHaptic() && ri != vr::k_unTrackedDeviceIndexInvalid) sys->TriggerHapticPulse(ri, 0, 3000);
     return true;
 }
@@ -468,6 +476,7 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
                 state->dwPacketNumber = g_packet.fetch_add(1);
                 state->Gamepad = g_fake;
                 ApplyVrStickRules(&state->Gamepad);
+                vr::control::g_rightTriggerHeld = state->Gamepad.bRightTrigger > 100;
                 return ERROR_SUCCESS;
             }
         }
@@ -481,10 +490,14 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
             ApplyVrStickRules(&pad);
             state->dwPacketNumber = g_packet.fetch_add(1);
             state->Gamepad = pad;
+            vr::control::g_rightTriggerHeld = pad.bRightTrigger > 100;
             return ERROR_SUCCESS;
         }
     }
-    if (user == 0) vr::control::g_motionAmount = 0.0f;  // nessun input VR: niente vignettatura
+    if (user == 0) {
+        vr::control::g_motionAmount = 0.0f;  // nessun input VR: niente vignettatura
+        vr::control::g_rightTriggerHeld = false;
+    }
     return g_GetState_Real ? g_GetState_Real(user, state) : ERROR_DEVICE_NOT_CONNECTED;
 }
 

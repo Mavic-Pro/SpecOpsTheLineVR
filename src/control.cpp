@@ -77,10 +77,13 @@ std::atomic<float> g_gunOffsetCm[3];
 std::atomic<float> g_synthHandCm[3] = {35.0f, 20.0f, -35.0f};
 std::atomic<bool> g_twoHand{true};
 std::atomic<bool> g_arms{true};
+std::atomic<float> g_armStretch{1.25f};
 std::atomic<bool> g_muzzleAim{true};
 std::atomic<bool> g_noAimAssist{true};
 std::atomic<bool> g_spread{true};
 std::atomic<bool> g_fireLog{false};
+std::atomic<int> g_projLogSeconds{0};
+std::atomic<bool> g_rightTriggerHeld{false};
 std::atomic<bool> g_autoUpdate{true};
 static std::mutex g_updateRepoMutex;
 static std::string g_updateRepo;
@@ -90,7 +93,8 @@ std::string UpdateRepo() {
 }
 std::atomic<bool> g_fpBody{true};
 std::atomic<bool> g_leftGrip{false};
-std::atomic<float> g_bodyBack{14.0f};
+std::atomic<float> g_bodyBack{6.0f};
+std::atomic<float> g_bodyBackLook{10.0f};
 std::atomic<bool> g_bodyFollowsHead{true};
 std::atomic<float> g_armRotDeg[3];
 std::atomic<float> g_armOffsetCm[3];
@@ -283,6 +287,10 @@ void Execute(const std::string& line) {
         in >> v;
         std::lock_guard<std::mutex> lock(g_updateRepoMutex);
         g_updateRepo = v;
+    } else if (cmd == "projlog") {
+        int n = 10;
+        in >> n;
+        g_projLogSeconds = n > 0 ? n : 10;
     } else if (cmd == "firelog") {
         std::string v;
         in >> v;
@@ -320,15 +328,20 @@ void Execute(const std::string& line) {
         in >> v;
         g_bodyFollowsHead = (v != "off");
     } else if (cmd == "bodyback") {
-        float v = 0;
-        in >> v;
+        float v = 0, look = 10.0f;
+        in >> v >> look;
         g_bodyBack = v;
+        g_bodyBackLook = look;
     } else if (cmd == "armrot") {
         float p = 0, y = 0, r = 0;
         in >> p >> y >> r;
         g_armRotDeg[0] = p;
         g_armRotDeg[1] = y;
         g_armRotDeg[2] = r;
+    } else if (cmd == "armstretch") {
+        float v = 1.25f;
+        in >> v;
+        g_armStretch = v < 1.0f ? 1.0f : (v > 1.6f ? 1.6f : v);
     } else if (cmd == "armoffset") {
         float f = 0, r = 0, u = 0;
         in >> f >> r >> u;
