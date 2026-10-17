@@ -212,6 +212,19 @@ public:
             if (vf > 2.5f && s.left[1] > s.hmd[1] - 0.35f) {  // 3,2 m/s non scattava mai nelle sessioni reali
                 Press(kLB, s.t, 0.30, "lancio della granata", vf);
                 m_throwReady = s.t + 1.0;
+                // Direzione del lancio = velocita' della mano (la granata la segue).
+                float sp = std::sqrt(s.leftVel[0] * s.leftVel[0] + s.leftVel[1] * s.leftVel[1] +
+                                     s.leftVel[2] * s.leftVel[2]);
+                if (sp > 0.1f) {
+                    for (int k = 0; k < 3; ++k) vr::control::g_throwDir[k] = s.leftVel[k] / sp;
+                    vr::control::g_throwStamp = GetTickCount64();
+                }
+            } else if (vf > 2.8f && vr::control::g_gestureMelee && s.left[1] <= s.hmd[1] - 0.35f &&
+                       s.t > m_meleeReady) {
+                // Pugno in avanti all'altezza del petto (il lancio parte dall'alto): corpo a corpo.
+                Press(kB, s.t, 0.12, "corpo a corpo", vf);
+                m_meleeReady = s.t + 0.8;
+                m_throwReady = s.t + 0.5;
             }
         }
         if (s.leftValid && s.rightValid && vr::control::g_gestureReload) {
@@ -283,6 +296,7 @@ private:
     bool m_gripWasDown = false, m_gripIsSwap = false, m_hapticPending = false;
     double m_lastLogT = 0.0;
     double m_lastT = 0.0, m_throwReady = 0.0, m_reloadReady = 0.0, m_duckReady = 0.0, m_nearMagT = -10.0;
+    double m_meleeReady = 0.0;
 };
 
 GestureDetector g_gestures;
@@ -356,6 +370,10 @@ void RunGestureSim(const std::string& which) {
             s.left[1] = 1.6f;
             s.left[2] = 0.2f - 0.9f * u;
             s.leftVel[2] = (k > 10 && k < 25) ? -3.0f : -0.3f;
+        } else if (which == "melee") {  // pugno in avanti all'altezza del petto
+            s.left[1] = 1.2f;
+            s.left[2] = -0.1f - 0.5f * u;
+            s.leftVel[2] = (k > 10 && k < 20) ? -3.2f : -0.2f;
         } else if (which == "reload") {  // tocca il caricatore, poi tira giu'
             if (k < 15) {
                 s.left[0] = 0.2f; s.left[1] = 1.2f; s.left[2] = -0.3f;

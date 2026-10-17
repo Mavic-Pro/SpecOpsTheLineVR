@@ -130,6 +130,9 @@ std::string ArmControlName(int i) {
 }
 std::atomic<float> g_synthLeftCm[3];
 std::atomic<bool> g_gestureGrenade{true}, g_gestureReload{true}, g_gestureCover{true};
+std::atomic<bool> g_gestureMelee{true};
+std::atomic<float> g_throwDir[3];
+std::atomic<unsigned long long> g_throwStamp{0};
 std::atomic<bool> g_gestureWeapon{true};
 std::atomic<int> g_inputLogFrames{0};
 std::atomic<int> g_gestureLogFrames{0};
@@ -414,6 +417,7 @@ void Execute(const std::string& line) {
         in >> which >> v;
         bool on = (v != "off");
         if (which == "grenade" || which == "all") g_gestureGrenade = on;
+        if (which == "melee" || which == "all") g_gestureMelee = on;
         if (which == "reload" || which == "all") g_gestureReload = on;
         if (which == "cover" || which == "all") g_gestureCover = on;
         if (which == "weapon" || which == "all") g_gestureWeapon = on;

@@ -1774,6 +1774,7 @@ void UpdateFirstPersonBody(void* pawn);
 void UpdateSquadCommandAim(char* cam, void* pawn);
 void UpdateProjectileLog();
 void RedirectNewProjectiles(void* pawn);
+void RedirectThrownGrenade(void* pawn);
 
 // Una riga per i test automatici (tools/regress.py), ogni 300 tick stereo:
 // differenze dall'ultima riga. ripetuti = Present consecutivi dello stesso
@@ -1812,6 +1813,7 @@ public:
         UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateProjectileLog();
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         if (vr::control::g_firstPerson && HasCameraSignature(cam)) UpdatePawnViewLocation(cam);
         ApplyNearPlane(cam);
@@ -3352,6 +3354,67 @@ void DisableAimAssist(char* cam, void* weapon) {
 constexpr uintptr_t kOffActorInstigator = 0xE8;
 int g_projRedirectFrames = 0;
 std::vector<void*> g_projRedirected;
+
+// Granata lanciata col gesto: per 2 s dal lancio la nuova granata di Walker
+// (proiettile con "Grenade" nel nome, Instigator = Walker) prende la direzione
+// della mano al momento del lancio, con la velocita' scelta dal gioco. Prima
+// partiva verso il mirino, qualunque fosse il gesto.
+void RedirectThrownGrenade(void* pawn) {
+    static ULONGLONG handled = 0;
+    unsigned long long stamp = vr::control::g_throwStamp.load();
+    if (!pawn || !stamp || stamp == handled || GetTickCount64() - stamp > 2000) return;
+    if (!g_projClass) {
+        uint32_t d0 = 0, n0 = 0;
+        TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &d0);
+        TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &n0);
+        for (uint32_t i = 0; i < n0 && !g_projClass; ++i) {
+            uint32_t o = 0;
+            if (TrySafeReadUint32(reinterpret_cast<void*>(d0 + 4 * i), &o) && o &&
+                vr::script::ObjectName(reinterpret_cast<void*>(o)) == "Projectile" &&
+                vr::script::ClassName(reinterpret_cast<void*>(o)) == "Class")
+                g_projClass = reinterpret_cast<void*>(o);
+        }
+        if (!g_projClass) return;
+    }
+    static int frame = 0;
+    if (++frame % 2) return;  // la scansione degli oggetti costa: un frame su due
+    // Direzione della mano (SteamVR: x destra, y su, -z avanti) -> mondo, come
+    // gli spostamenti delle mani (riferimento del ricentramento, poi yaw del corpo).
+    float t[3] = {vr::control::g_throwDir[0].load(), vr::control::g_throwDir[1].load(), vr::control::g_throwDir[2].load()};
+    float sy = std::sin(g_hmdYawReference), cy = std::cos(g_hmdYawReference);
+    float f = t[0] * sy - t[2] * cy, r = t[0] * cy + t[2] * sy, u = t[1];
+    float b = g_bodyYaw.load() * (6.28318530718f / 65536.0f);
+    float dir[3] = {f * std::cos(b) - r * std::sin(b), f * std::sin(b) + r * std::cos(b), u};
+    uint32_t data = 0, num = 0;
+    TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data);
+    TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num);
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0, inst = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
+        void* obj = reinterpret_cast<void*>(o);
+        if (!IsProjectile(obj)) continue;
+        TrySafeReadUint32(static_cast<char*>(obj) + kOffActorInstigator, &inst);
+        if (reinterpret_cast<void*>(inst) != pawn) continue;
+        if (std::find(g_projRedirected.begin(), g_projRedirected.end(), obj) != g_projRedirected.end()) continue;
+        std::string cls = vr::script::ClassName(obj);
+        if (cls.find("Grenade") == std::string::npos && cls.find("grenade") == std::string::npos) continue;
+        if (cls.find("Milkor") != std::string::npos) continue;  // lanciagranate: ci pensa RedirectNewProjectiles
+        float v[3];
+        if (!SafeCopy(v, static_cast<char*>(obj) + kOffActorVelocity, 12)) continue;
+        float speed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (speed < 100.0f) continue;  // ancora in mano
+        float nv[3] = {dir[0] * speed, dir[1] * speed, dir[2] * speed};
+        SafeCopy(static_cast<char*>(obj) + kOffActorVelocity, nv, 12);
+        g_projRedirected.push_back(obj);
+        if (g_projRedirected.size() > 64) g_projRedirected.erase(g_projRedirected.begin());
+        handled = stamp;
+        char buf[220];
+        snprintf(buf, sizeof(buf), "GRENADE: %s thrown along the hand (%.2f, %.2f, %.2f), speed %.0f", cls.c_str(), dir[0],
+                 dir[1], dir[2], speed);
+        vr::log::Line(buf);
+        return;
+    }
+}
 
 void RedirectNewProjectiles(void* pawn) {
     static void* lastWeapon = nullptr;

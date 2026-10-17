@@ -227,6 +227,12 @@ extern std::atomic<float> g_synthLeftCm[3];
 // Gesti (vr_input.cpp): lancio della granata con la mano sinistra (LB),
 // ricarica tirando giu' il caricatore (X), copertura abbassandosi (A).
 extern std::atomic<bool> g_gestureGrenade, g_gestureReload, g_gestureCover;
+// Pugno in avanti con la sinistra all'altezza del petto = corpo a corpo (B).
+extern std::atomic<bool> g_gestureMelee;
+// Ultimo lancio col gesto: direzione della mano (spazio di SteamVR, unitaria)
+// e istante (GetTickCount64): la granata lanciata parte in quella direzione.
+extern std::atomic<float> g_throwDir[3];
+extern std::atomic<unsigned long long> g_throwStamp;
 // Arma presa dalla spalla: grip destro con la mano sopra la spalla = Y (arma seguente).
 extern std::atomic<bool> g_gestureWeapon;
 // Diagnostica: righe INPUTLOG (stato grezzo dei Touch) ogni 250 ms, per N righe.
