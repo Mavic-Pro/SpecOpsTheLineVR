@@ -362,6 +362,11 @@ void RecordPresentEye(int eye) {
 
 std::atomic<UINT> g_backBufferW{0}, g_backBufferH{0};
 std::atomic<uint32_t> g_headBlocked{0};
+// Telemetria STATS: passaggi allo schermo virtuale e salto massimo della vista
+// (occhio sinistro) da un tick all'altro.
+std::atomic<uint32_t> g_cinemaSwitches{0};
+float g_maxViewJump = 0.0f;
+void LogStats();
 // Indicatore di mira: NDC per occhio (thread di gioco -> Present).
 std::atomic<float> g_markerNdc[2][2];
 std::atomic<bool> g_markerVisible[2];
@@ -608,6 +613,7 @@ struct EyeOrigin {
     bool poseValid;           // posa del visore del tick che ha generato l'origine
     vr::HmdMatrix34_t pose;
     uint32_t tick;            // tick stereo (g_stereoDraws) che ha generato l'origine
+    bool valid;               // false: casella mai scritta o annullata
 };
 extern std::atomic<uint32_t> g_stereoDraws;
 // Posa del visore usata dal tick di gioco in corso (thread di gioco).
@@ -620,12 +626,25 @@ std::atomic<uint32_t> g_eyeMatches[2];
 std::atomic<uint32_t> g_eyeMisses{0};
 constexpr UINT kViewOriginRegister = 5;
 
+// Annulla le origini registrate (all'ingresso e all'uscita dallo schermo
+// virtuale: le voci vecchie non devono riconoscere i frame nuovi).
+void InvalidateEyeRing() {
+    for (auto& e : g_eyeRing) e.valid = false;
+}
+
 void IdentifyEyeFromViewOrigin(const float* v) {
     float x = -v[0], y = -v[1], z = -v[2];
-    // Nota (18/10): cercare dal piu' recente sbagliava l'occhio in centinaia di
-    // frame (occhio ripetuto, arma sdoppiata): si resta sull'ordine dell'anello.
+    // Origine (0,0,0): passaggi senza vista (post-processo, HUD). Prima
+    // combaciava con le caselle vuote dell'anello (tutte "occhio sinistro in
+    // 0,0,0") e all'inizio del gameplay i frame destri diventavano sinistri:
+    // 282 sinistri e 0 destri, fucile doppio (18/10).
+    if (std::fabs(x) < 1.0f && std::fabs(y) < 1.0f && std::fabs(z) < 1.0f) return;
+    // Vale il primo riconoscimento del frame (la scena principale); i passaggi
+    // successivi non lo cambiano. vr::control::g_presentEye torna a -1 a ogni Present.
+    if (vr::control::g_presentEye.load() >= 0) return;
     for (int i = 0; i < kEyeRingSize; ++i) {
         const EyeOrigin& e = g_eyeRing[i];
+        if (!e.valid) continue;
         if (std::fabs(e.x - x) < 0.01f && std::fabs(e.y - y) < 0.01f && std::fabs(e.z - z) < 0.01f) {
             vr::control::g_presentEye = e.eye;
             vr::output::SetRenderPose(e.eye, e.poseValid ? &e.pose : nullptr, e.tick);
@@ -1531,10 +1550,26 @@ void ApplyFirstPerson(char* cam) {
 // Occhio del Draw in corso (stereo sincrono, thread di gioco), -1 = fuori.
 std::atomic<int> g_drawEye{-1};
 
+// Testa congelata per il tick (thread di gioco, prima dei due Draw): la posa
+// viene aggiornata sul thread di rendering (BeginScene) e poteva cambiare tra
+// l'occhio sinistro e il destro dello stesso tick.
+struct HeadSnapshot {
+    bool valid = false;
+    int32_t yaw = 0, pitch = 0, roll = 0;
+    float offset[3] = {0, 0, 0};
+};
+HeadSnapshot g_headSnap;
+int32_t HeadYaw() { return g_headSnap.valid ? g_headSnap.yaw : g_deltaYaw.load(std::memory_order_relaxed); }
+int32_t HeadPitch() { return g_headSnap.valid ? g_headSnap.pitch : g_deltaPitch.load(std::memory_order_relaxed); }
+int32_t HeadRoll() { return g_headSnap.valid ? g_headSnap.roll : g_deltaRoll.load(std::memory_order_relaxed); }
+void HeadOffset(float* out) {
+    for (int i = 0; i < 3; ++i) out[i] = g_headSnap.valid ? g_headSnap.offset[i] : g_headOffset[i].load();
+}
+
 void RecordEyeOrigin(const float* loc, int eye) {
     uint32_t slot = g_eyeRingPos.fetch_add(1) % kEyeRingSize;
     g_eyeRing[slot] = {loc[0], loc[1], loc[2], eye, g_tickHmdPoseValid, g_tickHmdPose,
-                       g_stereoDraws.load(std::memory_order_relaxed)};
+                       g_stereoDraws.load(std::memory_order_relaxed), true};
 }
 
 // Sposta loc (gia' nella camera) di +-meta' IPD lungo il vettore "right".
@@ -1544,15 +1579,25 @@ void OffsetLocationForEye(char* cam, int eye, float half) {
     // sull'asse della TESTA: se la rotazione della testa non e' nella camera
     // (aim body) la aggiungiamo qui.
     int32_t yawUnits = *reinterpret_cast<int32_t*>(cam + kCameraOffsetYaw);
-    if (vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid) yawUnits = g_bodyYaw.load();
-    if (vr::control::g_aimFollowsBody) yawUnits += g_deltaYaw.load(std::memory_order_relaxed);
-    float yaw = yawUnits * (6.28318530718f / 65536.0f);
-    float roll = g_deltaRoll.load(std::memory_order_relaxed) * (6.28318530718f / 65536.0f);
+    int32_t pitchUnits = *reinterpret_cast<int32_t*>(cam + kCameraOffsetPitch);
+    if (vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid) {
+        yawUnits = g_bodyYaw.load();
+        pitchUnits = g_bodyPitch.load();
+    }
+    if (vr::control::g_aimFollowsBody) {
+        yawUnits += HeadYaw();
+        pitchUnits += HeadPitch();
+    }
+    const float k = 6.28318530718f / 65536.0f;
+    float sy = std::sin(yawUnits * k), cy = std::cos(yawUnits * k);
+    float sp = std::sin(pitchUnits * k), cp = std::cos(pitchUnits * k);
+    float sr = std::sin(HeadRoll() * k), cr = std::cos(HeadRoll() * k);
     float sign = eye == 0 ? -1.0f : 1.0f;
-    // Vettore "right" della testa: orizzontale ruotato col rollio.
-    loc[0] += sign * half * -std::sin(yaw) * std::cos(roll);
-    loc[1] += sign * half * std::cos(yaw) * std::cos(roll);
-    loc[2] += sign * half * -std::sin(roll);
+    // Asse Y (destra) di FRotationMatrix(pitch, yaw, roll) di UE3: con testa
+    // inclinata e sguardo in alto/basso gli occhi restano sull'asse giusto.
+    loc[0] += sign * half * (sr * sp * cy - cr * sy);
+    loc[1] += sign * half * (sr * sp * sy + cr * cy);
+    loc[2] += sign * half * (-sr * cp);
     RecordEyeOrigin(loc, eye);
 }
 
@@ -1613,6 +1658,24 @@ void UpdateSquadCommandAim(char* cam, void* pawn);
 void UpdateProjectileLog();
 void RedirectNewProjectiles(void* pawn);
 
+// Una riga per i test automatici (tools/regress.py), ogni 300 tick stereo:
+// differenze dall'ultima riga. ripetuti = Present consecutivi dello stesso
+// occhio (immagini doppie), sconosciuti = frame senza occhio riconosciuto.
+void LogStats() {
+    static uint32_t last[8] = {};
+    uint32_t now[8] = {g_presentByEye[0].load(), g_presentByEye[1].load(), g_presentByEye[2].load(),
+                       g_presentRepeats.load(), g_eyeMisses.load(), g_headBlocked.load(), g_cinemaSwitches.load(), 0};
+    char b[300];
+    snprintf(b, sizeof(b),
+             "STATS: present L=%u R=%u unknown=%u repeated=%u | eye misses=%u | head blocked=%u | cinema switches=%u | "
+             "max view jump=%.1f | cinema=%d",
+             now[1] - last[1], now[2] - last[2], now[0] - last[0], now[3] - last[3], now[4] - last[4], now[5] - last[5],
+             now[6] - last[6], g_maxViewJump, (int)vr::control::g_cinemaActive.load());
+    vr::log::Line(b);
+    for (int i = 0; i < 8; ++i) last[i] = now[i];
+    g_maxViewJump = 0.0f;
+}
+
 class ViewportDrawThunk {
 public:
     void Detour(int bShouldPresent) {
@@ -1648,7 +1711,9 @@ public:
         if (wanted) {
             unwantedSince = 0;
             if (!wantedSince) wantedSince = nowMs;
-            ULONGLONG need = vr::control::g_cinemaForce ? 0 : (noWalker ? 150 : 600);
+            // Camera lontana da Walker per meno di 0,6 s (inquadrature brevi da 0,1-0,5 s
+            // nei log): resta in VR, niente lampo dello schermo virtuale.
+            ULONGLONG need = vr::control::g_cinemaForce ? 0 : 600;
             if (nowMs - wantedSince >= need) cinema = true;
         } else {
             wantedSince = 0;
@@ -1656,6 +1721,8 @@ public:
             if (nowMs - unwantedSince >= 150) cinema = false;
         }
         if (cinema != vr::control::g_cinemaActive.load()) {
+            InvalidateEyeRing();
+            g_cinemaSwitches.fetch_add(1, std::memory_order_relaxed);
             vr::log::Line(cinema ? "CINEMA: virtual screen (outside gameplay)" : "CINEMA: end, back to VR");
             vr::control::g_cinemaActive = cinema;
         }
@@ -1665,6 +1732,11 @@ public:
         }
         float* loc = reinterpret_cast<float*>(cam + 0x10);
         float base[3] = {loc[0], loc[1], loc[2]};
+        g_headSnap.yaw = g_deltaYaw.load();
+        g_headSnap.pitch = g_deltaPitch.load();
+        g_headSnap.roll = g_deltaRoll.load();
+        for (int i = 0; i < 3; ++i) g_headSnap.offset[i] = g_headOffset[i].load();
+        g_headSnap.valid = true;
         for (int eye = 0; eye < 2; ++eye) {
             loc[0] = base[0];
             loc[1] = base[1];
@@ -1689,11 +1761,13 @@ public:
                               (g_profTick - g_profDraw[0] - g_profDraw[1]) / g_profCount);
                 g_profOutput = g_profPresent = 0.0;
                 vr::log::Line(b);
+                LogStats();
                 g_profDraw[0] = g_profDraw[1] = g_profTick = 0.0;
                 g_profCount = 0;
             }
         }
         g_drawEye = -1;
+        g_headSnap.valid = false;
         if (HasCameraSignature(cam)) {
             loc[0] = base[0];
             loc[1] = base[1];
@@ -2070,6 +2144,15 @@ void UpdateHeadTracking() {
     float predict = PredictedSecondsToPhotons(vrsys);
     vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, predict, poses, vr::k_unMaxTrackedDeviceCount);
     const vr::TrackedDevicePose_t& hmdPose = poses[vr::k_unTrackedDeviceIndex_Hmd];
+    // Controller predetti a parte (handpredict, ms): la testa la corregge la
+    // riproiezione del visore, le mani no, quindi il fucile mostrava tutta la
+    // latenza del sistema ("weapons felt stiff", 18/10).
+    vr::TrackedDevicePose_t handPoses[vr::k_unMaxTrackedDeviceCount];
+    float handSec = vr::control::g_handPredictMs * 0.001f;
+    if (handSec > 0.0f)
+        vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, handSec, handPoses, vr::k_unMaxTrackedDeviceCount);
+    else
+        std::memcpy(handPoses, poses, sizeof(handPoses));
     if (!hmdPose.bPoseIsValid) {
         if (shouldLog) vr::log::Line("UpdateHeadTracking: invalid HMD pose.");
         return;
@@ -2141,7 +2224,9 @@ void UpdateHeadTracking() {
         float rightY = m.m[1][0];
         if (rightY > 1.0f) rightY = 1.0f;
         if (rightY < -1.0f) rightY = -1.0f;
-        g_deltaRoll = vr::control::g_rollSign * RadiansToUnreal(std::asin(-rightY));
+        // atan2(right.y, up.y): esatto anche guardando in alto/basso (asin di
+        // right.y vale solo a beccheggio 0: a 45 gradi in basso sbagliava ~6 gradi).
+        g_deltaRoll = vr::control::g_rollSign * RadiansToUnreal(std::atan2(-m.m[1][0], m.m[1][1]));
         // Spostamento nel riferimento della direzione al ricentramento.
         float dx = pos[0] - posRef[0], dy = pos[1] - posRef[1], dz = pos[2] - posRef[2];
         float sy = std::sin(g_hmdYawReference), cy = std::cos(g_hmdYawReference);
@@ -2159,8 +2244,8 @@ void UpdateHeadTracking() {
     // relativo alla direzione di ricentramento, pitch rispetto all'orizzonte.
     {
         vr::TrackedDeviceIndex_t ri = vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
-        if (ri != vr::k_unTrackedDeviceIndexInvalid && ri < vr::k_unMaxTrackedDeviceCount && poses[ri].bPoseIsValid) {
-            const vr::HmdMatrix34_t& c = poses[ri].mDeviceToAbsoluteTracking;
+        if (ri != vr::k_unTrackedDeviceIndexInvalid && ri < vr::k_unMaxTrackedDeviceCount && handPoses[ri].bPoseIsValid) {
+            const vr::HmdMatrix34_t& c = handPoses[ri].mDeviceToAbsoluteTracking;
             float cYaw = YawFromOpenVrPose(c);
             float cPitch = PitchFromOpenVrPose(c) + vr::control::g_aimPitchOffsetDeg * 0.01745329252f;
             g_aimDeltaYaw = vr::control::g_yawSign * RadiansToUnreal(cYaw - g_hmdYawReference);
@@ -2177,14 +2262,14 @@ void UpdateHeadTracking() {
             float rightY = c.m[1][0];
             if (rightY > 1.0f) rightY = 1.0f;
             if (rightY < -1.0f) rightY = -1.0f;
-            g_handRoll = vr::control::g_rollSign * RadiansToUnreal(std::asin(-rightY));
+            g_handRoll = vr::control::g_rollSign * RadiansToUnreal(std::atan2(-c.m[1][0], c.m[1][1]));
             g_handValid = true;
             // Controller sinistro, stesso riferimento: mira a due mani.
             vr::TrackedDeviceIndex_t li =
                 vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
             g_twoHandActive = false;
-            if (li != vr::k_unTrackedDeviceIndexInvalid && li < vr::k_unMaxTrackedDeviceCount && poses[li].bPoseIsValid) {
-                const vr::HmdMatrix34_t& lm = poses[li].mDeviceToAbsoluteTracking;
+            if (li != vr::k_unTrackedDeviceIndexInvalid && li < vr::k_unMaxTrackedDeviceCount && handPoses[li].bPoseIsValid) {
+                const vr::HmdMatrix34_t& lm = handPoses[li].mDeviceToAbsoluteTracking;
                 float lx = lm.m[0][3] - posRef[0], ly = lm.m[1][3] - posRef[1], lz = lm.m[2][3] - posRef[2];
                 float left[3] = {(lx * sy - lz * cy) * scale, (lx * cy + lz * sy) * scale, ly * scale};
                 float right[3] = {g_handOffset[0], g_handOffset[1], g_handOffset[2]};
@@ -2195,7 +2280,7 @@ void UpdateHeadTracking() {
                 float lRightY = lm.m[1][0];
                 if (lRightY > 1.0f) lRightY = 1.0f;
                 if (lRightY < -1.0f) lRightY = -1.0f;
-                g_leftRoll = vr::control::g_rollSign * RadiansToUnreal(std::asin(-lRightY));
+                g_leftRoll = vr::control::g_rollSign * RadiansToUnreal(std::atan2(-lm.m[1][0], lm.m[1][1]));
                 g_leftValid = true;
                 ApplyTwoHandAim(right, left);
             } else {
@@ -3313,25 +3398,29 @@ public:
         // spostamento della testa nel mondo.
         bool hand = vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid;
         int32_t bodyYaw = hand ? g_bodyYaw.load()
-                               : outRot[1] - (vr::control::g_aimFollowsBody ? 0 : g_deltaYaw.load(std::memory_order_relaxed));
+                               : outRot[1] - (vr::control::g_aimFollowsBody ? 0 : HeadYaw());
         if (hand) {
             // La camera del gioco punta col controller: la vista e' corpo + testa.
-            outRot[0] = g_bodyPitch.load() + g_deltaPitch.load(std::memory_order_relaxed);
-            outRot[1] = g_bodyYaw.load() + g_deltaYaw.load(std::memory_order_relaxed);
+            outRot[0] = g_bodyPitch.load() + HeadPitch();
+            outRot[1] = g_bodyYaw.load() + HeadYaw();
         } else if (vr::control::g_aimFollowsBody) {
-            outRot[0] += g_deltaPitch.load(std::memory_order_relaxed);  // FRotator: Pitch, Yaw, Roll
-            outRot[1] += g_deltaYaw.load(std::memory_order_relaxed);
+            outRot[0] += HeadPitch();  // FRotator: Pitch, Yaw, Roll
+            outRot[1] += HeadYaw();
         }
-        outRot[2] += g_deltaRoll.load(std::memory_order_relaxed);
+        outRot[2] += HeadRoll();
         if (outLoc) {
             float b = bodyYaw * (6.28318530718f / 65536.0f);
-            float f = g_headOffset[0], r = g_headOffset[1], u = g_headOffset[2];
+            float ho[3];
+            HeadOffset(ho);
+            float f = ho[0], r = ho[1], u = ho[2];
             float base[3] = {outLoc[0], outLoc[1], outLoc[2]};
             // Altezza della vista ammorbidita (solo la vista: la mira resta
             // quella del gioco). Salti oltre 80 unita' (teletrasporti,
             // checkpoint) passano subito.
-            {
-                static float smoothZ = 0.0f;
+            static float smoothZ = 0.0f;
+            if (g_drawEye == 1) {
+                base[2] = smoothZ;  // stesso valore dell'occhio sinistro di questo tick
+            } else {
                 static double lastT = 0.0;
                 double now = ProfMs() * 0.001;
                 float tau = vr::control::g_eyeHeightSmooth;
@@ -3351,8 +3440,11 @@ public:
             // c'e' un ostacolo, la testa si ferma ~8 unita' prima.
             float dx = target[0] - base[0], dy = target[1] - base[1], dz = target[2] - base[2];
             float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+            static float tickT = 1.0f;  // calcolato sull'occhio sinistro, riusato dal destro
             float t = 1.0f;
-            if (vr::control::g_headCollision && len > 0.5f) {
+            if (g_drawEye == 1) {
+                t = tickT;
+            } else if (vr::control::g_headCollision && len > 0.5f) {
                 const float margin = 8.0f;
                 float ext[3] = {base[0] + dx / len * (len + margin), base[1] + dy / len * (len + margin),
                                 base[2] + dz / len * (len + margin)};
@@ -3364,6 +3456,15 @@ public:
                     t = allowed <= 0.0f ? 0.0f : (allowed < len ? allowed / len : 1.0f);
                     g_headBlocked.fetch_add(1, std::memory_order_relaxed);
                 }
+            }
+            if (g_drawEye != 1) tickT = t;
+            if (g_drawEye == 0) {
+                static float lastView[3] = {0, 0, 0};
+                float dj = std::sqrt((outLoc[0] - lastView[0]) * (outLoc[0] - lastView[0]) +
+                                     (outLoc[1] - lastView[1]) * (outLoc[1] - lastView[1]) +
+                                     (outLoc[2] - lastView[2]) * (outLoc[2] - lastView[2]));
+                if (dj < 500.0f && dj > g_maxViewJump) g_maxViewJump = dj;  // >500: teletrasporto/checkpoint
+                for (int i = 0; i < 3; ++i) lastView[i] = outLoc[i];
             }
             outLoc[0] = base[0] + dx * t;
             outLoc[1] = base[1] + dy * t;
@@ -3565,13 +3666,22 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         void* markable;
         float screenDist;
     } parms = {best, 0.0f};
+    // Il gioco convalida la scelta in modo asincrono (traccia di visibilita'):
+    // l'esito si controlla qualche frame dopo, non subito.
+    static void* pending = nullptr;
+    static int pendingFrames = 0;
+    if (pending && ++pendingFrames >= 10) {
+        uint32_t sel = 0;
+        TrySafeReadUint32(cam - 0x77C + kOffPcSelectedMarkable, &sel);
+        vr::log::Line("SQUAD: command target along the barrel: " + vr::script::ClassName(pending) +
+                      (reinterpret_cast<void*>(sel) == pending ? " (selected)" : " (not taken by the game)"));
+        pending = nullptr;
+    }
     vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
     if (best != lastPick) {
         lastPick = best;
-        uint32_t sel = 0;
-        TrySafeReadUint32(cam - 0x77C + kOffPcSelectedMarkable, &sel);
-        vr::log::Line("SQUAD: command target along the barrel: " + vr::script::ClassName(best) +
-                      (reinterpret_cast<void*>(sel) == best ? " (selected)" : " (not taken by the game)"));
+        pending = best;
+        pendingFrames = 0;
     }
 }
 

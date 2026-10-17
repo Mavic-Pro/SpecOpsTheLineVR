@@ -119,6 +119,21 @@ bool IsDll32(const std::string& data) {
     return machine == 0x014C;  // IMAGE_FILE_MACHINE_I386
 }
 
+// Il manifesto updates.json nel ramo main del repository elenca le versioni
+// ritirate ("revoked") e quella raccomandata: chi ha una versione ritirata
+// riceve la raccomandata anche se e' piu' vecchia (18/10: la 0.9.1 con le
+// immagini doppie restava installata perche' l'aggiornamento non torna mai
+// indietro). Esempio: {"revoked": ["0.9.1"], "recommended": "v0.9.2"}
+bool IsRevoked(const std::string& manifest, const std::string& version) {
+    size_t r = manifest.find("\"revoked\"");
+    if (r == std::string::npos) return false;
+    size_t open = manifest.find('[', r), close = manifest.find(']', r);
+    if (open == std::string::npos || close == std::string::npos) return false;
+    std::string list = manifest.substr(open, close - open);
+    return list.find("\"" + version + "\"") != std::string::npos ||
+           list.find("\"v" + version + "\"") != std::string::npos;
+}
+
 void Run() {
     Sleep(15000);  // dopo la lettura dell'ini e l'avvio del gioco
     if (!vr::control::g_autoUpdate) {
@@ -131,15 +146,34 @@ void Run() {
         vr::log::Line("UPDATE: no repository configured.");
         return;
     }
-    std::string json;
-    if (!HttpGet(L"api.github.com", Widen("/repos/" + repo + "/releases/latest"), &json, 1 << 20)) {
-        vr::log::Line("UPDATE: cannot read the latest release of " + repo + ".");
+    bool beta = vr::control::g_updateBeta;
+    std::string manifest, json, tag;
+    bool revoked = false;
+    if (HttpGet(L"raw.githubusercontent.com", Widen("/" + repo + "/main/updates.json"), &manifest, 1 << 16))
+        revoked = IsRevoked(manifest, SPECOPSVR_VERSION);
+    std::string recommended = revoked ? JsonString(manifest, "recommended") : std::string();
+    std::string api = !recommended.empty() ? "/releases/tags/" + recommended
+                      : beta               ? "/releases?per_page=5"  // la piu' recente, anche pre-release
+                                           : "/releases/latest";     // esclude le pre-release
+    if (!HttpGet(L"api.github.com", Widen("/repos/" + repo + api), &json, 1 << 21)) {
+        vr::log::Line("UPDATE: cannot read the releases of " + repo + ".");
         return;
     }
-    std::string tag = JsonString(json, "tag_name");
+    size_t tagAt = 0;
+    tag = JsonString(json, "tag_name", 0, &tagAt);
     if (tag.empty()) return;
-    if (ParseVersion(tag) <= ParseVersion(SPECOPSVR_VERSION)) {
-        vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is up to date (latest release " + tag + ").");
+    // Con la lista (canale beta) gli allegati cercati sono quelli della prima release.
+    size_t nextRelease = json.find("\"tag_name\"", tagAt);
+    if (nextRelease != std::string::npos) json = json.substr(0, nextRelease);
+    if (revoked) {
+        vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " was withdrawn; installing the recommended " + tag + ".");
+    } else if (ParseVersion(tag) == ParseVersion(SPECOPSVR_VERSION)) {
+        vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is up to date (" + std::string(beta ? "beta" : "stable") +
+                      " channel).");
+        return;
+    } else if (ParseVersion(tag) < ParseVersion(SPECOPSVR_VERSION)) {
+        vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is newer than the latest " +
+                      std::string(beta ? "beta" : "stable") + " release " + tag + " (test build?).");
         return;
     }
     // Allegato "d3d9.dll" della release.
@@ -188,9 +222,12 @@ void Run() {
 }  // namespace
 
 void Start() {
-    // Avanzi di un aggiornamento precedente.
+    // Avanzi di un aggiornamento precedente: la versione sostituita resta come
+    // d3d9.dll.prev (rollback.bat la rimette al suo posto).
     std::string dir = vr::log::Directory();
-    DeleteFileA((dir + "\\d3d9.dll.old").c_str());
+    std::string old = dir + "\\d3d9.dll.old";
+    if (GetFileAttributesA(old.c_str()) != INVALID_FILE_ATTRIBUTES)
+        MoveFileExA(old.c_str(), (dir + "\\d3d9.dll.prev").c_str(), MOVEFILE_REPLACE_EXISTING);
     DeleteFileA((dir + "\\d3d9.dll.new").c_str());
     std::thread(Run).detach();
 }

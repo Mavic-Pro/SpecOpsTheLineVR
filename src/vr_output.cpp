@@ -778,6 +778,30 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     // Schermo virtuale: tutto il back buffer (le eventuali bande nere del
     // 16:9 le toglie il thread di uscita, vedi DetectContentRows).
     RECT cinemaRect = {0, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height)};
+    // Ritorno dallo schermo virtuale: durante la cinematica l'occhio destro non
+    // viene letto, quindi resterebbe pronta un'immagine destra di prima della
+    // cinematica e la prima coppia univa un sinistro nuovo a un destro vecchio
+    // (fucile doppio all'inizio del gameplay, 18/10). Si scarta tutto cio' che
+    // e' in attesa e si riparte da una coppia nuova.
+    static bool wasCinema = false;
+    if (wasCinema && !cinema) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (int e = 0; e < 2; ++e) {
+            int old = g_ready[e].slot;
+            if (old >= 0) {
+                if (!g_slotGpu[e][old]) g_sysmem[e][old]->UnlockRect();
+                g_slotState[e][old] = kFree;
+            }
+            g_ready[e] = EyePacket{};
+            if (g_gpuSlot[e] >= 0) {
+                g_slotState[e][g_gpuSlot[e]] = kFree;
+                g_gpuSlot[e] = -1;
+            }
+        }
+        g_frameReady = false;
+        vr::log::Line("VR-OUTPUT: back from the cinema screen, pending eye images dropped.");
+    }
+    wasCinema = cinema;
     if (cinema || vr::control::g_stereoHalfIpd <= 0) {
         eye = -1;
     } else if (eye < 0 && GetTickCount64() - vr::control::g_lastStereoDrawMs < 200) {

@@ -56,6 +56,8 @@ extern std::atomic<bool> g_commandFollowsGun;
 // Pose di testa e controller predette per l'istante in cui il frame arriva
 // sul display: fino al prossimo vsync + vsync->fotoni + predictFrames frame.
 extern std::atomic<float> g_predictFrames;
+// Predizione dei soli controller in millisecondi ("handpredict"; 0 = nessuna).
+extern std::atomic<float> g_handPredictMs;
 // Con il device D3D9Ex (file specopsvr_gpushare): copia GPU->GPU degli occhi
 // tramite superfici condivise invece della lettura via CPU.
 extern std::atomic<bool> g_gpuCopy;  // diagnostica: 1 = salta la copia, 2 = salta copia e WaitGetPoses, 3 = solo senza WaitGetPoses
@@ -156,6 +158,8 @@ extern std::atomic<bool> g_rightTriggerHeld;
 extern std::atomic<bool> g_squadButtonHeld;
 // Aggiornamento automatico (updater.cpp): "autoupdate on|off", "updaterepo proprietario/nome".
 extern std::atomic<bool> g_autoUpdate;
+// "updatechannel beta": l'aggiornamento include le pre-release (predefinito: stable).
+extern std::atomic<bool> g_updateBeta;
 std::string UpdateRepo();
 // Prima persona: Walker opaco (niente dissolvenza vicino alla camera) e testa nascosta.
 extern std::atomic<bool> g_fpBody;

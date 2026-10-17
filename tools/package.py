@@ -69,10 +69,22 @@ Write-Host 'Start SteamVR, then the game.'
 UNINSTALL_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
-foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'd3d9.dll.old', 'd3d9.dll.new') {
+foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst $f)
 }
 Write-Host "SpecOpsTheLineVR removed from $dst (specopsvr.ini and the logs were kept)."
+"""
+
+ROLLBACK_PS1 = r"""
+. (Join-Path $PSScriptRoot 'find_game.ps1')
+$dst = Find-Game $args[0]
+$prev = Join-Path $dst 'd3d9.dll.prev'
+if (-not (Test-Path $prev)) { Write-Host 'No previous version found (d3d9.dll.prev).'; exit 1 }
+if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
+Copy-Item -Force (Join-Path $dst 'd3d9.dll') (Join-Path $dst 'd3d9.dll.rolledback')
+Copy-Item -Force $prev (Join-Path $dst 'd3d9.dll')
+Add-Content -Path (Join-Path $dst 'specopsvr.ini') -Value "`r`nautoupdate off  # set by rollback.bat; remove to get updates again"
+Write-Host 'The previous version is back. Automatic updates were turned off in specopsvr.ini.'
 """
 
 COLLECT_PS1 = r"""
@@ -116,7 +128,10 @@ UNINSTALL
 
 UPDATES
   The mod checks GitHub at start-up and installs new versions by itself for
-  the next launch ("autoupdate off" in specopsvr.ini disables it).
+  the next launch ("autoupdate off" in specopsvr.ini disables it). New
+  versions first come out as test (pre-release) builds: "updatechannel beta"
+  gets them too. If an update causes problems, close the game and run
+  rollback.bat to go back to the previous version.
 
 CONTROLS (Touch controllers, shown to the game as an Xbox pad)
   Left stick: move                 Right stick: turn
@@ -162,6 +177,8 @@ def main():
         "install.bat": bat("install.ps1", "Installs SpecOpsTheLineVR into the game folder (found through Steam)."),
         "uninstall.bat": bat("uninstall.ps1", "Removes SpecOpsTheLineVR (the game files are never modified)."),
         "collect_logs.bat": bat("collect_logs.ps1", "Zips logs, configuration and crash dumps for a bug report."),
+        "rollback.ps1": ROLLBACK_PS1,
+        "rollback.bat": bat("rollback.ps1", "Puts back the version installed before the last automatic update."),
         "README.txt": README_TXT.format(version=version()),
     }
     for name, text in files.items():

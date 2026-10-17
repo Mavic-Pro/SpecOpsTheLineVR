@@ -38,6 +38,7 @@ std::atomic<bool> g_pairCheck{false};
 std::atomic<bool> g_commandFollowsGun{true};
 std::atomic<float> g_turnWithHeadDeg{45.0f};
 std::atomic<float> g_predictFrames{-1.0f};
+std::atomic<float> g_handPredictMs{25.0f};
 std::atomic<bool> g_gpuCopy{true};
 std::atomic<float> g_stereoHalfIpd{1.6f};  // ~6,4 cm a ~2 cm per unita' Unreal
 std::atomic<int> g_presentEye{-1};
@@ -91,6 +92,7 @@ std::atomic<int> g_projLogSeconds{0};
 std::atomic<bool> g_rightTriggerHeld{false};
 std::atomic<bool> g_squadButtonHeld{false};
 std::atomic<bool> g_autoUpdate{true};
+std::atomic<bool> g_updateBeta{false};
 static std::mutex g_updateRepoMutex;
 static std::string g_updateRepo;
 std::string UpdateRepo() {
@@ -292,6 +294,10 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_autoUpdate = (v != "off");
+    } else if (cmd == "updatechannel") {
+        std::string v;
+        in >> v;
+        g_updateBeta = (v == "beta");
     } else if (cmd == "updaterepo") {
         std::string v;
         in >> v;
@@ -504,6 +510,10 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_commandFollowsGun = (v != "head");
+    } else if (cmd == "handpredict") {
+        float v = 25.0f;
+        in >> v;
+        g_handPredictMs = v < 0.0f ? 0.0f : (v > 60.0f ? 60.0f : v);
     } else if (cmd == "predict") {
         std::string t;
         in >> t;
