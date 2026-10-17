@@ -13,6 +13,8 @@
 #include <openvr.h>
 #include <algorithm>
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -196,6 +198,12 @@ SetVertexShaderConstantF_t g_SetVertexShaderConstantF_Original = nullptr;
 
 void UpdateHeadTracking();
 bool TrySafeReadUint32(void* addr, uint32_t* outValue);
+extern std::atomic<bool> g_onTurret;
+extern std::atomic<int32_t> g_turretYawUnits;
+bool TurretAimActive();
+bool SafeCopy(void* dst, const void* src, size_t n);
+// Giocatore bloccato da una scena (bCinematicMode), aggiornato dal thread di gioco.
+std::atomic<bool> g_gameLockedScene{false};
 
 void* VTableEntry(void* obj, int index) {
     void** vtable = *reinterpret_cast<void***>(obj);
@@ -353,6 +361,53 @@ HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
 std::atomic<uint32_t> g_presentByEye[3];
 std::atomic<uint32_t> g_presentRepeats{0};
 
+// Etichetta di ogni frame disegnato (Fase 2, 18/10): il thread di gioco la
+// accoda prima di ogni FViewport::Draw che presenta, il thread di rendering la
+// toglie al Present corrispondente (i comandi di rendering restano in ordine).
+// Porta occhio, tick e posa del visore usata per QUEL frame: il riconoscimento
+// tramite l'origine della vista (c5) resta come controllo incrociato, ma stando
+// fermi l'origine e' uguale in molti tick e non dice quale tick e' (0.9.1).
+struct FrameTag {
+    int eye = -1;
+    uint32_t tick = 0;
+    bool poseValid = false;
+    vr::HmdMatrix34_t pose = {};
+};
+std::mutex g_frameTagMutex;
+std::deque<FrameTag> g_frameTags;
+std::atomic<uint32_t> g_frameTagDisagree{0}, g_frameTagResync{0}, g_frameTagEmpty{0};
+
+void PushFrameTag(const FrameTag& t) {
+    std::lock_guard<std::mutex> lock(g_frameTagMutex);
+    if (g_frameTags.size() >= 16) g_frameTags.pop_front();
+    g_frameTags.push_back(t);
+}
+
+// Etichetta del Present in corso; c5Eye = occhio riconosciuto dall'origine
+// (-1 se nessuno). Se non coincidono e l'etichetta seguente coincide, la coda
+// era sfasata (un Present senza Draw o un Draw senza Present): si riallinea.
+bool PopFrameTag(int c5Eye, FrameTag* out) {
+    std::lock_guard<std::mutex> lock(g_frameTagMutex);
+    if (g_frameTags.empty()) {
+        g_frameTagEmpty.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    *out = g_frameTags.front();
+    g_frameTags.pop_front();
+    if (c5Eye >= 0 && out->eye >= 0 && out->eye != c5Eye) {
+        g_frameTagDisagree.fetch_add(1, std::memory_order_relaxed);
+        if (!g_frameTags.empty() && g_frameTags.front().eye == c5Eye) {
+            *out = g_frameTags.front();
+            g_frameTags.pop_front();
+            g_frameTagResync.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            out->eye = c5Eye;
+            out->poseValid = false;  // tick incerto: niente posa
+        }
+    }
+    return true;
+}
+
 void RecordPresentEye(int eye) {
     static int last = -2;
     g_presentByEye[eye + 1].fetch_add(1, std::memory_order_relaxed);
@@ -381,6 +436,15 @@ HRESULT WINAPI Hooked_Present(
     HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) {
     g_lastPresentMs = GetTickCount64();
     int eye = vr::control::g_presentEye.exchange(-1);
+    {
+        FrameTag tag;
+        if (PopFrameTag(eye, &tag)) {
+            if (tag.eye >= 0) eye = tag.eye;
+            if (eye >= 0) vr::output::SetRenderPose(eye, tag.poseValid ? &tag.pose : nullptr, tag.tick);
+        } else if (eye >= 0) {
+            vr::output::SetRenderPose(eye, nullptr, 0);
+        }
+    }
     RecordPresentEye(eye);
     DrawAimMarker(self, eye);
     std::string shotPath;
@@ -632,6 +696,12 @@ void InvalidateEyeRing() {
     for (auto& e : g_eyeRing) e.valid = false;
 }
 
+// c0-c3 del passaggio che ha dato l'occhio (la scena principale): per misurare
+// il FOV effettivo del rendering (l'ultimo c0-c3 del frame era dell'interfaccia,
+// 90x58,7 gradi anche col visore).
+float g_vsViewProj[16] = {};
+float g_mainViewProj[16] = {};
+
 void IdentifyEyeFromViewOrigin(const float* v) {
     float x = -v[0], y = -v[1], z = -v[2];
     // Origine (0,0,0): passaggi senza vista (post-processo, HUD). Prima
@@ -647,7 +717,7 @@ void IdentifyEyeFromViewOrigin(const float* v) {
         if (!e.valid) continue;
         if (std::fabs(e.x - x) < 0.01f && std::fabs(e.y - y) < 0.01f && std::fabs(e.z - z) < 0.01f) {
             vr::control::g_presentEye = e.eye;
-            vr::output::SetRenderPose(e.eye, e.poseValid ? &e.pose : nullptr, e.tick);
+            std::memcpy(g_mainViewProj, g_vsViewProj, sizeof(g_mainViewProj));
             g_eyeMatches[e.eye & 1].fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -656,8 +726,7 @@ void IdentifyEyeFromViewOrigin(const float* v) {
 }
 
 // Ultima matrice c0-c3 (view-projection della vista, senza traslazione):
-// serve a misurare il FOV effettivo usato dal rendering.
-float g_vsViewProj[16] = {};
+// g_vsViewProj e g_mainViewProj sono dichiarate sopra.
 
 void ScanVsConstantsForCameraLocation(UINT start, const float* data, UINT count) {
     if (start == 0 && count >= 4) std::memcpy(g_vsViewProj, data, sizeof(g_vsViewProj));
@@ -1380,9 +1449,30 @@ int32_t RadiansToUnreal(float rad);
 // cono di 40 gradi, scattava sempre e il fucile puntava verso la mano sinistra.)
 void ApplyTwoHandAim(const float* right, const float* left) {
     static bool wasActive = false;
+    // Passaggio graduale tra una e due mani (~100 ms): prima l'arma scattava
+    // di colpo dalla direzione del polso a quella tra le mani.
+    static float blend = 0.0f;
+    static float twoYaw = 0.0f, twoPitch = 0.0f;
+    static double lastT = 0.0;
+    double now = ProfMs() * 0.001;
+    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
+    lastT = now;
+    if (dt > 0.2f) dt = 0.2f;
+    auto applyBlend = [&](bool target) {
+        blend += (target ? 1.0f : -1.0f) * dt / 0.1f;
+        blend = blend < 0.0f ? 0.0f : (blend > 1.0f ? 1.0f : blend);
+        if (blend <= 0.0f) return;
+        float ry = static_cast<float>(g_aimDeltaYaw.load()) * (6.28318530718f / 65536.0f);
+        float rp = static_cast<float>(g_aimDeltaPitch.load()) * (6.28318530718f / 65536.0f);
+        float dy = std::remainder(twoYaw - ry, 6.28318530718f);
+        g_aimDeltaYaw = RadiansToUnreal(ry + dy * blend);
+        g_aimDeltaPitch = RadiansToUnreal(rp + (twoPitch - rp) * blend);
+    };
     g_twoHandActive = false;
+    vr::control::g_twoHandEngaged = false;
     if (!vr::control::g_twoHand) {
         wasActive = false;
+        applyBlend(false);
         return;
     }
     float scale = vr::control::g_posScale;
@@ -1398,14 +1488,17 @@ void ApplyTwoHandAim(const float* right, const float* left) {
     float limit = wasActive ? 0.14f : 0.08f;
     if (along < 0.12f || along > 0.70f || off > limit) {
         wasActive = false;
+        applyBlend(false);
         return;
     }
     if (!wasActive) vr::log::Line("AIM: two-handed grip.");
     wasActive = true;
     float horiz = std::sqrt(d[0] * d[0] + d[1] * d[1]);
-    g_aimDeltaYaw = RadiansToUnreal(std::atan2(d[1], d[0]));
-    g_aimDeltaPitch = RadiansToUnreal(std::atan2(d[2], horiz));
+    twoYaw = std::atan2(d[1], d[0]);
+    twoPitch = std::atan2(d[2], horiz);
+    applyBlend(true);
     g_twoHandActive = true;
+    vr::control::g_twoHandEngaged = true;
 }
 std::atomic<int32_t> g_deltaPitch{0};
 std::atomic<uint32_t> g_overridesApplied{0};
@@ -1550,6 +1643,28 @@ void ApplyFirstPerson(char* cam) {
 // Occhio del Draw in corso (stereo sincrono, thread di gioco), -1 = fuori.
 std::atomic<int> g_drawEye{-1};
 
+// Posa della testa pubblicata in blocco da UpdateHeadTracking (thread di
+// rendering) e letta in blocco dal thread di gioco: rotazioni, spostamento e
+// matrice del visore dello stesso campionamento.
+struct PublishedHead {
+    bool valid = false;
+    int32_t yaw = 0, pitch = 0, roll = 0;
+    float offset[3] = {0, 0, 0};
+    vr::HmdMatrix34_t pose = {};
+};
+std::mutex g_publishedHeadMutex;
+PublishedHead g_publishedHead;
+
+void PublishHeadPose(const vr::HmdMatrix34_t* m) {
+    std::lock_guard<std::mutex> lock(g_publishedHeadMutex);
+    g_publishedHead.valid = true;
+    g_publishedHead.yaw = g_deltaYaw.load();
+    g_publishedHead.pitch = g_deltaPitch.load();
+    g_publishedHead.roll = g_deltaRoll.load();
+    for (int i = 0; i < 3; ++i) g_publishedHead.offset[i] = g_headOffset[i].load();
+    g_publishedHead.pose = *m;
+}
+
 // Testa congelata per il tick (thread di gioco, prima dei due Draw): la posa
 // viene aggiornata sul thread di rendering (BeginScene) e poteva cambiare tra
 // l'occhio sinistro e il destro dello stesso tick.
@@ -1557,6 +1672,8 @@ struct HeadSnapshot {
     bool valid = false;
     int32_t yaw = 0, pitch = 0, roll = 0;
     float offset[3] = {0, 0, 0};
+    bool poseValid = false;
+    vr::HmdMatrix34_t pose = {};
 };
 HeadSnapshot g_headSnap;
 int32_t HeadYaw() { return g_headSnap.valid ? g_headSnap.yaw : g_deltaYaw.load(std::memory_order_relaxed); }
@@ -1662,17 +1779,26 @@ void RedirectNewProjectiles(void* pawn);
 // differenze dall'ultima riga. ripetuti = Present consecutivi dello stesso
 // occhio (immagini doppie), sconosciuti = frame senza occhio riconosciuto.
 void LogStats() {
-    static uint32_t last[8] = {};
-    uint32_t now[8] = {g_presentByEye[0].load(), g_presentByEye[1].load(), g_presentByEye[2].load(),
-                       g_presentRepeats.load(), g_eyeMisses.load(), g_headBlocked.load(), g_cinemaSwitches.load(), 0};
-    char b[300];
+    static uint32_t last[10] = {};
+    uint32_t now[10] = {g_presentByEye[0].load(), g_presentByEye[1].load(), g_presentByEye[2].load(),
+                        g_presentRepeats.load(), g_eyeMisses.load(), g_headBlocked.load(), g_cinemaSwitches.load(),
+                        g_frameTagDisagree.load(), g_frameTagResync.load(), g_frameTagEmpty.load()};
+    // FOV della scena principale (colonne di c0-c3: x/w, y/w) contro quello chiesto.
+    const float* mv = g_mainViewProj;
+    auto n3 = [](float a, float b2, float c) { return std::sqrt(a * a + b2 * b2 + c * c); };
+    float cw = n3(mv[3], mv[7], mv[11]);
+    float hfov = cw > 0 ? 2.0f * std::atan(cw / n3(mv[0], mv[4], mv[8])) * 57.2957795f : 0.0f;
+    float vfov = cw > 0 ? 2.0f * std::atan(cw / n3(mv[1], mv[5], mv[9])) * 57.2957795f : 0.0f;
+    float want = vr::control::g_fovOverride > 0 ? vr::control::g_fovOverride.load() : 0.0f;
+    char b[420];
     snprintf(b, sizeof(b),
              "STATS: present L=%u R=%u unknown=%u repeated=%u | eye misses=%u | head blocked=%u | cinema switches=%u | "
-             "max view jump=%.1f | cinema=%d",
+             "max view jump=%.1f | cinema=%d | frame tags disagree=%u resync=%u empty=%u | view fov %.1fx%.1f (wanted %.1f)",
              now[1] - last[1], now[2] - last[2], now[0] - last[0], now[3] - last[3], now[4] - last[4], now[5] - last[5],
-             now[6] - last[6], g_maxViewJump, (int)vr::control::g_cinemaActive.load());
+             now[6] - last[6], g_maxViewJump, (int)vr::control::g_cinemaActive.load(), now[7] - last[7],
+             now[8] - last[8], now[9] - last[9], hfov, vfov, want);
     vr::log::Line(b);
-    for (int i = 0; i < 8; ++i) last[i] = now[i];
+    for (int i = 0; i < 10; ++i) last[i] = now[i];
     g_maxViewJump = 0.0f;
 }
 
@@ -1700,7 +1826,24 @@ public:
             cinematicMode = TrySafeReadUint32(cam - 0x77C + 0x39C, &pcFlags) && (pcFlags & 0x8000);
         }
         bool noWalker = !(HasCameraSignature(cam) && PlayerPawnIfViewTarget(cam));
-        bool wanted = vr::control::g_cinemaEnabled && (vr::control::g_cinemaForce || cinematicMode || noWalker);
+        // Modalita' cinematica con la camera ancora su Walker (camminate guidate,
+        // porte, scene scriptate): resta in 3D, salvo un video a schermo intero
+        // (YPlayerController.IsPlayingFullscreenMovie, controllato ogni 10 tick).
+        bool movie = false;
+        if (cinematicMode && !noWalker && vr::control::g_cinemaWalker3D) {
+            static int n = 0;
+            static bool lastMovie = true;
+            if (++n % 10 == 1) {
+                struct {
+                    uint32_t ret;
+                } mp = {0};
+                lastMovie = !vr::script::CallFunction(cam - 0x77C, "IsPlayingFullscreenMovie", &mp) || mp.ret != 0;
+            }
+            movie = lastMovie;
+        }
+        bool lockedScene = cinematicMode && (noWalker || !vr::control::g_cinemaWalker3D || movie);
+        g_gameLockedScene = cinematicMode;
+        bool wanted = vr::control::g_cinemaEnabled && (vr::control::g_cinemaForce || lockedScene || noWalker);
         // Isteresi: momenti brevi di modalita' cinematica durante il gioco
         // (porte, eventi scriptati) restano in VR. Passare allo schermo
         // virtuale per mezzo secondo e tornare indietro, nel visore, e' un
@@ -1727,15 +1870,29 @@ public:
             vr::control::g_cinemaActive = cinema;
         }
         if (cinema || half <= 0 || !vr::control::g_syncStereo || !HasCameraSignature(cam)) {
+            if (bShouldPresent) PushFrameTag(FrameTag{});
             g_ViewportDraw_Original(self, bShouldPresent);
             return;
         }
         float* loc = reinterpret_cast<float*>(cam + 0x10);
         float base[3] = {loc[0], loc[1], loc[2]};
-        g_headSnap.yaw = g_deltaYaw.load();
-        g_headSnap.pitch = g_deltaPitch.load();
-        g_headSnap.roll = g_deltaRoll.load();
-        for (int i = 0; i < 3; ++i) g_headSnap.offset[i] = g_headOffset[i].load();
+        {
+            std::lock_guard<std::mutex> lock(g_publishedHeadMutex);
+            if (g_publishedHead.valid && vr::control::g_mode == vr::control::kModeHmd) {
+                g_headSnap.yaw = g_publishedHead.yaw;
+                g_headSnap.pitch = g_publishedHead.pitch;
+                g_headSnap.roll = g_publishedHead.roll;
+                for (int i = 0; i < 3; ++i) g_headSnap.offset[i] = g_publishedHead.offset[i];
+                g_headSnap.pose = g_publishedHead.pose;
+                g_headSnap.poseValid = true;
+            } else {
+                g_headSnap.yaw = g_deltaYaw.load();
+                g_headSnap.pitch = g_deltaPitch.load();
+                g_headSnap.roll = g_deltaRoll.load();
+                for (int i = 0; i < 3; ++i) g_headSnap.offset[i] = g_headOffset[i].load();
+                g_headSnap.poseValid = false;
+            }
+        }
         g_headSnap.valid = true;
         for (int eye = 0; eye < 2; ++eye) {
             loc[0] = base[0];
@@ -1744,6 +1901,14 @@ public:
             g_drawEye = eye;
             OffsetLocationForEye(cam, eye, half);
             double t0 = ProfMs();
+            if (bShouldPresent) {
+                FrameTag tag;
+                tag.eye = eye;
+                tag.tick = g_stereoDraws.load(std::memory_order_relaxed);
+                tag.poseValid = g_headSnap.poseValid;
+                tag.pose = g_headSnap.pose;
+                PushFrameTag(tag);
+            }
             g_ViewportDraw_Original(self, bShouldPresent);
             g_profDraw[eye] += ProfMs() - t0;
         }
@@ -1864,7 +2029,7 @@ inline bool MaybeApplyCameraOverride(void* dst, size_t n) {
     // "aim hand": la camera usata dalla logica di gioco (mira) punta dove
     // punta il controller destro; la vista viene ricostruita in
     // GetPlayerViewPoint come corpo + testa.
-    if (vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid) {
+    if (vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid && !TurretAimActive()) {
         if (g_muzzleAimValid) {
             // La canna del fucile visibile decide la mira (colpi e mirino
             // dove punta la canna, con una o due mani).
@@ -2062,6 +2227,7 @@ float PredictedSecondsToPhotons(vr::IVRSystem* sys) {
 bool AddControllerYaw(void* pc, int32_t delta) {
     __try {
         *reinterpret_cast<int32_t*>(static_cast<char*>(pc) + 0x64) += delta;
+        vr::control::g_ownYawUnits.fetch_add(delta);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -2209,7 +2375,69 @@ void UpdateHeadTracking() {
         uint32_t cover = 0;
         inCover = pawnT && TrySafeReadUint32(static_cast<char*>(pawnT) + 0x498, &cover) && (cover & 0xFF) != 0;
     }
-    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover) {
+    // Rotazione del corpo decisa dal gioco (entrando in copertura Walker viene
+    // girato di ~50 gradi verso il riparo in pochi frame): la si toglie dalla
+    // vista spostando il riferimento della testa, cosi' il mondo non gira
+    // attorno al giocatore. Esclusi lo stick (pochi gradi per frame) e le
+    // rotazioni fatte dalla mod (g_ownYawUnits).
+    {
+        static int32_t lastBodyYaw = 0;
+        static bool haveBody = false;
+        int32_t bodyYawNow = g_bodyYaw.load();
+        int32_t own = vr::control::g_ownYawUnits.exchange(0);
+        int32_t turretAdd = g_turretYawUnits.exchange(0);
+        if (haveBody && turretAdd != 0) {
+            // Solo la parte davvero eseguita (la torretta puo' essere al limite).
+            int32_t actual = static_cast<int16_t>(bodyYawNow - lastBodyYaw - (own - turretAdd));
+            int32_t comp = 0;
+            if ((actual > 0) == (turretAdd > 0)) comp = std::abs(actual) < std::abs(turretAdd) ? actual : turretAdd;
+            g_hmdYawReference += vr::control::g_yawSign * comp * (6.28318530718f / 65536.0f);
+            lastBodyYaw += comp;
+            own -= turretAdd;
+        }
+        if (haveBody && !vr::control::g_cinemaActive && vr::control::g_coverSnapCompensate &&
+            !vr::control::g_stickTurning && !TurretAimActive() && !g_gameLockedScene) {
+            int16_t d = static_cast<int16_t>(bodyYawNow - lastBodyYaw - own);
+            const int kMin = 7 * 65536 / 360, kMax = 120 * 65536 / 360;
+            if (std::abs(d) > kMin && std::abs(d) < kMax) {
+                g_hmdYawReference += vr::control::g_yawSign * d * (6.28318530718f / 65536.0f);
+                static ULONGLONG lastLog = 0;
+                if (GetTickCount64() - lastLog > 500) {
+                    lastLog = GetTickCount64();
+                    vr::log::Line("COVER: body turned " + std::to_string(d * 360 / 65536) +
+                                  " degrees by the game" + (inCover ? " (cover)" : "") + ", view kept still");
+                }
+            }
+        }
+        lastBodyYaw = bodyYawNow;
+        haveBody = true;
+    }
+    // Sporgersi dal riparo col corpo: alzarsi di 12 cm o spostarsi di 18 cm
+    // rispetto a dove si era entrando in copertura = LT (esce a mirare);
+    // rientro sotto 7 / 11 cm.
+    {
+        static bool wasCover = false, peeking = false;
+        static float entry[3] = {0, 0, 0};
+        if (inCover && !wasCover) {
+            for (int i = 0; i < 3; ++i) entry[i] = pos[i];
+            peeking = false;
+        }
+        if (inCover && vr::control::g_coverPeekEnabled) {
+            float up = pos[1] - entry[1];
+            float lat = std::sqrt((pos[0] - entry[0]) * (pos[0] - entry[0]) + (pos[2] - entry[2]) * (pos[2] - entry[2]));
+            if (!peeking && (up > 0.12f || lat > 0.18f)) {
+                peeking = true;
+                vr::log::Line("COVER: leaning out (head up " + std::to_string(up) + " m, sideways " + std::to_string(lat) + " m)");
+            } else if (peeking && up < 0.07f && lat < 0.11f) {
+                peeking = false;
+            }
+        } else {
+            peeking = false;
+        }
+        vr::control::g_coverPeek = peeking;
+        wasCover = inCover;
+    }
+    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover && !g_gameLockedScene) {
         float ex = std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f);
         if (std::fabs(ex) > turnThr) {
             float shift = ex - std::copysign(turnThr, ex);
@@ -2240,6 +2468,7 @@ void UpdateHeadTracking() {
         g_deltaRoll = 0;
         for (auto& v : g_headOffset) v = 0.0f;
     }
+    PublishHeadPose(&m);
     // Controller destro: direzione di puntamento (-Z del controller), yaw
     // relativo alla direzione di ricentramento, pitch rispetto all'orizzonte.
     {
@@ -2289,6 +2518,21 @@ void UpdateHeadTracking() {
         } else {
             g_aimValid = false;
             g_handValid = false;
+        }
+    }
+    // Torretta: il PlayerController (e con lui la torretta) ruota verso il
+    // controller destro; la vista non gira (compensazione sopra) e il
+    // beccheggio del corpo non entra nella vista. Prima la torretta seguiva lo
+    // stick e solo in parte il controller ("had to aim my headset", 18/10).
+    if (TurretAimActive() && g_aimValid && g_playerControllerPtr) {
+        char* pc = static_cast<char*>(g_playerControllerPtr);
+        int32_t dy = static_cast<int32_t>(g_aimDeltaYaw.load() * 0.35f);
+        if (dy != 0 && AddControllerYaw(pc, dy)) g_turretYawUnits.fetch_add(dy);
+        uint32_t pitchNow = 0;
+        if (TrySafeReadUint32(pc + 0x60, &pitchNow)) {
+            int16_t err = static_cast<int16_t>(g_aimDeltaPitch.load() - static_cast<int32_t>(pitchNow));
+            int32_t newPitch = static_cast<int32_t>(pitchNow) + static_cast<int32_t>(err * 0.35f);
+            SafeCopy(pc + 0x60, &newPitch, 4);
         }
     }
     if (shouldLog) DumpCamera(camera);
@@ -3232,12 +3476,25 @@ void RedirectNewProjectiles(void* pawn) {
     }
 }
 
+// Arma in mano = postazione fissa (torretta, minigun dell'elicottero): la mira
+// col controller ruota la torretta (UpdateHeadTracking), non la camera.
+std::atomic<bool> g_onTurret{false};
+std::atomic<int32_t> g_turretYawUnits{0};
+bool TurretAimActive() {
+    return g_onTurret.load() && vr::control::g_turretAimHand && vr::control::g_aimHand && !vr::control::g_cinemaActive;
+}
+
 void UpdateArms(const float* base, int32_t bodyYaw) {
     char* cam = static_cast<char*>(g_cameraPtr.load());
     bool hand = vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid && g_handValid;
     void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
     bool want = vr::control::g_arms && hand && vr::control::g_firstPerson && pawn && !vr::control::g_cinemaActive;
     uint32_t weapon = 0, mesh = 0;
+    {
+        uint32_t w = 0;
+        g_onTurret = pawn && TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &w) && w &&
+                     CurrentWeaponInfo(reinterpret_cast<void*>(w)).stationary;
+    }
     if (want && TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) && weapon &&
         CurrentWeaponInfo(reinterpret_cast<void*>(weapon)).stationary)
         want = false;  // postazioni fisse: le mani restano sulle maniglie dell'animazione
@@ -3401,7 +3658,7 @@ public:
                                : outRot[1] - (vr::control::g_aimFollowsBody ? 0 : HeadYaw());
         if (hand) {
             // La camera del gioco punta col controller: la vista e' corpo + testa.
-            outRot[0] = g_bodyPitch.load() + HeadPitch();
+            outRot[0] = (TurretAimActive() ? 0 : g_bodyPitch.load()) + HeadPitch();
             outRot[1] = g_bodyYaw.load() + HeadYaw();
         } else if (vr::control::g_aimFollowsBody) {
             outRot[0] += HeadPitch();  // FRotator: Pitch, Yaw, Roll
@@ -3511,6 +3768,7 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     char* cam = static_cast<char*>(g_cameraPtr.load());
     if (!vr::control::g_aimMarker || !hand || !HasCameraSignature(cam) || !PlayerPawnIfViewTarget(cam)) {
         g_markerVisible[eye] = false;
+        if (eye == 0) vr::control::g_adsActive = false;
         return;
     }
     const float range = 20000.0f;
@@ -3518,6 +3776,33 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     void* pawn = PlayerPawnIfViewTarget(cam);
     float muzzle[3], barrel[3];
     if (vr::control::g_muzzleAim && g_armsActive && GunBarrel(pawn, muzzle, barrel)) {
+        // Mira con le tacche, dalle pose tracciate (non dalla canna disegnata:
+        // la mira del gioco attivata da LT sposta l'arma e lo stato
+        // lampeggiava a ogni frame). Riferimento del ricentramento, unita':
+        // occhio = spostamento della testa, raggio = controller destro con la
+        // sua direzione. Le tacche stanno ~4-6 unita' sopra l'impugnatura:
+        // dentro se l'occhio e' entro 8 unita' dal raggio e 4-45 unita' dietro
+        // il controller; fuori sopra 11.
+        if (eye == 0) {
+            float ho[3];
+            HeadOffset(ho);
+            float c[3] = {g_handOffset[0].load(), g_handOffset[1].load(), g_handOffset[2].load()};
+            float yaw = static_cast<float>(g_aimDeltaYaw.load()) * (6.28318530718f / 65536.0f);
+            float pitch = static_cast<float>(g_aimDeltaPitch.load()) * (6.28318530718f / 65536.0f);
+            float dir[3] = {std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch)};
+            float v[3] = {ho[0] - c[0], ho[1] - c[1], ho[2] - c[2]};
+            float along = v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
+            float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
+            float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+            bool ads = vr::control::g_adsActive;
+            bool behind = along < -4.0f && along > -45.0f;
+            if (!vr::control::g_adsEnabled || !behind || !g_handValid) ads = false;
+            else if (!ads && off < 8.0f) ads = true;
+            else if (ads && off > 11.0f) ads = false;
+            if (ads != vr::control::g_adsActive.load())
+                vr::log::Line(ads ? "ADS: gun at the eye (sights), marker hidden" : "ADS: end");
+            vr::control::g_adsActive = ads;
+        }
         // Raggio dalla canna del fucile visibile: il mirino va dove arriva.
         float start[3], end[3];
         for (int i = 0; i < 3; ++i) {
@@ -3540,6 +3825,7 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
         g_muzzleAimPitch = RadiansToUnreal(std::atan2(d[2], horiz));
         g_muzzleAimValid = true;
     } else {
+        if (eye == 0) vr::control::g_adsActive = false;
         g_muzzleAimValid = false;
         // Direzione di mira = rotazione che la logica di gioco usa (corpo + controller).
         float af[3], ar[3], au[3];
@@ -3567,7 +3853,7 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     float tv = (w && h) ? th * h / w : th;
     g_markerNdc[eye][0] = (x / z) / th;
     g_markerNdc[eye][1] = (y / z) / tv;
-    g_markerVisible[eye] = true;
+    g_markerVisible[eye] = !vr::control::g_adsActive;
 }
 
 

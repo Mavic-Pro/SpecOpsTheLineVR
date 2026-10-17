@@ -45,12 +45,22 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 - **Post effects**: motion blur and depth of field are switched off in
   `GSystemSettings` (`0x014D77B0`).
 - **Near plane**: `GNearClippingPlane` (`0x0141578C`).
-- **Render pose (experimental, off)**: `submitpose on` sends each frame with
-  the HMD pose of its game tick (`Submit_TextureWithPose`) and `predict <n>`
-  predicts poses to display time. Off by default since 0.9.2: the frame is
-  matched to its tick through the eye origin, which is identical in many
-  ticks while standing still, so frames went out with a wrong pose (double
-  images in 0.9.1). Needs a unique per-tick frame id first.
+- **Frame tags and render pose**: before every presenting `FViewport::Draw`
+  the game thread queues a tag {eye, tick, HMD pose of the tick}; the render
+  thread pops it at the matching Present (render commands stay in order). The
+  eye found from the view origin (c5) is only a cross-check: on disagreement
+  the queue is re-aligned (STATS `frame tags disagree/resync/empty`). The HMD
+  pose and the head deltas are published together by `UpdateHeadTracking`
+  (render thread) and frozen once per tick for both eyes. Frames are
+  submitted with their pose (`Submit_TextureWithPose`, `submitpose on`). In
+  0.9.1 the pose came from the eye-origin ring, which is ambiguous while
+  standing still (double images).
+- **Eye ring**: entries carry a valid flag; the (0,0,0) origin of post-process
+  passes is ignored; first match per frame; ring and pending eye images are
+  dropped on cinema transitions.
+- **Measured**: rendered projection 108.0 x 110.2 degrees for a requested 108
+  (Quest 3); Walker's skeleton is 94 units tall, i.e. ~52 units/m for a 1.8 m
+  man, so `posscale 50` is right.
 - **First-person eye**: Walker's location + `fpforward` along the yaw of the
   Pawn (not the camera rotation, which at copy time could still hold the
   gun direction set by the mod: in cover the eyes jumped ~19 units per frame).
@@ -157,6 +167,28 @@ Useful offsets (`ue3.py props`):
   visible enemy nearest to the eye-to-marker ray and passes it to
   `YPlayerController.SetAsCurrentSelectedMarkable` (screen distance 0), before
   and after the frame is drawn.
+- Cover: body yaw changes made by the game (not by the stick or the mod, more
+  than 7 degrees in a frame, e.g. the ~50 degree snap when taking cover) are
+  moved into the yaw reference, so the view does not spin (`coversnap`).
+  In cover, raising the head 12 cm or leaning 18 cm from where it was when
+  entering cover holds LT: Walker pops out to aim (`coverpeek`).
+- Turrets (`YWeapon_Stationary`): the PlayerController is steered towards the
+  right controller (35% of the error per frame, yaw and pitch); the part of
+  the yaw actually performed is moved into the yaw reference and body pitch
+  is left out of the view, so the view does not follow the turret
+  (`turretaim hand`).
+- Aim down the sights: from tracked poses (head offset vs. the right
+  controller ray, not the drawn gun, whose pose changes with the game's aim
+  mode and made the state flicker): eye within 8 units of the ray and 4-45
+  units behind the controller hides the marker and holds LT (`ads`).
+- Two-handed aim blends in and out over 100 ms; while the left hand holds the
+  barrel its grip does not throw a grenade.
+- Haptics: the game's motor speed is remembered and pulsed every frame on the
+  gun hand (and the left hand when two-handed); gestures confirm with 70 ms.
+- Controllers are predicted `handpredict` ms (25) ahead; head roll and hand
+  roll use atan2(right.y, up.y).
+- Scenes with bCinematicMode but the camera still on Walker stay in 3D unless
+  `YPlayerController.IsPlayingFullscreenMovie` (`cinemawalker`).
 - Turning: past `turnwithhead` degrees of head yaw the excess moves to the
   PlayerController rotation and to the yaw reference (view unchanged).
 - Aim assist (`YWeapon` friction / snap-on flags at +0x260,

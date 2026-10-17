@@ -29,7 +29,8 @@ import deepsweep as ds  # noqa: E402
 
 MAP = 'SP_Gorge02_P'
 STATS = re.compile(r'STATS: present L=(\d+) R=(\d+) unknown=(\d+) repeated=(\d+) \| eye misses=\d+ \| '
-                   r'head blocked=\d+ \| cinema switches=(\d+) \| max view jump=([\d.]+) \| cinema=(\d)')
+                   r'head blocked=\d+ \| cinema switches=(\d+) \| max view jump=([\d.]+) \| cinema=(\d)'
+                   r'(?: \| frame tags disagree=(\d+) resync=(\d+) empty=(\d+))?')
 VEC = r'\(([-\d.]+), ([-\d.]+), ([-\d.]+)\)'
 SHOT = re.compile(r'SHOT: from ' + VEC + r' to ' + VEC + r', game wanted ' + VEC + r', barrel -> ' + VEC +
                   r', barrel origin ' + VEC + r' axis ' + VEC + r', impact ' + VEC)
@@ -46,7 +47,8 @@ def stats_since(pos):
     for m in STATS.finditer(ls.log_since(pos)):
         L, R, unk, rep, csw = (int(x) for x in m.groups()[:5])
         rows.append({'L': L, 'R': R, 'unknown': unk, 'repeated': rep, 'cinema_switches': csw,
-                     'jump': float(m.group(6)), 'cinema': m.group(7) == '1'})
+                     'jump': float(m.group(6)), 'cinema': m.group(7) == '1',
+                     'tag_disagree': int(m.group(8) or 0), 'tag_empty': int(m.group(10) or 0)})
     return rows
 
 
@@ -59,7 +61,10 @@ def check_pairing(name, rows, failures, skip_first=0):
     R = sum(r['R'] for r in game)
     rep = sum(r['repeated'] for r in game)
     tot = L + R
-    res = {'L': L, 'R': R, 'repeated': rep, 'lines': len(game)}
+    dis = sum(r['tag_disagree'] for r in game)
+    res = {'L': L, 'R': R, 'repeated': rep, 'lines': len(game), 'tag_disagree': dis}
+    if dis > 0.01 * tot:
+        failures.append('%s: frame tag and eye origin disagree %d times' % (name, dis))
     if rep > MAX_REPEATED_FRAC * tot:
         failures.append('%s: repeated eyes %d of %d presents' % (name, rep, tot))
     if abs(L - R) > MAX_LR_IMBALANCE * tot + 2:

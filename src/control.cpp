@@ -33,10 +33,20 @@ std::atomic<bool> g_cinemaForce{false};
 std::atomic<float> g_cinemaWidthM{3.2f}, g_cinemaDistM{2.6f};
 std::atomic<int> g_outputTest{0};
 std::atomic<float> g_outputScale{1.0f};
-std::atomic<bool> g_submitWithPose{false};
+std::atomic<bool> g_submitWithPose{true};
 std::atomic<bool> g_pairCheck{false};
 std::atomic<bool> g_commandFollowsGun{true};
 std::atomic<float> g_turnWithHeadDeg{45.0f};
+std::atomic<int32_t> g_ownYawUnits{0};
+std::atomic<bool> g_stickTurning{false};
+std::atomic<bool> g_coverSnapCompensate{true};
+std::atomic<bool> g_coverPeekEnabled{true};
+std::atomic<bool> g_coverPeek{false};
+std::atomic<bool> g_turretAimHand{true};
+std::atomic<bool> g_adsEnabled{true};
+std::atomic<bool> g_adsActive{false};
+std::atomic<bool> g_twoHandEngaged{false};
+std::atomic<bool> g_cinemaWalker3D{true};
 std::atomic<float> g_predictFrames{-1.0f};
 std::atomic<float> g_handPredictMs{25.0f};
 std::atomic<bool> g_gpuCopy{true};
@@ -502,6 +512,26 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_submitWithPose = (v != "off");
+    } else if (cmd == "cinemawalker") {
+        std::string v;
+        in >> v;
+        g_cinemaWalker3D = (v != "screen");
+    } else if (cmd == "ads") {
+        std::string v;
+        in >> v;
+        g_adsEnabled = (v != "off");
+    } else if (cmd == "turretaim") {
+        std::string v;
+        in >> v;
+        g_turretAimHand = (v != "stick");
+    } else if (cmd == "coversnap") {
+        std::string v;
+        in >> v;
+        g_coverSnapCompensate = (v != "off");
+    } else if (cmd == "coverpeek") {
+        std::string v;
+        in >> v;
+        g_coverPeekEnabled = (v != "off");
     } else if (cmd == "turnwithhead") {
         float v = 45.0f;
         in >> v;

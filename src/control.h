@@ -174,6 +174,30 @@ extern std::atomic<bool> g_bodyFollowsHead;
 // (la vista non cambia): lo stick "avanti" torna verso dove si guarda.
 // 0 = mai (solo stick). Segnalazione 18/10: "still had to use the right stick".
 extern std::atomic<float> g_turnWithHeadDeg;
+// Yaw (unita' Rotator) aggiunto dalla mod al PlayerController (rotazione a
+// scatti, corpo che segue la testa): escluso dalle rotazioni "del gioco".
+extern std::atomic<int32_t> g_ownYawUnits;
+// Stick destro inclinato (rotazione dal giocatore): niente compensazione.
+extern std::atomic<bool> g_stickTurning;
+// Copertura: rotazione del corpo decisa dal gioco (ingresso nel riparo)
+// compensata nella vista ("coversnap on|off").
+extern std::atomic<bool> g_coverSnapCompensate;
+// Copertura: sporgersi col corpo (alzarsi o spostarsi di lato) = LT, Walker
+// esce dal riparo per mirare ("coverpeek on|off"). g_coverPeek: stato attuale.
+extern std::atomic<bool> g_coverPeekEnabled;
+extern std::atomic<bool> g_coverPeek;
+// Torrette e mitragliatrici fisse mirate col controller ("turretaim hand|stick").
+extern std::atomic<bool> g_turretAimHand;
+// Mira con le tacche: occhio sulla linea della canna -> niente mirino verde e
+// LT (mira del gioco). "ads on|off"; g_adsActive = stato attuale.
+extern std::atomic<bool> g_adsEnabled;
+extern std::atomic<bool> g_adsActive;
+// Mano sinistra sulla canna (mira a due mani): il grip sinistro non lancia
+// la granata (LB) mentre si tiene l'arma.
+extern std::atomic<bool> g_twoHandEngaged;
+// Scene "nel motore" con la camera di Walker e il giocatore bloccato
+// (bCinematicMode): in 3D ("cinemawalker 3d") o sullo schermo virtuale ("screen").
+extern std::atomic<bool> g_cinemaWalker3D;
 extern std::atomic<float> g_armRotDeg[3];
 // Allungamento massimo del braccio per raggiungere i controller (1 = nessuno).
 extern std::atomic<float> g_armStretch;

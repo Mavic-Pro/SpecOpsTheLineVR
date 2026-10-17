@@ -69,6 +69,30 @@ bool ButtonPressed(const vr::VRControllerState_t& s, vr::EVRButtonId id) {
     return (s.ulButtonPressed & vr::ButtonMaskFromId(id)) != 0;
 }
 
+// Vibrazione: il gioco chiama XInputSetState solo quando cambia il motore,
+// mentre l'API legacy di SteamVR accetta impulsi di ~4 ms: l'intensita' viene
+// ricordata e l'impulso ripetuto a ogni lettura del pad (ogni frame) finche'
+// il motore resta acceso. Va alla mano che regge l'arma (destra) e anche alla
+// sinistra quando tiene la canna; prima il motore sinistro del pad finiva
+// sulla mano sinistra vuota. g_hapticUntil: conferme dei gesti (ms).
+std::atomic<WORD> g_rumble[2];
+std::atomic<ULONGLONG> g_hapticUntil[2];
+
+void UpdateHaptics(vr::IVRSystem* sys) {
+    ULONGLONG now = GetTickCount64();
+    WORD game = g_rumble[0] > g_rumble[1] ? g_rumble[0].load() : g_rumble[1].load();
+    for (int h = 0; h < 2; ++h) {
+        unsigned short us = 0;
+        bool gunHand = h == 1 || vr::control::g_twoHandEngaged;
+        if (game && gunHand) us = static_cast<unsigned short>(600 + game / 20);
+        if (now < g_hapticUntil[h]) us = 3500;
+        if (!us) continue;
+        vr::TrackedDeviceIndex_t idx = sys->GetTrackedDeviceIndexForControllerRole(
+            h == 0 ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
+        if (idx != vr::k_unTrackedDeviceIndexInvalid) sys->TriggerHapticPulse(idx, 0, us > 3900 ? 3900 : us);
+    }
+}
+
 // Grip dei Touch: con i binding legacy di SteamVR (legacy_bindings_touch.json)
 // arriva come tasto Grip e come valore analogico sulla seconda componente
 // dell'asse 2 ("axis2_value1"); si accettano tutte le forme.
@@ -119,7 +143,8 @@ bool ReadTouchControllers(XGamepad* out) {
         out->sThumbLX = AxisToShort(ls.rAxis[0].x);
         out->sThumbLY = AxisToShort(ls.rAxis[0].y);
         out->bLeftTrigger = TriggerToByte(ls.rAxis[1].x);
-        if (GripValue(ls) > 0.6f) out->wButtons |= kLB;
+        // Grip sinistro = granata (LB), tranne quando la mano tiene la canna.
+        if (GripValue(ls) > 0.6f && !vr::control::g_twoHandEngaged) out->wButtons |= kLB;
         if (ButtonPressed(ls, vr::k_EButton_A)) out->wButtons |= kX;
         if (ButtonPressed(ls, vr::k_EButton_ApplicationMenu)) out->wButtons |= kY;
         if (ButtonPressed(ls, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kLThumb;
@@ -134,6 +159,7 @@ bool ReadTouchControllers(XGamepad* out) {
         if (ButtonPressed(rs, vr::k_EButton_ApplicationMenu)) out->wButtons |= kB;
         if (ButtonPressed(rs, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kRThumb;
     }
+    UpdateHaptics(sys);  // sotto lo stesso lock di sessione
     return true;
 }
 
@@ -183,7 +209,7 @@ public:
         m_lastT = s.t;
         if (s.leftValid && vr::control::g_gestureGrenade && s.t > m_throwReady) {
             float vf = s.leftVel[0] * s.fwd[0] + s.leftVel[2] * s.fwd[2];
-            if (vf > 3.2f && s.left[1] > s.hmd[1] - 0.35f) {
+            if (vf > 2.5f && s.left[1] > s.hmd[1] - 0.35f) {  // 3,2 m/s non scattava mai nelle sessioni reali
                 Press(kLB, s.t, 0.30, "lancio della granata", vf);
                 m_throwReady = s.t + 1.0;
             }
@@ -305,7 +331,11 @@ bool ReadGestureSample(GestureSample* s) {
     vr::VRControllerState_t rs = {};
     if (ri != vr::k_unTrackedDeviceIndexInvalid && sys->GetControllerState(ri, &rs, sizeof(rs)))
         s->rightGrip = GripValue(rs) > 0.6f;
-    if (g_gestures.TakeHaptic() && ri != vr::k_unTrackedDeviceIndexInvalid) sys->TriggerHapticPulse(ri, 0, 3000);
+    if (g_gestures.TakeHaptic()) {
+        ULONGLONG until = GetTickCount64() + 70;  // conferma del gesto su entrambe le mani
+        g_hapticUntil[0] = until;
+        g_hapticUntil[1] = until;
+    }
     return true;
 }
 
@@ -434,6 +464,15 @@ void ApplyRecenterCombo(XGamepad* pad) {
 }
 
 void ApplyVrStickRules(XGamepad* pad) {
+    {
+        static ULONGLONG lastTurn = 0;
+        if (std::abs(static_cast<int>(pad->sThumbRX)) > 5000) lastTurn = GetTickCount64();
+        vr::control::g_stickTurning = GetTickCount64() - lastTurn < 300;
+    }
+    // Sporgersi dal riparo col corpo: LT (Walker esce per mirare).
+    if (vr::control::g_coverPeek && !vr::control::g_cinemaActive) pad->bLeftTrigger = 255;
+    // Arma portata all'occhio (mira con le tacche): LT.
+    if (vr::control::g_adsActive && !vr::control::g_cinemaActive) pad->bLeftTrigger = 255;
     ApplyGestures(pad);
     ApplyRecenterCombo(pad);
     ApplyDpadModifier(pad);
@@ -462,7 +501,7 @@ void ApplyVrStickRules(XGamepad* pad) {
         armed = false;
         void* pc = vr::control::g_playerController;
         int32_t delta = static_cast<int32_t>((x > 0 ? snap : -snap) / 360.0f * 65536.0f);
-        if (pc) SafeAddYaw(pc, delta);
+        if (pc && SafeAddYaw(pc, delta)) vr::control::g_ownYawUnits.fetch_add(delta);
     } else if (x > -0.3f && x < 0.3f) {
         armed = true;
     }
@@ -506,20 +545,8 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
 
 DWORD WINAPI Hooked_XInputSetState(DWORD user, XVibration* vib) {
     if (user == 0 && vib) {
-        vr::session::Shared vrLock(true);
-        vr::IVRSystem* sys = vrLock.ok() ? vr::VRSystem() : nullptr;
-        if (sys && (vib->wLeftMotorSpeed || vib->wRightMotorSpeed)) {
-            // L'API legacy accetta impulsi fino a ~3,9 ms; chiamata ogni frame
-            // finche' il gioco tiene acceso il motore.
-            auto pulse = [&](vr::ETrackedControllerRole role, WORD speed) {
-                if (!speed) return;
-                vr::TrackedDeviceIndex_t idx = sys->GetTrackedDeviceIndexForControllerRole(role);
-                if (idx != vr::k_unTrackedDeviceIndexInvalid)
-                    sys->TriggerHapticPulse(idx, 0, static_cast<unsigned short>(500 + speed / 20));
-            };
-            pulse(vr::TrackedControllerRole_LeftHand, vib->wLeftMotorSpeed);
-            pulse(vr::TrackedControllerRole_RightHand, vib->wRightMotorSpeed);
-        }
+        g_rumble[0] = vib->wLeftMotorSpeed;
+        g_rumble[1] = vib->wRightMotorSpeed;
     }
     return g_SetState_Real ? g_SetState_Real(user, vib) : ERROR_SUCCESS;
 }
