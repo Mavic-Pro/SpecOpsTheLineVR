@@ -97,10 +97,10 @@ bool ReadTouchControllers(XGamepad* out) {
             vr::control::g_inputLogFrames.fetch_sub(1);
             char b[400];
             std::snprintf(b, sizeof(b),
-                          "INPUTLOG: L%s stick=(%.2f %.2f) grill=%.2f grip=%.2f tasti=%llx | R%s stick=(%.2f %.2f) grill=%.2f "
-                          "grip=%.2f tasti=%llx",
-                          haveL ? "" : "(assente)", ls.rAxis[0].x, ls.rAxis[0].y, ls.rAxis[1].x, ls.rAxis[2].x,
-                          static_cast<unsigned long long>(ls.ulButtonPressed), haveR ? "" : "(assente)", rs.rAxis[0].x,
+                          "INPUTLOG: L%s stick=(%.2f %.2f) trigger=%.2f grip=%.2f buttons=%llx | R%s stick=(%.2f %.2f) trigger=%.2f "
+                          "grip=%.2f buttons=%llx",
+                          haveL ? "" : "(missing)", ls.rAxis[0].x, ls.rAxis[0].y, ls.rAxis[1].x, ls.rAxis[2].x,
+                          static_cast<unsigned long long>(ls.ulButtonPressed), haveR ? "" : "(missing)", rs.rAxis[0].x,
                           rs.rAxis[0].y, rs.rAxis[1].x, rs.rAxis[2].x, static_cast<unsigned long long>(rs.ulButtonPressed));
             vr::log::Line(b);
         }
@@ -158,8 +158,8 @@ public:
             float rel[3] = {s.right[0] - s.hmd[0], s.right[1] - s.hmd[1], s.right[2] - s.hmd[2]};
             char b[300];
             std::snprintf(b, sizeof(b),
-                          "GESTILOG: testa y=%.2f (in piedi %.2f, vy %.2f) | sx valida=%d y=%.2f vel avanti=%.2f vy=%.2f | "
-                          "dx valida=%d y-testa=%.2f davanti=%.2f grip=%d | dist mani=%.2f",
+                          "GESTURELOG: head y=%.2f (standing %.2f, vy %.2f) | left valid=%d y=%.2f forward vel=%.2f vy=%.2f | "
+                          "right valid=%d y-head=%.2f ahead=%.2f grip=%d | hands dist=%.2f",
                           s.hmd[1], m_standingY, s.hmdVelY, (int)s.leftValid, s.left[1], vf, s.leftVel[1],
                           (int)s.rightValid, rel[1], rel[0] * s.fwd[0] + rel[2] * s.fwd[2], (int)s.rightGrip,
                           Dist(s.left, s.right));
@@ -240,7 +240,7 @@ private:
                         m_presses.end());
         m_presses.push_back({button, t, t + dur});
         char b[120];
-        std::snprintf(b, sizeof(b), "GESTO: %s (%.2f m/s)", what, speed);
+        std::snprintf(b, sizeof(b), "GESTURE: %s (%.2f m/s)", what, speed);
         vr::log::Line(b);
     }
     std::vector<Pressed> m_presses;
@@ -349,7 +349,7 @@ void ApplyGestures(XGamepad* pad) {
     static WORD lastLogged = 0;
     if (g && g != lastLogged) {
         char b[80];
-        std::snprintf(b, sizeof(b), "GESTO: tasti 0x%04X inviati al gioco", g);
+        std::snprintf(b, sizeof(b), "GESTURE: buttons 0x%04X sent to the game", g);
         vr::log::Line(b);
     }
     lastLogged = g;
@@ -391,7 +391,7 @@ void ApplyDpadModifier(XGamepad* pad) {
         static WORD lastD = 0;
         if (d && d != lastD) {
             char b[64];
-            std::snprintf(b, sizeof(b), "DPAD: croce 0x%04X (stick destro premuto)", d);
+            std::snprintf(b, sizeof(b), "DPAD: 0x%04X (right stick held)", d);
             vr::log::Line(b);
         }
         lastD = d;
@@ -421,7 +421,7 @@ void ApplyRecenterCombo(XGamepad* pad) {
     if (!fired && now - since > 1000) {
         fired = true;
         vr::control::g_recenterRequested = true;
-        vr::log::Line("RICENTRA: richiesto dai controller (due stick premuti).");
+        vr::log::Line("RECENTER: requested from the controllers (both sticks held).");
     }
 }
 
@@ -476,7 +476,7 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                vr::log::Line("INPUT: controller Touch attivi, presentati al gioco come pad Xbox 0.");
+                vr::log::Line("INPUT: Touch controllers active, shown to the game as Xbox pad 0.");
             }
             ApplyVrStickRules(&pad);
             state->dwPacketNumber = g_packet.fetch_add(1);
@@ -516,7 +516,7 @@ bool PatchSlot(uintptr_t slot, const char* name, void* replacement, void** origi
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        static_cast<LPCSTR>(current), &owner);
     if (!xinput || owner != xinput) {
-        vr::log::Line(std::string("INPUT: voce IAT ") + name + " inattesa, non tocco nulla.");
+        vr::log::Line(std::string("INPUT: IAT entry ") + name + " unexpected, leaving it alone.");
         return false;
     }
     DWORD old;
@@ -534,7 +534,7 @@ void InstallXInputHooks() {
                        reinterpret_cast<void**>(&g_GetState_Real));
     bool b = PatchSlot(kIatXInputSetState, "XInputSetState", reinterpret_cast<void*>(&Hooked_XInputSetState),
                        reinterpret_cast<void**>(&g_SetState_Real));
-    vr::log::Line(std::string("INPUT: hook XInput ") + (a && b ? "installati" : "NON installati"));
+    vr::log::Line(std::string("INPUT: XInput hooks ") + (a && b ? "installed" : "NOT installed"));
 }
 
 void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons, unsigned durationMs) {

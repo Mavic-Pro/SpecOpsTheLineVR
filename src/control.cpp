@@ -79,6 +79,7 @@ std::atomic<bool> g_twoHand{true};
 std::atomic<bool> g_arms{true};
 std::atomic<bool> g_muzzleAim{true};
 std::atomic<bool> g_noAimAssist{true};
+std::atomic<bool> g_spread{true};
 std::atomic<bool> g_fireLog{false};
 std::atomic<bool> g_autoUpdate{true};
 static std::mutex g_updateRepoMutex;
@@ -161,7 +162,7 @@ void Execute(const std::string& line) {
         if (m == "off") g_mode = kModeOff;
         else if (m == "hmd") g_mode = kModeHmd;
         else if (m == "synth") g_mode = kModeSynthetic;
-        else vr::log::Line("CMD: modalita' sconosciuta '" + m + "' (off|hmd|synth)");
+        else vr::log::Line("CMD: unknown mode '" + m + "' (off|hmd|synth)");
         g_recenterRequested = true;
     } else if (cmd == "synth") {
         float yaw = 30, pitch = 0, period = 4;
@@ -286,6 +287,10 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_fireLog = (v != "off");
+    } else if (cmd == "spread") {
+        std::string v;
+        in >> v;
+        g_spread = (v == "on");
     } else if (cmd == "aimassist") {
         std::string v;
         in >> v;
@@ -493,7 +498,7 @@ void Execute(const std::string& line) {
             g_shots.push_back({ShotPath(name + "_" + std::to_string(i)), i == 0 ? 0 : (step > 1 ? step - 1 : 0)});
         }
     } else {
-        vr::log::Line("CMD: comando sconosciuto '" + cmd + "'");
+        vr::log::Line("CMD: unknown command '" + cmd + "'");
     }
 }
 
@@ -505,10 +510,10 @@ void Execute(const std::string& line) {
 void LoadConfigFile() {
     std::ifstream f(ModuleDirectory() + "\\specopsvr.ini");
     if (!f) {
-        vr::log::Line("CONFIG: specopsvr.ini non trovato, uso i valori predefiniti.");
+        vr::log::Line("CONFIG: specopsvr.ini not found, using the defaults.");
         return;
     }
-    vr::log::Line("CONFIG: carico specopsvr.ini");
+    vr::log::Line("CONFIG: loading specopsvr.ini");
     std::string line;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();

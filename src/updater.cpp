@@ -63,7 +63,7 @@ bool HttpGet(const std::wstring& host, const std::wstring& path, std::string* bo
                 }
             }
         } else {
-            vr::log::Line("AGGIORNAMENTO: risposta HTTP " + std::to_string(status));
+            vr::log::Line("UPDATE: HTTP status " + std::to_string(status));
         }
     }
     if (r) WinHttpCloseHandle(r);
@@ -122,24 +122,24 @@ bool IsDll32(const std::string& data) {
 void Run() {
     Sleep(15000);  // dopo la lettura dell'ini e l'avvio del gioco
     if (!vr::control::g_autoUpdate) {
-        vr::log::Line("AGGIORNAMENTO: disattivato (autoupdate off).");
+        vr::log::Line("UPDATE: disabled (autoupdate off).");
         return;
     }
     std::string repo = vr::control::UpdateRepo();
     if (repo.empty()) repo = SPECOPSVR_REPO;
     if (repo.empty() || repo.find('/') == std::string::npos) {
-        vr::log::Line("AGGIORNAMENTO: nessun repository configurato.");
+        vr::log::Line("UPDATE: no repository configured.");
         return;
     }
     std::string json;
     if (!HttpGet(L"api.github.com", Widen("/repos/" + repo + "/releases/latest"), &json, 1 << 20)) {
-        vr::log::Line("AGGIORNAMENTO: impossibile leggere l'ultima release di " + repo + ".");
+        vr::log::Line("UPDATE: cannot read the latest release of " + repo + ".");
         return;
     }
     std::string tag = JsonString(json, "tag_name");
     if (tag.empty()) return;
     if (ParseVersion(tag) <= ParseVersion(SPECOPSVR_VERSION)) {
-        vr::log::Line("AGGIORNAMENTO: versione " SPECOPSVR_VERSION " aggiornata (ultima release " + tag + ").");
+        vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is up to date (latest release " + tag + ").");
         return;
     }
     // Allegato "d3d9.dll" della release.
@@ -154,14 +154,14 @@ void Run() {
         }
     }
     if (url.empty()) {
-        vr::log::Line("AGGIORNAMENTO: la release " + tag + " non ha l'allegato d3d9.dll.");
+        vr::log::Line("UPDATE: release " + tag + " has no d3d9.dll asset.");
         return;
     }
-    vr::log::Line("AGGIORNAMENTO: nuova versione " + tag + ", scaricamento...");
+    vr::log::Line("UPDATE: new version " + tag + ", downloading...");
     std::wstring host, path;
     std::string dll;
     if (!SplitUrl(url, &host, &path) || !HttpGet(host, path, &dll, 64u << 20) || !IsDll32(dll)) {
-        vr::log::Line("AGGIORNAMENTO: scaricamento non riuscito o file non valido.");
+        vr::log::Line("UPDATE: download failed or invalid file.");
         return;
     }
     std::string dir = vr::log::Directory();
@@ -173,16 +173,16 @@ void Run() {
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     DeleteFileA(old.c_str());
     if (!ok || !MoveFileA(cur.c_str(), old.c_str())) {
-        vr::log::Line("AGGIORNAMENTO: impossibile sostituire la dll (permessi?).");
+        vr::log::Line("UPDATE: cannot replace the dll (permissions?).");
         DeleteFileA(neu.c_str());
         return;
     }
     if (!MoveFileA(neu.c_str(), cur.c_str())) {
         MoveFileA(old.c_str(), cur.c_str());  // rimette la vecchia
-        vr::log::Line("AGGIORNAMENTO: impossibile installare la nuova dll.");
+        vr::log::Line("UPDATE: cannot install the new dll.");
         return;
     }
-    vr::log::Line("AGGIORNAMENTO: versione " + tag + " installata, attiva dal prossimo avvio del gioco.");
+    vr::log::Line("UPDATE: version " + tag + " installed, active from the next game start.");
 }
 
 }  // namespace

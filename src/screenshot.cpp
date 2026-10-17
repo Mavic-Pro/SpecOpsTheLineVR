@@ -54,13 +54,13 @@ bool SaveBackBuffer(IDirect3DDevice9* device, const std::string& path) {
 
     do {
         if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer))) {
-            vr::log::Line("SCREENSHOT: GetBackBuffer fallita.");
+            vr::log::Line("SCREENSHOT: GetBackBuffer failed.");
             break;
         }
         D3DSURFACE_DESC desc;
         backBuffer->GetDesc(&desc);
         if (desc.Format != D3DFMT_X8R8G8B8 && desc.Format != D3DFMT_A8R8G8B8) {
-            vr::log::Line("SCREENSHOT: formato back buffer non supportato (" +
+            vr::log::Line("SCREENSHOT: unsupported back buffer format (" +
                           std::to_string(static_cast<int>(desc.Format)) + ").");
             break;
         }
@@ -73,7 +73,7 @@ bool SaveBackBuffer(IDirect3DDevice9* device, const std::string& path) {
         if (SUCCEEDED(hr)) hr = device->StretchRect(backBuffer, nullptr, resolved, nullptr, D3DTEXF_NONE);
         if (FAILED(hr)) {
             char buf[96];
-            std::snprintf(buf, sizeof(buf), "SCREENSHOT: copia in render target fallita hr=0x%08lX", hr);
+            std::snprintf(buf, sizeof(buf), "SCREENSHOT: copy to render target failed hr=0x%08lX", hr);
             vr::log::Line(buf);
             break;
         }
@@ -82,14 +82,14 @@ bool SaveBackBuffer(IDirect3DDevice9* device, const std::string& path) {
         if (SUCCEEDED(hr)) hr = device->GetRenderTargetData(resolved, sysmem);
         if (FAILED(hr)) {
             char buf[96];
-            std::snprintf(buf, sizeof(buf), "SCREENSHOT: copia in memoria di sistema fallita hr=0x%08lX", hr);
+            std::snprintf(buf, sizeof(buf), "SCREENSHOT: copy to system memory failed hr=0x%08lX", hr);
             vr::log::Line(buf);
             break;
         }
 
         D3DLOCKED_RECT lr;
         if (FAILED(sysmem->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-            vr::log::Line("SCREENSHOT: LockRect fallita.");
+            vr::log::Line("SCREENSHOT: LockRect failed.");
             break;
         }
         int w = static_cast<int>(desc.Width) / 2;
@@ -108,7 +108,7 @@ bool SaveBackBuffer(IDirect3DDevice9* device, const std::string& path) {
         sysmem->UnlockRect();
 
         ok = WriteBmp24(path, w, h, rgb);
-        vr::log::Line(std::string("SCREENSHOT ") + (ok ? "salvato: " : "scrittura fallita: ") + path);
+        vr::log::Line(std::string("SCREENSHOT ") + (ok ? "saved: " : "write failed: ") + path);
     } while (false);
 
     SafeRelease(sysmem);

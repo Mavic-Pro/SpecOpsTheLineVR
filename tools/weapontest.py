@@ -29,8 +29,8 @@ import deepsweep as ds  # noqa: E402
 
 OUT = os.path.join(ROOT, 'shots', 'weapons')
 VEC = r'\(([-\d.]+), ([-\d.]+), ([-\d.]+)\)'
-COLPO_RE = re.compile(r'COLPO: da ' + VEC + r' verso ' + VEC + r', il gioco voleva ' + VEC + r', canna -> ' + VEC +
-                      r', canna origine ' + VEC + r' asse ' + VEC)
+COLPO_RE = re.compile(r'SHOT: from ' + VEC + r' to ' + VEC + r', game wanted ' + VEC + r', barrel -> ' + VEC +
+                      r', barrel origin ' + VEC + r' axis ' + VEC + r', impact ' + VEC)
 
 
 def weapon_classes():
@@ -53,6 +53,14 @@ def weapon_classes():
         if base not in chain or x == base or stationary in chain:
             continue
         if '_Scnd' in name or '_AI' in name or name.endswith('Base') or name.startswith('Default'):
+            continue
+        # Classi astratte (UClass.ClassFlags +0xDC, CLASS_Abstract 0x1) e di
+        # supporto (_Content): un GiveWeapon fallito lascia l'arsenale bloccato.
+        if p.u32(x + 0xDC) & 1 or name.endswith('_Content'):
+            continue
+        # Non armi da fuoco del giocatore: esplosivi, coltello, cannello, armi
+        # del multigiocatore, di prova, "nessuna arma", armi della squadra/IA.
+        if re.search(r'_(Expl_|Knife|Blowtorch|MP[A-Z]|No[A-Z]|PDA|TestWeapon)|EliteAI|Squad$', name):
             continue
         out.append(name)
     return sorted(set(out))
@@ -108,16 +116,23 @@ def ensure_free():
 
 
 def test_weapon(cls, d):
+    """Da' l'arma, la equipaggia davvero (SwitchWeapon + EndSwitchWeapon: senza,
+    il cambio restava a meta' e l'arma non sparava), spara col grilletto finto
+    e misura per ogni colpo la distanza tra il punto d'impatto e il punto del
+    mirino (dove arriva la canna)."""
     r = {'classe': cls}
-    # Cinematiche partite nel frattempo: saltate (A/B) prima di provare l'arma.
     ensure_free()
     pos = ls.log_size()
-    g.send_cmds(['pad fake 0 0 0 0 0 0 0 200'])  # grilletto rilasciato
-    time.sleep(0.5)
+    g.send_cmds(['pad fake 0 0 0 0 0 0 0 200'])
+    time.sleep(0.4)
     g.send_cmds(['giveweapon ' + cls])
-    time.sleep(4.0)  # animazione di estrazione
-    g.send_cmds(['ucall cheat AllAmmo'])
     time.sleep(1.0)
+    g.send_cmds(['ucall arsenal SwitchWeapon %s 1' % cls])
+    time.sleep(3.5)
+    g.send_cmds(['ucall arsenal EndSwitchWeapon'])
+    time.sleep(0.6)
+    g.send_cmds(['ucall cheat AllAmmo'])
+    time.sleep(0.6)
     st = ls.state_sample()
     r['stato'] = st
     if not st or ('arma=' + cls) not in st:
@@ -131,28 +146,36 @@ def test_weapon(cls, d):
     time.sleep(0.5)
     g.send_cmds(['shot wt_' + cls])
     time.sleep(2.0)
+    if not COLPO_RE.search(ls.log_since(fpos)):  # grilletto ignorato: fuoco chiesto all'arsenale
+        g.send_cmds(['ucall arsenal StartFire 0 0'])
+        time.sleep(0.9)
+        g.send_cmds(['ucall arsenal StopFire 0 0'])
+        time.sleep(1.5)
     a1 = ammo(cls)
     r['munizioni'] = [a0, a1]
     shots = COLPO_RE.findall(ls.log_since(fpos))
     r['colpi'] = len(shots)
-    angs, offs, ahead = [], [], []
+    angs, errs, offs = [], [], []
     for s in shots:
         v = [float(x) for x in s]
-        start, end, target, borig, baxis = v[0:3], v[3:6], v[9:12], v[12:15], v[15:18]
+        start, end, target, borig, baxis, hit = v[0:3], v[3:6], v[9:12], v[12:15], v[15:18], v[18:21]
         ang = angle(sub(end, start), sub(target, start))
         if ang is not None:
             angs.append(ang)
-        off, t = dist_to_line(start, borig, baxis)
-        offs.append(off)
-        ahead.append(t)
+        offs.append(dist_to_line(start, borig, baxis)[0])
+        if norm(hit) > 1.0:
+            errs.append(norm(sub(hit, target)))
     if shots:
         r['angolo_max'] = round(max(angs), 3) if angs else None
         r['partenza_fuori_asse_max'] = round(max(offs), 1)
-        r['partenza_lungo_canna'] = [round(min(ahead), 1), round(max(ahead), 1)]
-        ok = angs and max(angs) < 0.5 and max(offs) < 6.0
+        r['impatti_misurati'] = len(errs)
+        r['errore_impatto_max'] = round(max(errs), 1) if errs else None
+        r['errore_impatto_medio'] = round(sum(errs) / len(errs), 1) if errs else None
+        ok = angs and max(angs) < 0.5 and max(offs) < 1.0 and errs and max(errs) < 5.0
         r['esito'] = 'OK' if ok else 'DA VERIFICARE'
     else:
-        r['esito'] = 'nessun colpo istantaneo' + (' (ha sparato: proiettile)' if a0 is not None and a1 is not None and a1 < a0 else '')
+        fired = a0 is not None and a1 is not None and a1 < a0
+        r['esito'] = 'a proiettile (ha sparato)' if fired else 'non ha sparato'
     src = os.path.join(g.SHOT_DIR, 'wt_%s.bmp' % cls)
     try:
         from PIL import Image
@@ -163,37 +186,59 @@ def test_weapon(cls, d):
     return r
 
 
+MAP = 'SP_Gorge02_P'
+SETUP = ['cheats', 'ucall cheat God', 'firelog on', 'synth 0 -30 0', 'synthaim 0 -35', 'synthhand 40 20 -30',
+         'synthleft 0 0 0', 'mode synth']
+
+
+def fresh_level():
+    """Gioco riavviato da zero e livello caricato una volta: dopo ricaricamenti
+    ripetuti con la console, o dopo un GiveWeapon fallito, il fuoco smette di
+    funzionare; con un avvio pulito le armi sparano una dopo l'altra."""
+    ls.gamectl('kill')
+    g.launch(['-nostartupmovies', '-windowed', 'ResX=2400', 'ResY=2500'])
+    time.sleep(55)
+    g.focus()
+    g.send_cmds(['console open TheLine_P?mission=%s?game=SRAssets.YGameInfo_SP_Content' % MAP])
+    time.sleep(45)
+    ensure_free()
+    for c in SETUP:
+        g.send_cmds([c])
+        time.sleep(0.6)
+    time.sleep(1.0)
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     ls.backup_saves()
     ls.ensure_game()
-    g.focus()
-    # Inizio di Gorge02: gameplay subito, nessuna cinematica, si puo' sparare
-    # (Desert01 aperto dal collaudo resta in modalita' cinematica e blocca gli spari).
-    g.send_cmds(['console open TheLine_P?mission=SP_Gorge02_P?game=SRAssets.YGameInfo_SP_Content'])
-    time.sleep(45)
-    ensure_free()
-    for c in ['cheats', 'ucall cheat God', 'firelog on', 'synth 0 -25 0', 'synthaim 12 -20', 'synthhand 40 20 -30',
-              'synthleft 0 0 0', 'mode synth']:
-        g.send_cmds([c])
-        time.sleep(0.8)
     classes = sys.argv[1:] or weapon_classes()
     print('armi da provare:', len(classes), flush=True)
+    fresh_level()
     report = []
+
+    def show(cls, r):
+        print('%-32s %-26s colpi=%s impatto-mirino max/medio=%s/%s angolo=%s fuori asse=%s munizioni=%s' % (
+            cls, r.get('esito'), r.get('colpi'), r.get('errore_impatto_max'), r.get('errore_impatto_medio'),
+            r.get('angolo_max'), r.get('partenza_fuori_asse_max'), r.get('munizioni')), flush=True)
+
     try:
         for cls in classes:
             r = test_weapon(cls, OUT)
+            if r.get('esito') in ('non ha sparato', 'non equipaggiata') or not ls.running():
+                # conferma su un gioco appena avviato
+                fresh_level()
+                r = test_weapon(cls, OUT)
+                r['ripetuta'] = True
+                fresh_level()
             report.append(r)
-            print('%-32s %-28s colpi=%s angolo=%s fuori asse=%s munizioni=%s' % (
-                cls, r.get('esito'), r.get('colpi'), r.get('angolo_max'), r.get('partenza_fuori_asse_max'),
-                r.get('munizioni')), flush=True)
+            show(cls, r)
             json.dump(report, open(os.path.join(OUT, 'rapporto.json'), 'w', encoding='utf-8'), indent=1,
                       ensure_ascii=False)
-            if not ls.running():
-                print('gioco chiuso', flush=True)
-                break
     finally:
         g.send_cmds(['synthaim 0 0', 'synth 0 0 0', 'mode hmd'])
+        ls.gamectl('kill')
+        ls.restore_saves()
 
 
 if __name__ == '__main__':

@@ -33,7 +33,7 @@ bool CheckGameExecutable() {
     char exe[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
     char b[400];
-    std::snprintf(b, sizeof(b), "Eseguibile: %s, impronta 0x%08lX / 0x%08lX (supportata 0x%08lX / 0x%08lX)", exe,
+    std::snprintf(b, sizeof(b), "Executable: %s, fingerprint 0x%08lX / 0x%08lX (supported 0x%08lX / 0x%08lX)", exe,
                   stamp, size, kSupportedTimeDateStamp, kSupportedSizeOfImage);
     vr::log::Line(b);
     return stamp == kSupportedTimeDateStamp && size == kSupportedSizeOfImage;
@@ -52,15 +52,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         vr::log::Init();
         vr::log::InstallCrashHandler();
-        vr::log::Line("SpecOpsVR proxy d3d9.dll iniettato nel processo.");
+        vr::log::Line("SpecOpsVR proxy d3d9.dll loaded into the game.");
         if (!vr::realdll::Load()) {
-            vr::log::Line("ERRORE FATALE: impossibile caricare il vero d3d9.dll, il proxy non funzionera'.");
+            vr::log::Line("FATAL ERROR: cannot load the real d3d9.dll, the proxy will not work.");
         }
         vr::updater::Start();  // anche con un eseguibile non supportato: una versione nuova potrebbe supportarlo
         g_supportedExe = CheckGameExecutable();
         if (!g_supportedExe) {
-            vr::log::Line("ERRORE: versione del gioco non supportata (serve l'eseguibile Steam di Spec Ops: The Line). "
-                          "La mod resta inattiva e il gioco funziona normalmente, senza VR.");
+            vr::log::Line("ERROR: unsupported game version (the Steam executable of Spec Ops: The Line is required). "
+                          "The mod stays inactive and the game runs normally, without VR.");
             return TRUE;
         }
         vr::display::InstallDesktopSizeSpoof();
@@ -70,20 +70,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 }
 
 IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
-    vr::log::Line("Direct3DCreate9 chiamato dal gioco (SDKVersion=" + std::to_string(SDKVersion) + ").");
+    vr::log::Line("Direct3DCreate9 called by the game (SDKVersion=" + std::to_string(SDKVersion) + ").");
     if (!vr::realdll::Direct3DCreate9_Real) {
-        vr::log::Line("ERRORE: funzione reale Direct3DCreate9 non disponibile.");
+        vr::log::Line("ERROR: real Direct3DCreate9 not available.");
         return nullptr;
     }
     if (g_supportedExe && vr::hooks::GpuShareRequested() && vr::realdll::Direct3DCreate9Ex_Real) {
         IDirect3D9Ex* ex = nullptr;
         if (SUCCEEDED(vr::realdll::Direct3DCreate9Ex_Real(SDKVersion, &ex)) && ex) {
-            vr::log::Line("GPUSHARE: oggetto D3D9 creato come D3D9Ex.");
+            vr::log::Line("GPUSHARE: D3D9 object created as D3D9Ex.");
             vr::hooks::g_d3d9ex = true;
             EnsureCreateDeviceHooked(ex);
             return ex;
         }
-        vr::log::Line("GPUSHARE: Direct3DCreate9Ex fallita, modalita' normale.");
+        vr::log::Line("GPUSHARE: Direct3DCreate9Ex failed, normal mode.");
     }
     IDirect3D9* real = vr::realdll::Direct3DCreate9_Real(SDKVersion);
     EnsureCreateDeviceHooked(real);
@@ -119,9 +119,9 @@ DWORD WINAPI D3DPERF_GetStatus(void) {
 }
 
 HRESULT WINAPI Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3D) {
-    vr::log::Line("Direct3DCreate9Ex chiamato dal gioco (SDKVersion=" + std::to_string(SDKVersion) + ").");
+    vr::log::Line("Direct3DCreate9Ex called by the game (SDKVersion=" + std::to_string(SDKVersion) + ").");
     if (!vr::realdll::Direct3DCreate9Ex_Real) {
-        vr::log::Line("ERRORE: funzione reale Direct3DCreate9Ex non disponibile.");
+        vr::log::Line("ERROR: real Direct3DCreate9Ex not available.");
         return E_NOTIMPL;
     }
     HRESULT hr = vr::realdll::Direct3DCreate9Ex_Real(SDKVersion, ppD3D);

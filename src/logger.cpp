@@ -72,13 +72,13 @@ std::string ExeInfo() {
 }
 
 void WriteHeader(const std::string& dir) {
-    g_file << "==== SpecOpsVR " << SPECOPSVR_VERSION << " (compilata " << __DATE__ << " " << __TIME__ << ") ====\n";
-    g_file << "Avvio: " << Timestamp(true) << "\n";
-    g_file << "Gioco: " << ExeInfo() << "\n";
+    g_file << "==== SpecOpsVR " << SPECOPSVR_VERSION << " (built " << __DATE__ << " " << __TIME__ << ") ====\n";
+    g_file << "Started: " << Timestamp(true) << "\n";
+    g_file << "Game: " << ExeInfo() << "\n";
     g_file << "Windows: " << WindowsVersion() << "\n";
     std::ifstream ini(dir + "\\specopsvr.ini");
     if (ini) {
-        g_file << "---- specopsvr.ini (righe attive) ----\n";
+        g_file << "---- specopsvr.ini (active lines) ----\n";
         std::string line;
         while (std::getline(ini, line)) {
             size_t a = line.find_first_not_of(" \t\r");
@@ -86,7 +86,7 @@ void WriteHeader(const std::string& dir) {
             g_file << "  " << line << "\n";
         }
     } else {
-        g_file << "specopsvr.ini assente: valori predefiniti\n";
+        g_file << "specopsvr.ini missing: defaults\n";
     }
     g_file << "----\n";
 }
@@ -104,7 +104,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
                            static_cast<LPCSTR>(addr), &mod))
         GetModuleFileNameA(mod, modName, MAX_PATH);
     char b[512];
-    std::snprintf(b, sizeof(b), "CRASH: eccezione 0x%08lX a %p (%s +0x%lX), thread %lu", code, addr, modName,
+    std::snprintf(b, sizeof(b), "CRASH: exception 0x%08lX at %p (%s +0x%lX), thread %lu", code, addr, modName,
                   static_cast<unsigned long>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod)),
                   GetCurrentThreadId());
     Line(b);
@@ -121,7 +121,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
             write(GetCurrentProcess(), GetCurrentProcessId(), f,
                   static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory), &mei,
                   nullptr, nullptr))
-            Line("CRASH: minidump scritto in " + dump);
+            Line("CRASH: minidump written to " + dump);
         CloseHandle(f);
     }
     return EXCEPTION_CONTINUE_SEARCH;

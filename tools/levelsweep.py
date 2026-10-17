@@ -42,7 +42,7 @@ MAPS = ['SP_Desert01_p', 'SP_Desert02_p', 'SP_Gorge01_P', 'SP_Gorge02_P', 'SP_Ci
         'SP_Road_P', 'SP_ShipsGraveyard_P', 'SP_StealingWater01_p', 'SP_StealingWater02_p', 'SP_Atrium01_P',
         'SP_Atrium02_P', 'SP_RadioMan02_P', 'SP_RadioMan03_P', 'SP_Bridge_p', 'SP_DollsHouse_P',
         'SP_BurjDubai_P', 'SP_Epilogue_p', 'SP_Credits_P']
-STATE_RE = re.compile(r'STATO (gameplay=\d cinema=\d cinematic=\d pawn=\S* viewtarget=\S* arma=\S*)')
+STATE_RE = re.compile(r'STATE (gameplay=\d cinema=\d cinematic=\d pawn=\S* viewtarget=\S* arma=\S*)')
 
 
 def backup_saves():
@@ -118,7 +118,7 @@ def sweep_map(name):
         if not running():
             rep['errori'].append('gioco chiuso durante il caricamento')
             break
-        if time.time() - t0 > 8 and re.search(r'Puntatore al Pawn catturato', log_since(pos)):
+        if time.time() - t0 > 8 and re.search(r'Pawn pointer captured', log_since(pos)):
             rep['caricata'] = True
             break
     rep['secondi_caricamento'] = round(time.time() - t0)
@@ -151,11 +151,11 @@ def sweep_map(name):
             rep['stati'].append('gioco: %s' % state_sample())
         shot('sw_%s_g1' % name)
     txt = log_since(pos)
-    rep['blocchi'] = [int(x) for x in re.findall(r'WATCHDOG: thread di rendering fermo da (\d+)s', txt)]
-    rep['fps'] = [float(x) for x in re.findall(r'PROFILO: tick [\d.]+ ms \(([\d.]+) fps', txt)]
-    rep['errori'] += sorted(set(re.findall(r'(ERRORE[^\n]*|eccezione[^\n]*)', txt)))[:10]
-    rep['cinema_eventi'] = len(re.findall(r'CINEMA: schermo virtuale \(', txt))
-    rep['armi'] = sorted(set(re.findall(r'ARMA: (\S+)', txt)))
+    rep['blocchi'] = [int(x) for x in re.findall(r'WATCHDOG: render thread stalled for (\d+)s', txt)]
+    rep['fps'] = [float(x) for x in re.findall(r'PROFILE: tick [\d.]+ ms \(([\d.]+) fps', txt)]
+    rep['errori'] += sorted(set(re.findall(r'(ERROR[^\n]*|exception[^\n]*)', txt)))[:10]
+    rep['cinema_eventi'] = len(re.findall(r'CINEMA: virtual screen \(', txt))
+    rep['armi'] = sorted(set(re.findall(r'WEAPON: (\S+)', txt)))
     if not running():
         rep['errori'].append('gioco chiuso')
     from PIL import Image

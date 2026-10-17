@@ -115,7 +115,7 @@ std::string Hex(unsigned long v) {
 }
 
 void Disable(const std::string& why) {
-    vr::log::Line("VR-OUTPUT disattivato: " + why);
+    vr::log::Line("VR-OUTPUT disabled: " + why);
     g_disabled = true;
 }
 
@@ -161,8 +161,8 @@ bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
     g_boundsForFov = vr::control::g_fovOverride;
     char buf[400];
     std::snprintf(buf, sizeof(buf),
-        "VR-FOV: tangenti L(%.3f %.3f %.3f %.3f) R(%.3f %.3f %.3f %.3f) aspect=%.3f -> FOV gioco %.1f gradi; "
-        "ritaglio L x[%ld..%ld] R x[%ld..%ld] y[%ld..%ld] = %ux%u per occhio (back buffer %ux%u)",
+        "VR-FOV: tangents L(%.3f %.3f %.3f %.3f) R(%.3f %.3f %.3f %.3f) aspect=%.3f -> game FOV %.1f degrees; "
+        "crop L x[%ld..%ld] R x[%ld..%ld] y[%ld..%ld] = %ux%u per eye (back buffer %ux%u)",
         l[0], r[0], t[0], b[0], l[1], r[1], t[1], b[1], aspect, used,
         g_eyeCrop[0].left, g_eyeCrop[0].right, g_eyeCrop[1].left, g_eyeCrop[1].right,
         g_eyeCrop[0].top, g_eyeCrop[0].bottom, g_cropW, g_cropH, bbW, bbH);
@@ -193,8 +193,8 @@ bool InitD3D11() {
                                    &g_d3d11, &level, &g_d3d11Ctx);
     adapter->Release();
     factory->Release();
-    vr::log::Line(std::string("VR-OUTPUT: device D3D11 sulla scheda del visore (indice ") +
-                  std::to_string(adapterIndex) + ", " + name + ") " + (SUCCEEDED(hr) ? "creato" : "FALLITO " + Hex(hr)));
+    vr::log::Line(std::string("VR-OUTPUT: D3D11 device on the headset GPU (index ") +
+                  std::to_string(adapterIndex) + ", " + name + ") " + (SUCCEEDED(hr) ? "created" : "FAILED " + Hex(hr)));
     return SUCCEEDED(hr);
 }
 
@@ -300,7 +300,7 @@ void ShowCinemaOverlay() {
     if (g_cinemaOverlay == vr::k_ulOverlayHandleInvalid) {
         vr::EVROverlayError err = ov->CreateOverlay("specopsvr.cinema", "SpecOpsVR schermo", &g_cinemaOverlay);
         if (err != vr::VROverlayError_None) {
-            vr::log::Line("CINEMA: CreateOverlay fallita, errore " + std::to_string(err));
+            vr::log::Line("CINEMA: CreateOverlay failed, error " + std::to_string(err));
             g_cinemaOverlay = vr::k_ulOverlayHandleInvalid;
             return;
         }
@@ -323,7 +323,7 @@ void ShowCinemaOverlay() {
     ov->SetOverlayWidthInMeters(g_cinemaOverlay, vr::control::g_cinemaWidthM);
     ov->ShowOverlay(g_cinemaOverlay);
     g_cinemaShown = true;
-    vr::log::Line("CINEMA: schermo virtuale mostrato.");
+    vr::log::Line("CINEMA: virtual screen shown.");
 }
 
 // Righe con contenuto (senza le bande nere sopra e sotto): campiona 16 pixel
@@ -353,7 +353,7 @@ void HideCinemaOverlay() {
     if (!g_cinemaShown) return;
     if (vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->HideOverlay(g_cinemaOverlay);
     g_cinemaShown = false;
-    vr::log::Line("CINEMA: schermo virtuale nascosto.");
+    vr::log::Line("CINEMA: virtual screen hidden.");
 }
 
 bool EnsureResources(IDirect3DDevice9* device, UINT w, UINT h) {
@@ -416,14 +416,14 @@ bool EnsureResources(IDirect3DDevice9* device, UINT w, UINT h) {
             }
         }
         g_gpuReady = ok;
-        vr::log::Line(ok ? "VR-OUTPUT: superfici condivise D3D9Ex -> D3D11 pronte (copia GPU)."
-                         : "VR-OUTPUT: superfici condivise non disponibili, lettura via CPU.");
+        vr::log::Line(ok ? "VR-OUTPUT: D3D9Ex -> D3D11 shared surfaces ready (GPU copy)."
+                         : "VR-OUTPUT: shared surfaces not available, CPU readback.");
     }
     g_width = w;
     g_height = h;
     StartWorker();
-    vr::log::Line("VR-OUTPUT: risorse per occhio " + std::to_string(w) + "x" + std::to_string(h) +
-                  " pronte (thread di uscita dedicato).");
+    vr::log::Line("VR-OUTPUT: per-eye resources " + std::to_string(w) + "x" + std::to_string(h) +
+                  " ready (dedicated output thread).");
     return true;
 }
 
@@ -443,7 +443,7 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
         void* srvPtr = nullptr;
         vr::EVRCompositorError err = compositor->GetMirrorTextureD3D11(static_cast<vr::EVREye>(e), g_d3d11, &srvPtr);
         if (err != vr::VRCompositorError_None || !srvPtr) {
-            vr::log::Line("MIRRORSHOT: GetMirrorTextureD3D11 fallita, errore " + std::to_string(err));
+            vr::log::Line("MIRRORSHOT: GetMirrorTextureD3D11 failed, error " + std::to_string(err));
             for (auto* t : staging) if (t) t->Release();
             return;
         }
@@ -469,8 +469,8 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
         res->Release();
         compositor->ReleaseMirrorTextureD3D11(srvPtr);
         if (!staging[e]) return;
-        vr::log::Line("MIRRORSHOT: occhio " + std::to_string(e) + " " + std::to_string(td.Width) + "x" +
-                      std::to_string(td.Height) + " formato " + std::to_string(td.Format));
+        vr::log::Line("MIRRORSHOT: eye " + std::to_string(e) + " " + std::to_string(td.Width) + "x" +
+                      std::to_string(td.Height) + " format " + std::to_string(td.Format));
     }
     UINT ow = w / 2, oh = h / 2;
     std::vector<uint8_t> rgb(static_cast<size_t>(ow) * 2 * oh * 3);
@@ -515,7 +515,7 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
         if (!pad.empty()) fwrite(pad.data(), 1, pad.size(), f);
     }
     fclose(f);
-    vr::log::Line("MIRRORSHOT salvato: " + path);
+    vr::log::Line("MIRRORSHOT saved: " + path);
 }
 
 // Thread di uscita: aspetta una coppia di occhi pronta, attende il ritmo del
@@ -523,7 +523,7 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
 // invia. Anche le chiamate al compositor non legate al frame (finestra
 // specchio, cattura) stanno qui, cosi' il contesto D3D11 ha un solo thread.
 void WorkerLoop() {
-    vr::log::Line("VR-OUTPUT: thread di uscita avviato.");
+    vr::log::Line("VR-OUTPUT: output thread started.");
     int submits = 0;
     double windowStart = QpcMs();
     double copyMs = 0.0, waitMs = 0.0, submitMs = 0.0;
@@ -632,8 +632,8 @@ void WorkerLoop() {
             double n = submits == 1 ? 1.0 : 300.0;
             char b[300];
             std::snprintf(b, sizeof(b),
-                          "VR-OUTPUT: invio %d submit L=%d R=%d [D3D11, thread dedicato] %.1f invii/s; per invio ms: "
-                          "copia=%.2f attesa visore=%.2f Submit=%.2f",
+                          "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
+                          "copy=%.2f headset wait=%.2f Submit=%.2f",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
                           copyMs / n, waitMs / n, submitMs / n);
             vr::log::Line(b);
@@ -641,7 +641,7 @@ void WorkerLoop() {
             copyMs = waitMs = submitMs = 0.0;
         }
     }
-    vr::log::Line("VR-OUTPUT: thread di uscita terminato.");
+    vr::log::Line("VR-OUTPUT: output thread stopped.");
 }
 
 void StartWorker() {
@@ -682,8 +682,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         static int lastLevel = -99;
         if (level != lastLevel) {
             lastLevel = level;
-            vr::log::Line("VR-OUTPUT: stato del visore " + std::to_string(level) +
-                          (active ? " (attivo: invio al visore)" : " (inattivo/standby: solo monitor)"));
+            vr::log::Line("VR-OUTPUT: headset state " + std::to_string(level) +
+                          (active ? " (active: sending to the headset)" : " (idle/standby: monitor only)"));
         }
         // In Scene si invia sempre (lo stato del visore con Link non e' affidabile);
         // solo prima del primo passaggio a Scene conta lo stato.
@@ -816,7 +816,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             // Percorso GPU: ritaglio direttamente nella texture condivisa.
             if (FAILED(device->StretchRect(backBuffer, &src, g_shSurf9[e][s], &dst,
                                            scale < 0.999f ? D3DTEXF_LINEAR : D3DTEXF_NONE))) {
-                if (frame % 300 == 1) vr::log::Line("VR-OUTPUT: StretchRect nella superficie condivisa fallita.");
+                if (frame % 300 == 1) vr::log::Line("VR-OUTPUT: StretchRect into the shared surface failed.");
                 continue;
             }
             g_shQuery[e][s]->Issue(D3DISSUE_END);
@@ -831,7 +831,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         if (FAILED(device->StretchRect(backBuffer, &src, g_sharedSurface, &dst,
                                        cinema || scale < 0.999f ? D3DTEXF_LINEAR : D3DTEXF_NONE)) ||
             FAILED(device->GetRenderTargetData(g_sharedSurface, g_sysmem[e][s]))) {
-            if (frame % 300 == 1) vr::log::Line("VR-OUTPUT: StretchRect/GetRenderTargetData fallita.");
+            if (frame % 300 == 1) vr::log::Line("VR-OUTPUT: StretchRect/GetRenderTargetData failed.");
             continue;
         }
         g_slotState[e][s] = kGpu;

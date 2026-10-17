@@ -327,7 +327,7 @@ def gameplay_state():
         with open(LOG, encoding="utf-8", errors="replace") as f:
             f.seek(size)
             for line in f:
-                if "STATO gameplay=" in line:
+                if "STATE gameplay=" in line:
                     return line.strip().endswith("=1")
     return None
 
@@ -335,7 +335,7 @@ def gameplay_state():
 def play(args):
     """Avvia il gioco (se serve) e arriva in gameplay: titolo -> menu ->
     Campagna -> Continua partita, poi la cinematica iniziale. Lo stato e'
-    chiesto alla dll (dumpcam -> riga "STATO gameplay=1" quando il giocatore
+    chiesto alla dll (dumpcam -> riga "STATE gameplay=1" quando il giocatore
     controlla Walker). Preme ENTER solo nei menu (prima del caricamento)."""
     if not game_pid():
         launch(args or ["-nostartupmovies", "-windowed", "ResX=2400", "ResY=2500"])

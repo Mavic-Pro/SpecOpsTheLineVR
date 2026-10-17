@@ -49,7 +49,7 @@ bool Load() {
         real = LoadLibraryA(path.c_str());
     }
     if (!real) {
-        vr::log::Line("ERRORE: impossibile caricare il vero d3d9.dll da " + path);
+        vr::log::Line("ERROR: cannot load the real d3d9.dll from " + path);
         return false;
     }
 
@@ -59,7 +59,7 @@ bool Load() {
         GetProcAddress(real, "Direct3DCreate9Ex"));
 
     if (!Direct3DCreate9_Real) {
-        vr::log::Line("ERRORE: Direct3DCreate9 non trovato nel d3d9.dll reale");
+        vr::log::Line("ERROR: Direct3DCreate9 not found in the real d3d9.dll");
         return false;
     }
 
@@ -78,7 +78,7 @@ bool Load() {
     D3DPERF_GetStatus_Real = reinterpret_cast<D3DPERF_GetStatus_t>(
         GetProcAddress(real, "D3DPERF_GetStatus"));
 
-    vr::log::Line("d3d9.dll reale caricato correttamente da " + path);
+    vr::log::Line("real d3d9.dll loaded from " + path);
     return true;
 }
 

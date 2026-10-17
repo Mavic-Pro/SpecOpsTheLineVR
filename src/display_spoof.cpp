@@ -64,7 +64,7 @@ bool Patch(uintptr_t slot, const char* name, void* replacement, void** outOrigin
     void* expected = user32 ? reinterpret_cast<void*>(GetProcAddress(user32, name)) : nullptr;
     void** entry = reinterpret_cast<void**>(slot);
     if (!expected || *entry != expected) {
-        vr::log::Line(std::string("DISPLAY: voce IAT ") + name + " inattesa, non tocco nulla.");
+        vr::log::Line(std::string("DISPLAY: IAT entry ") + name + " unexpected, leaving it alone.");
         return false;
     }
     DWORD old;
@@ -85,7 +85,7 @@ void LogResize(const char* api, int x, int y, int cx, int cy, UINT flags, void* 
     static int budget = 40;
     if (budget-- <= 0) return;
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "DISPLAY: %s pos=(%d,%d) size=%dx%d flags=0x%X chiamante=0x%p",
+    std::snprintf(buf, sizeof(buf), "DISPLAY: %s pos=(%d,%d) size=%dx%d flags=0x%X caller=0x%p",
                   api, x, y, cx, cy, flags, caller);
     vr::log::Line(buf);
 }
@@ -155,7 +155,7 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         static int budget = 20;
         if (budget-- > 0) {
             vr::log::Line("DISPLAY: WM_SIZE " + std::to_string(LOWORD(lp)) + "x" + std::to_string(HIWORD(lp)) +
-                          " tipo=" + std::to_string(wp));
+                          " type=" + std::to_string(wp));
         }
     }
     if (msg == WM_GETMINMAXINFO) {
@@ -174,8 +174,8 @@ void UnclampWindow(HWND window, int clientWidth, int clientHeight) {
     if (!window || g_originalWndProc) return;
     g_originalWndProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&UnclampedWndProc)));
-    vr::log::Line(std::string("DISPLAY: limite di dimensione della finestra rimosso") +
-                  (g_originalWndProc ? "." : " (FALLITO)."));
+    vr::log::Line(std::string("DISPLAY: window size limit removed") +
+                  (g_originalWndProc ? "." : " (FAILED)."));
     if (!g_originalWndProc || clientWidth <= 0 || clientHeight <= 0) return;
     g_gameWindow = window;
     g_wantedWidth = clientWidth;
@@ -189,8 +189,8 @@ void UnclampWindow(HWND window, int clientWidth, int clientHeight) {
                        static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)));
     g_SetWindowPos_Real(window, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    vr::log::Line("DISPLAY: finestra riportata a client " + std::to_string(clientWidth) + "x" +
-                  std::to_string(clientHeight) + " (era " + std::to_string(client.right - client.left) + "x" +
+    vr::log::Line("DISPLAY: window reported as client " + std::to_string(clientWidth) + "x" +
+                  std::to_string(clientHeight) + " (was " + std::to_string(client.right - client.left) + "x" +
                   std::to_string(client.bottom - client.top) + ").");
 }
 
@@ -207,8 +207,8 @@ void InstallDesktopSizeSpoof() {
           reinterpret_cast<void**>(&g_SetWindowPos_Real));
     Patch(kIatMoveWindow, "MoveWindow", reinterpret_cast<void*>(&Hooked_MoveWindow),
           reinterpret_cast<void**>(&g_MoveWindow_Real));
-    vr::log::Line(std::string("DISPLAY: desktop riportato al gioco >= ") + std::to_string(kMinWidth) + "x" +
-                  std::to_string(kMinHeight) + (a && b ? " (attivo)" : " (NON attivo)"));
+    vr::log::Line(std::string("DISPLAY: desktop reported to the game >= ") + std::to_string(kMinWidth) + "x" +
+                  std::to_string(kMinHeight) + (a && b ? " (active)" : " (NOT active)"));
 }
 
 }  // namespace vr::display

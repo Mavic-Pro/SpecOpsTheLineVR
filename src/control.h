@@ -130,6 +130,8 @@ extern std::atomic<bool> g_arms;
 extern std::atomic<bool> g_muzzleAim;
 // Aiuto alla mira del pad (friction, aim snap-on) spento mirando col controller.
 extern std::atomic<bool> g_noAimAssist;
+// Dispersione dei colpi del gioco (off = i colpi vanno esattamente dove punta la canna).
+extern std::atomic<bool> g_spread;
 // Diagnostica: riga COLPO per ogni colpo del giocatore.
 extern std::atomic<bool> g_fireLog;
 // Aggiornamento automatico (updater.cpp): "autoupdate on|off", "updaterepo proprietario/nome".

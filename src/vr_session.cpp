@@ -24,7 +24,7 @@ bool InitAs(vr::EVRApplicationType type) {
     vr::EVRInitError err = vr::VRInitError_None;
     vr::VR_Init(&err, type);
     if (err != vr::VRInitError_None) {
-        vr::log::Line(std::string("OpenVR ") + TypeName(type) + " non disponibile (" +
+        vr::log::Line(std::string("OpenVR ") + TypeName(type) + " not available (" +
                       vr::VR_GetVRInitErrorAsEnglishDescription(err) + ").");
         g_ready = false;
         g_scene = false;
@@ -32,13 +32,13 @@ bool InitAs(vr::EVRApplicationType type) {
     }
     g_ready = true;
     g_scene = (type == vr::VRApplication_Scene);
-    vr::log::Line(std::string("OpenVR inizializzato come ") + TypeName(type) + ".");
+    vr::log::Line(std::string("OpenVR initialised as ") + TypeName(type) + ".");
     return true;
 }
 
 void Switch(vr::EVRApplicationType type) {
     AcquireSRWLockExclusive(&g_lock);
-    vr::log::Line(std::string("OpenVR: passaggio a ") + TypeName(type) + "...");
+    vr::log::Line(std::string("OpenVR: switching to ") + TypeName(type) + "...");
     if (g_ready) vr::VR_Shutdown();
     g_ready = false;
     if (!InitAs(type) && type == vr::VRApplication_Scene) InitAs(vr::VRApplication_Background);
@@ -82,8 +82,8 @@ void MonitorLoop() {
             static int lastLevel = -99;
             if (level != lastLevel) {
                 lastLevel = level;
-                vr::log::Line("OpenVR: stato del visore " + std::to_string(level) +
-                              (active ? " (indossato)" : " (non indossato / standby)"));
+                vr::log::Line("OpenVR: headset state " + std::to_string(level) +
+                              (active ? " (worn)" : " (not worn / standby)"));
             }
         }
         // Una volta in Scene si resta in Scene: con Quest Link lo stato del
@@ -97,7 +97,7 @@ void MonitorLoop() {
         } else if (g_scene) {
             if (!inactiveSince) inactiveSince = now;
             if (now - inactiveSince > 20000) {
-                vr::log::Line("OpenVR: visore inattivo da 20 s.");
+                vr::log::Line("OpenVR: headset idle for 20 s.");
                 Switch(vr::VRApplication_Background);
                 inactiveSince = 0;
             }

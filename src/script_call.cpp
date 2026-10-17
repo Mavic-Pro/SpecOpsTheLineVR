@@ -137,6 +137,20 @@ void* FindInstance(const std::string& spec) {
     return nullptr;
 }
 
+// Oggetto UClass con quel nome.
+void* FindClassObject(const std::string& name) {
+    uint32_t data = 0, num = 0;
+    SafeRead(reinterpret_cast<void*>(kGObjects), &data, 4);
+    SafeRead(reinterpret_cast<void*>(kGObjects + 4), &num, 4);
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0;
+        if (!SafeRead(reinterpret_cast<void*>(data + 4 * i), &o, 4) || !o) continue;
+        void* obj = reinterpret_cast<void*>(o);
+        if (_stricmp(ObjectName(obj).c_str(), name.c_str()) == 0 && ClassName(obj) == "Class") return obj;
+    }
+    return nullptr;
+}
+
 std::string FullName(void* obj) {
     std::string s;
     for (int i = 0; obj && i < 8; ++i) {
@@ -152,6 +166,8 @@ void* ResolveObject(void* pc, void* pawn, const std::string& tok) {
     if (tok == "pawn") return pawn;
     if (tok == "cheat") return pc ? reinterpret_cast<void*>(Field(pc, kOffPcCheatManager)) : nullptr;
     if (tok == "world") return pc ? reinterpret_cast<void*>(Field(pc, kOffActorWorldInfo)) : nullptr;
+    if (tok == "arsenal") return pawn ? reinterpret_cast<void*>(Field(pawn, kOffPawnArsenal)) : nullptr;
+    if (tok == "weapon") return pawn ? reinterpret_cast<void*>(Field(pawn, 0x1594)) : nullptr;  // YGamePawn.m_currentWeapon
     if (tok.rfind("0x", 0) == 0) return reinterpret_cast<void*>(strtoul(tok.c_str(), nullptr, 16));
     return FindInstance(tok);
 }
@@ -185,7 +201,7 @@ std::vector<std::string> SplitArgs(const std::string& line) {
 void EnableCheats(void* pc) {
     if (!pc) return;
     if (Field(pc, kOffPcCheatManager)) {
-        vr::log::Line("CHEATS: gia' attivi.");
+        vr::log::Line("CHEATS: already on.");
         return;
     }
     void* allow = FindFunction("YGameInfo", "AllowCheats");
@@ -193,14 +209,14 @@ void EnableCheats(void* pc) {
     uint8_t* code = allow ? reinterpret_cast<uint8_t*>(Field(allow, 0x54)) : nullptr;  // UStruct::Script
     uint8_t head[2] = {};
     if (!code || !add || !SafeRead(code, head, 2) || head[0] != 0x04 || head[1] != 0x28) {
-        vr::log::Line("CHEATS: AllowCheats non riconosciuta, niente da fare.");
+        vr::log::Line("CHEATS: AllowCheats not recognised, nothing done.");
         return;
     }
     code[1] = 0x27;
     uint8_t parms[16] = {};
     CallProcessEvent(pc, add, parms);
     code[1] = 0x28;
-    vr::log::Line(std::string("CHEATS: ") + (Field(pc, kOffPcCheatManager) ? "CheatManager creato." : "non creato."));
+    vr::log::Line(std::string("CHEATS: ") + (Field(pc, kOffPcCheatManager) ? "CheatManager created." : "not created."));
 }
 
 // "ucall <oggetto> <Funzione> [argomenti]": chiama una funzione UnrealScript.
@@ -215,12 +231,12 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
     if (tok.size() < 2) return;
     void* obj = ResolveObject(pc, pawn, tok[0]);
     if (!obj) {
-        vr::log::Line("UCALL: oggetto " + tok[0] + " non trovato.");
+        vr::log::Line("UCALL: object " + tok[0] + " not found.");
         return;
     }
     void* func = FindMethod(obj, tok[1]);
     if (!func) {
-        vr::log::Line("UCALL: " + ClassName(obj) + "." + tok[1] + " non trovata.");
+        vr::log::Line("UCALL: " + ClassName(obj) + "." + tok[1] + " not found.");
         return;
     }
     static uint8_t parms[1024];
@@ -268,17 +284,20 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
         } else if (type == "NameProperty") {
             int32_t nm[2] = {FindNameIndex(a), 0};
             std::memcpy(dst, nm, 8);
-        } else if (type == "ObjectProperty" || type == "ClassProperty") {
+        } else if (type == "ClassProperty") {
+            void* o = FindClassObject(a);
+            std::memcpy(dst, &o, 4);
+        } else if (type == "ObjectProperty") {
             void* o = ResolveObject(pc, pawn, a);
             std::memcpy(dst, &o, 4);
         } else {
-            vr::log::Line("UCALL: parametro di tipo " + type + " non gestito.");
+            vr::log::Line("UCALL: parameter type " + type + " not supported.");
             return;
         }
     }
     vr::log::Line("UCALL: " + FullName(obj) + " -> " + ClassName(obj) + "." + tok[1]);
     if (!CallProcessEvent(obj, func, parms)) {
-        vr::log::Line("UCALL: eccezione in ProcessEvent");
+        vr::log::Line("UCALL: exception in ProcessEvent");
         return;
     }
     // Parametri di uscita (out) e strutture: stampati come float.
@@ -295,7 +314,7 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
         vr::log::Line(buf);
     }
     if (!retProp) {
-        vr::log::Line("UCALL: fatto");
+        vr::log::Line("UCALL: done");
         return;
     }
     uint32_t off = Field(retProp, kOffPropOffset);
@@ -320,14 +339,14 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
     } else {
         ret = std::to_string(static_cast<int32_t>(v));
     }
-    vr::log::Line("UCALL: ritorno " + ret);
+    vr::log::Line("UCALL: returned " + ret);
 }
 
 void RunConsole(void* pc, const std::string& cmd) {
     static void* func = nullptr;
     if (!func) func = FindFunction("PlayerController", "ConsoleCommand");
     if (!pc || !func) {
-        vr::log::Line("CONSOLE: PlayerController o funzione non trovati.");
+        vr::log::Line("CONSOLE: PlayerController or function not found.");
         return;
     }
     // Parametri: FString Command +0, bool bWriteToLog +0xC, FString ritorno +0x10.
@@ -344,7 +363,7 @@ void RunConsole(void* pc, const std::string& cmd) {
     } parms = {text, n + 1, n + 1, 1, nullptr, 0, 0};
     vr::log::Line("CONSOLE: " + cmd);
     bool ok = CallProcessEvent(pc, func, &parms);
-    if (!ok) vr::log::Line("CONSOLE: eccezione in ProcessEvent");
+    if (!ok) vr::log::Line("CONSOLE: exception in ProcessEvent");
 }
 
 }  // namespace
@@ -416,14 +435,14 @@ void Tick(void* pc, void* pawn) {
     // Le classi "_Scnd" (modalita' secondaria di un'arma) e "_AI" non sono armi
     // da dare al giocatore: GiveWeapon con YWeapon_SCAR_Scnd va in eccezione.
     if (cls.find("_Scnd") != std::string::npos || cls.find("_AI") != std::string::npos) {
-        vr::log::Line("GIVEWEAPON " + cls + ": classe non adatta (modalita' secondaria / IA), ignorata.");
+        vr::log::Line("GIVEWEAPON " + cls + ": unsuitable class (secondary mode / AI), ignored.");
         return;
     }
     void* arsenal = pawn ? reinterpret_cast<void*>(Field(pawn, kOffPawnArsenal)) : nullptr;
     static void* func = nullptr;
     if (!func) func = FindFunction("YArsenalManager", "GiveWeapon");
     if (!arsenal || !func) {
-        vr::log::Line("GIVEWEAPON: arsenale o funzione non trovati.");
+        vr::log::Line("GIVEWEAPON: arsenal or function not found.");
         return;
     }
     // Parametri di YArsenalManager.GiveWeapon(string WeaponClassStr):
@@ -438,8 +457,8 @@ void Tick(void* pc, void* pawn) {
         void* ret;
     } parms = {text, n + 1, n + 1, nullptr};
     bool ok = CallProcessEvent(arsenal, func, &parms);
-    vr::log::Line("GIVEWEAPON " + cls + ": " + (ok ? (parms.ret ? "arma data (" + ClassName(parms.ret) + ")" : "nessuna arma")
-                                                  : "eccezione in ProcessEvent"));
+    vr::log::Line("GIVEWEAPON " + cls + ": " + (ok ? (parms.ret ? "weapon given (" + ClassName(parms.ret) + ")" : "no weapon")
+                                                  : "exception in ProcessEvent"));
 }
 
 }  // namespace vr::script

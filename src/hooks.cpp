@@ -102,14 +102,14 @@ void EndFrameVsConstAnalysis() {
             if (changed) {
                 if (g_logBudgetRemaining.fetch_sub(1) > 0) {
                     vr::log::Line(
-                        "CANDIDATO CAMERA reg=c" + std::to_string(reg) +
-                        " chiamate_frame=" + std::to_string(t.callsThisFrame) +
-                        " valore=" + FormatMatrix16(t.frameValue));
+                        "CAMERA CANDIDATE reg=c" + std::to_string(reg) +
+                        " calls_per_frame=" + std::to_string(t.callsThisFrame) +
+                        " value=" + FormatMatrix16(t.frameValue));
                     std::memcpy(t.lastLoggedValue, t.frameValue, sizeof(float) * 16);
                     t.everLogged = true;
                 } else if (!g_budgetExhaustedLogged.exchange(true)) {
-                    vr::log::Line("Budget di log candidati esaurito (" + std::to_string(kLogBudget) +
-                                  "): fermo la stampa per non intasare il file, la cattura dati continua in silenzio.");
+                    vr::log::Line("Candidate log budget exhausted (" + std::to_string(kLogBudget) +
+                                  "): no more lines to keep the file small, data capture continues silently.");
                 }
             }
         }
@@ -158,8 +158,8 @@ void AnalyzeProjectionSignature(UINT StartRegister, const float* data) {
     if (MatchesExactProjection(data)) {
         if (g_projLogBudgetRemaining.fetch_sub(1) > 0) {
             vr::log::Line(
-                "CANDIDATO PROIEZIONE (firma esatta) reg=c" + std::to_string(StartRegister) +
-                " valore=" + FormatMatrix16(data));
+                "PROJECTION CANDIDATE (exact signature) reg=c" + std::to_string(StartRegister) +
+                " value=" + FormatMatrix16(data));
         }
         g_projSignatureLogged[StartRegister] = true;
     }
@@ -204,7 +204,7 @@ HRESULT WINAPI Hooked_Reset(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* param
     vr::output::OnBeforeReset();
     if (params) params->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     HRESULT hr = g_Reset_Original(self, params);
-    vr::log::Line("Reset del device, hr=" + std::to_string(hr));
+    vr::log::Line("Device reset, hr=" + std::to_string(hr));
     return hr;
 }
 
@@ -262,7 +262,7 @@ DWORD WINAPI WatchdogThread(LPVOID) {
         CloseHandle(th);
         if (!got) continue;
         ++reports;
-        std::string line = "WATCHDOG: thread di rendering fermo da " + std::to_string((now - (lastPresent ? lastPresent : lastBegin)) / 1000) +
+        std::string line = "WATCHDOG: render thread stalled for " + std::to_string((now - (lastPresent ? lastPresent : lastBegin)) / 1000) +
                            "s, EIP=" + DescribeAddress(ctx.Eip) + " stack:";
         int found = 0;
         for (int i = 0; i < 512 && found < 16; ++i) {
@@ -319,7 +319,7 @@ void ApplyPostFxSettings() {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            vr::log::Line("POSTFX: GSystemSettings non riconosciuto, non tocco nulla.");
+            vr::log::Line("POSTFX: GSystemSettings not recognised, leaving it alone.");
         }
         return;
     }
@@ -329,16 +329,16 @@ void ApplyPostFxSettings() {
     if (*motionBlur != value || *depthOfField != value) {
         *motionBlur = value;
         *depthOfField = value;
-        vr::log::Line(std::string("POSTFX: motion blur e profondita' di campo ") + (value ? "attivi" : "disattivati"));
+        vr::log::Line(std::string("POSTFX: motion blur and depth of field ") + (value ? "on" : "off"));
     }
 }
 
 HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
     uint64_t count = ++g_frameCount;
     if (count == 1) {
-        vr::log::Line("Primo EndScene intercettato: pipeline di hook attiva.");
+        vr::log::Line("First EndScene intercepted: hook pipeline active.");
     } else if (count % 300 == 0) {
-        vr::log::Line("EndScene: " + std::to_string(count) + " frame renderizzati finora.");
+        vr::log::Line("EndScene: " + std::to_string(count) + " frames rendered so far.");
     }
     EndFrameVsConstAnalysis();
     vr::control::Poll();
@@ -975,12 +975,12 @@ LONG WINAPI PageWatchHandler(PEXCEPTION_POINTERS info) {
                 if (g_watchHitBudget.fetch_sub(1) > 0) {
                     char buf[256];
                     std::snprintf(buf, sizeof(buf),
-                        "PAGE-WATCH scrittura su 0x%p  EIP=0x%08X EAX=0x%08X EBX=0x%08X ECX=0x%08X "
+                        "PAGE-WATCH write to 0x%p  EIP=0x%08X EAX=0x%08X EBX=0x%08X ECX=0x%08X "
                         "EDX=0x%08X ESI=0x%08X EDI=0x%08X",
                         faultAddr, ctx->Eip, ctx->Eax, ctx->Ebx, ctx->Ecx, ctx->Edx, ctx->Esi, ctx->Edi);
                     vr::log::Line(buf);
                 } else if (g_watchArmed.exchange(false)) {
-                    vr::log::Line("PAGE-WATCH: budget esaurito, disattivo la protezione.");
+                    vr::log::Line("PAGE-WATCH: budget exhausted, protection removed.");
                     DWORD old;
                     VirtualProtect(g_watchPageBase, kPageSize, PAGE_READWRITE, &old);
                     return EXCEPTION_CONTINUE_EXECUTION;
@@ -1022,10 +1022,10 @@ void ArmPageWatch(void* targetAddr, size_t exactRangeBytes = 4) {
     DWORD old;
     if (VirtualProtect(g_watchPageBase, kPageSize, PAGE_READONLY, &old)) {
         g_watchArmed = true;
-        vr::log::Line("PAGE-WATCH armato sulla pagina 0x" +
+        vr::log::Line("PAGE-WATCH armed on page 0x" +
             [](void* p){ char b[32]; std::snprintf(b, sizeof(b), "%p", p); return std::string(b); }(g_watchPageBase));
     } else {
-        vr::log::Line("ERRORE: VirtualProtect fallita per PAGE-WATCH.");
+        vr::log::Line("ERROR: VirtualProtect failed for PAGE-WATCH.");
     }
 }
 
@@ -1051,7 +1051,7 @@ public:
             g_pawnPtr = self;
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%p", self);
-            vr::log::Line(std::string("Puntatore al Pawn catturato: 0x") + buf);
+            vr::log::Line(std::string("Pawn pointer captured: 0x") + buf);
             // PAGE-WATCH disattivato: la sua logica di single-step/re-arm
             // non e' thread-safe e con un motore a 90+ thread come questo
             // ha causato un crash/blocco durante il caricamento. Non
@@ -1082,7 +1082,7 @@ public:
             g_playerControllerPtr = self;
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%p", self);
-            vr::log::Line(std::string("Puntatore al PlayerController catturato: 0x") + buf);
+            vr::log::Line(std::string("PlayerController pointer captured: 0x") + buf);
         }
         g_ExecGetViewTarget_Original(self, stack, result);
     }
@@ -1108,7 +1108,7 @@ bool InitOpenVR() {
         std::string flag(path);
         flag = flag.substr(0, flag.find_last_of("\\/")) + "\\specopsvr_novr";
         if (GetFileAttributesA(flag.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            vr::log::Line("OpenVR NON inizializzato (file specopsvr_novr presente).");
+            vr::log::Line("OpenVR NOT initialised (specopsvr_novr file present).");
             return false;
         }
     }
@@ -1234,14 +1234,14 @@ bool SetThreadHwbp(DWORD tid, uintptr_t yawAddr, uintptr_t pitchAddr, bool arm) 
 }
 
 void LogWriterSites(const char* phase) {
-    vr::log::Line(std::string("HWBP risultati (") + phase + "), hit totali=" +
+    vr::log::Line(std::string("HWBP results (") + phase + "), total hits=" +
                   std::to_string(g_hwbpTotalHits.load()));
     for (int i = 0; i < kMaxWriterSites; ++i) {
         WriterSite& s = g_writerSites[i];
         if (s.eip == 0) break;
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-            "HWBP scrittore #%d EIP(dopo)=0x%08X hits=%u reg=%s%s tid=%u ECX=0x%08X ESI=0x%08X EDI=0x%08X EBP=0x%08X [esp]=0x%08X",
+            "HWBP writer #%d EIP(after)=0x%08X hits=%u reg=%s%s tid=%u ECX=0x%08X ESI=0x%08X EDI=0x%08X EBP=0x%08X [esp]=0x%08X",
             i, s.eip.load(), s.hits.load(),
             (s.regMask & 1) ? "yaw " : "", (s.regMask & 2) ? "pitch" : "",
             s.threadId, s.ecx, s.esi, s.edi, s.ebp, s.esp0);
@@ -1259,9 +1259,9 @@ DWORD WINAPI CameraWriteBpThread(LPVOID param) {
     // cheat table). Raggio d'azione minimo.
     DWORD gameTid = g_gameThreadId;
     bool armed = gameTid && SetThreadHwbp(gameTid, yawAddr, pitchAddr, true);
-    vr::log::Line("HWBP fase 1: thread di gioco tid=" + std::to_string(gameTid) +
-                  (armed ? " armato" : " NON armato") + ", attendo " +
-                  std::to_string(kHwbpPhaseMs / 1000) + "s (muovi mouse e cammina!).");
+    vr::log::Line("HWBP phase 1: game thread tid=" + std::to_string(gameTid) +
+                  (armed ? " armed" : " NOT armed") + ", waiting " +
+                  std::to_string(kHwbpPhaseMs / 1000) + "s (move the mouse and walk!).");
     Sleep(kHwbpPhaseMs);
     if (armed) SetThreadHwbp(gameTid, 0, 0, false);
     LogWriterSites("fase 1, thread di gioco");
@@ -1282,8 +1282,8 @@ DWORD WINAPI CameraWriteBpThread(LPVOID param) {
     }
     int armedCount = 0;
     for (int i = 0; i < count; ++i) armedCount += SetThreadHwbp(tids[i], yawAddr, pitchAddr, true);
-    vr::log::Line("HWBP fase 2: armati " + std::to_string(armedCount) + "/" + std::to_string(count) +
-                  " thread, attendo " + std::to_string(kHwbpPhaseMs / 1000) + "s.");
+    vr::log::Line("HWBP phase 2: armed " + std::to_string(armedCount) + "/" + std::to_string(count) +
+                  " threads, waiting " + std::to_string(kHwbpPhaseMs / 1000) + "s.");
     Sleep(kHwbpPhaseMs);
     for (int i = 0; i < count; ++i) SetThreadHwbp(tids[i], 0, 0, false);
     LogWriterSites("fase 2, tutti i thread");
@@ -1369,7 +1369,7 @@ void ApplyTwoHandAim(const float* right, const float* left) {
         wasActive = false;
         return;
     }
-    if (!wasActive) vr::log::Line("MIRA: impugnatura a due mani.");
+    if (!wasActive) vr::log::Line("AIM: two-handed grip.");
     wasActive = true;
     float horiz = std::sqrt(d[0] * d[0] + d[1] * d[1]);
     g_aimDeltaYaw = RadiansToUnreal(std::atan2(d[1], d[0]));
@@ -1507,7 +1507,7 @@ void ApplyFirstPerson(char* cam) {
 
 // Thread di gioco, subito dopo che la VM di UnrealScript ha copiato la
 // posizione nella camera: sposta la vista di +-meta' IPD lungo il vettore
-// "destra" della camera, alternando l'occhio ad ogni frame.
+// "right" della camera, alternando l'occhio ad ogni frame.
 // Occhio del Draw in corso (stereo sincrono, thread di gioco), -1 = fuori.
 std::atomic<int> g_drawEye{-1};
 
@@ -1516,7 +1516,7 @@ void RecordEyeOrigin(const float* loc, int eye) {
     g_eyeRing[slot] = {loc[0], loc[1], loc[2], eye};
 }
 
-// Sposta loc (gia' nella camera) di +-meta' IPD lungo il vettore "destra".
+// Sposta loc (gia' nella camera) di +-meta' IPD lungo il vettore "right".
 void OffsetLocationForEye(char* cam, int eye, float half) {
     float* loc = reinterpret_cast<float*>(cam + 0x10);
     // UE3: X avanti, Y destra, Z su; yaw in unita' Rotator. Gli occhi stanno
@@ -1528,7 +1528,7 @@ void OffsetLocationForEye(char* cam, int eye, float half) {
     float yaw = yawUnits * (6.28318530718f / 65536.0f);
     float roll = g_deltaRoll.load(std::memory_order_relaxed) * (6.28318530718f / 65536.0f);
     float sign = eye == 0 ? -1.0f : 1.0f;
-    // Vettore "destra" della testa: orizzontale ruotato col rollio.
+    // Vettore "right" della testa: orizzontale ruotato col rollio.
     loc[0] += sign * half * -std::sin(yaw) * std::cos(roll);
     loc[1] += sign * half * std::cos(yaw) * std::cos(roll);
     loc[2] += sign * half * -std::sin(roll);
@@ -1613,7 +1613,7 @@ public:
                       (vr::control::g_cinemaForce || cinematicMode ||
                        !(HasCameraSignature(cam) && PlayerPawnIfViewTarget(cam)));
         if (cinema != vr::control::g_cinemaActive.load()) {
-            vr::log::Line(cinema ? "CINEMA: schermo virtuale (fuori dal gameplay)" : "CINEMA: fine, ritorno alla VR");
+            vr::log::Line(cinema ? "CINEMA: virtual screen (outside gameplay)" : "CINEMA: end, back to VR");
             vr::control::g_cinemaActive = cinema;
         }
         if (cinema || half <= 0 || !vr::control::g_syncStereo || !HasCameraSignature(cam)) {
@@ -1639,8 +1639,8 @@ public:
             last = now;
             if (++g_profCount >= 300) {
                 char b[300];
-                std::snprintf(b, sizeof(b), "PROFILO: tick %.2f ms (%.1f fps stereo), Draw occhio sinistro %.2f ms, destro %.2f ms, "
-                              "uscita VR %.2f ms, Present monitor %.2f ms, resto %.2f ms",
+                std::snprintf(b, sizeof(b), "PROFILE: tick %.2f ms (%.1f fps stereo), Draw left eye %.2f ms, right %.2f ms, "
+                              "VR output %.2f ms, monitor Present %.2f ms, rest %.2f ms",
                               g_profTick / g_profCount, 1000.0 * g_profCount / g_profTick, g_profDraw[0] / g_profCount,
                               g_profDraw[1] / g_profCount, g_profOutput / g_profCount, g_profPresent / g_profCount,
                               (g_profTick - g_profDraw[0] - g_profDraw[1]) / g_profCount);
@@ -1693,7 +1693,7 @@ public:
                 static bool logged = false;
                 if (!logged) {
                     logged = true;
-                    vr::log::Line("ZOOM: cannocchiale, FOV del gioco " + std::to_string(fov));
+                    vr::log::Line("ZOOM: scope, game FOV " + std::to_string(fov));
                 }
                 g_scopeActive = true;
                 return fov;
@@ -1797,7 +1797,7 @@ bool PatchIat(uintptr_t slot, const char* name, void* replacement, Memcpy_t* out
     void* expected = crt ? reinterpret_cast<void*>(GetProcAddress(crt, name)) : nullptr;
     void** entry = reinterpret_cast<void**>(slot);
     if (!expected || *entry != expected) {
-        vr::log::Line(std::string("IAT: voce ") + name + " inattesa, hook NON installato.");
+        vr::log::Line(std::string("IAT: entry ") + name + " unexpected, hook NOT installed.");
         return false;
     }
     DWORD old;
@@ -1805,13 +1805,13 @@ bool PatchIat(uintptr_t slot, const char* name, void* replacement, Memcpy_t* out
     *outOriginal = reinterpret_cast<Memcpy_t>(expected);
     InterlockedExchange(reinterpret_cast<volatile LONG*>(entry), reinterpret_cast<LONG>(replacement));
     VirtualProtect(entry, sizeof(void*), old, &old);
-    vr::log::Line(std::string("IAT: hook su ") + name + " installato.");
+    vr::log::Line(std::string("IAT: hook on ") + name + " installed.");
     return true;
 }
 
 void DumpCamera(void* camera) {
     if (!HasCameraSignature(camera)) {
-        vr::log::Line("DUMPCAM: nessuna camera valida.");
+        vr::log::Line("DUMPCAM: no valid camera.");
         return;
     }
     const char* c = static_cast<const char*>(camera);
@@ -1823,7 +1823,7 @@ void DumpCamera(void* camera) {
         camera, loc[0], loc[1], loc[2], rot[0], rot[1], rot[2],
         g_deltaYaw.load(), g_deltaPitch.load(), g_overridesApplied.load());
     vr::log::Line(buf);
-    std::snprintf(buf, sizeof(buf), "DUMPCAM copia POV: offset dst=%+d dimensione=%d",
+    std::snprintf(buf, sizeof(buf), "DUMPCAM POV copy: dst offset=%+d size=%d",
                   g_lastCopyOffset.load(), g_lastCopySize.load());
     vr::log::Line(buf);
     std::string floats = "DUMPCAM float cam+0x00..0x5C:";
@@ -1833,17 +1833,17 @@ void DumpCamera(void* camera) {
         floats += b;
     }
     vr::log::Line(floats);
-    std::string stack = "DUMPCAM stack copia POV:";
+    std::string stack = "DUMPCAM POV copy stack:";
     for (int i = 0; i < kCopyStackDepth && g_copyStack[i]; ++i) {
         char b[16];
         std::snprintf(b, sizeof(b), " %08X", g_copyStack[i]);
         stack += b;
     }
     vr::log::Line(stack);
-    vr::log::Line("DUMPCAM stereo: copie posizione=" + std::to_string(g_locCopies.load()) +
-                  " occhio riconosciuto L=" + std::to_string(g_eyeMatches[0].load()) +
+    vr::log::Line("DUMPCAM stereo: location copies=" + std::to_string(g_locCopies.load()) +
+                  " eye recognised L=" + std::to_string(g_eyeMatches[0].load()) +
                   " R=" + std::to_string(g_eyeMatches[1].load()) +
-                  " non riconosciuti=" + std::to_string(g_eyeMisses.load()) +
+                  " unrecognised=" + std::to_string(g_eyeMisses.load()) +
                   " draw stereo=" + std::to_string(g_stereoDraws.load()) +
                   " | Present: sconosciuto=" + std::to_string(g_presentByEye[0].load()) +
                   " L=" + std::to_string(g_presentByEye[1].load()) +
@@ -1861,7 +1861,7 @@ void DumpCamera(void* camera) {
         auto fovDeg = [](float scale) { return scale > 0 ? 2.0f * std::atan(1.0f / scale) * 57.2957795f : 0.0f; };
         char b[256];
         std::snprintf(b, sizeof(b),
-            "DUMPCAM FOV da c0-c3: colonne hfov=%.2f vfov=%.2f (w=%.3f) | righe hfov=%.2f vfov=%.2f (w=%.3f)",
+            "DUMPCAM FOV from c0-c3: columns hfov=%.2f vfov=%.2f (w=%.3f) | rows hfov=%.2f vfov=%.2f (w=%.3f)",
             fovDeg(colW > 0 ? colX / colW : 0), fovDeg(colW > 0 ? colY / colW : 0), colW,
             fovDeg(rowW > 0 ? rowX / rowW : 0), fovDeg(rowW > 0 ? rowY / rowW : 0), rowW);
         vr::log::Line(b);
@@ -1877,7 +1877,7 @@ void DumpCamera(void* camera) {
             TrySafeReadUint32(c - 0x77C + 0x3B4, &vt);
             if (pawn) TrySafeReadUint32(reinterpret_cast<char*>(pawn) + 0x1594, &weapon);
         }
-        vr::log::Line(std::string("STATO gameplay=") + (sig && PlayerPawnIfViewTarget(c) ? "1" : "0") +
+        vr::log::Line(std::string("STATE gameplay=") + (sig && PlayerPawnIfViewTarget(c) ? "1" : "0") +
                       " cinema=" + (vr::control::g_cinemaActive ? "1" : "0") +
                       " cinematic=" + ((pcFlags & 0x8000) ? "1" : "0") +
                       " pawn=" + vr::script::ClassName(reinterpret_cast<void*>(pawn)) +
@@ -1903,7 +1903,7 @@ void DumpCamera(void* camera) {
                       g_pawnViewLoc[2] - g_pawnLocAtView[2]);
         vr::log::Line(b);
     }
-    vr::log::Line("DUMPCAM registri VS = +loc:" + RegMaskToString(g_vsRegMatchPlus) +
+    vr::log::Line("DUMPCAM VS registers = +loc:" + RegMaskToString(g_vsRegMatchPlus) +
                   " | = -loc:" + RegMaskToString(g_vsRegMatchMinus));
 }
 
@@ -1923,7 +1923,7 @@ void UpdateHeadTracking() {
         g_lastLoggedCameraPtr = camera;
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%p", camera);
-        vr::log::Line(std::string("Puntatore alla vera camera catturato/cambiato: 0x") + buf);
+        vr::log::Line(std::string("Real camera pointer captured/changed: 0x") + buf);
     }
     if (g_hudDiagFrames > 0) --g_hudDiagFrames;
     if (vr::control::g_dumpCameraRequested.exchange(false)) {
@@ -1982,14 +1982,14 @@ void UpdateHeadTracking() {
     vr::session::Shared vrLock(true);  // durante un cambio di tipo: questo tick senza testa
     vr::IVRSystem* const vrsys = vrLock.ok() ? vr::VRSystem() : nullptr;
     if (!vr::session::Ready() || !vrsys) {
-        if (shouldLog) vr::log::Line("UpdateHeadTracking: OpenVR non pronto.");
+        if (shouldLog) vr::log::Line("UpdateHeadTracking: OpenVR not ready.");
         return;
     }
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
     vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses, vr::k_unMaxTrackedDeviceCount);
     const vr::TrackedDevicePose_t& hmdPose = poses[vr::k_unTrackedDeviceIndex_Hmd];
     if (!hmdPose.bPoseIsValid) {
-        if (shouldLog) vr::log::Line("UpdateHeadTracking: posa HMD non valida.");
+        if (shouldLog) vr::log::Line("UpdateHeadTracking: invalid HMD pose.");
         return;
     }
     const vr::HmdMatrix34_t& m = hmdPose.mDeviceToAbsoluteTracking;
@@ -2005,7 +2005,7 @@ void UpdateHeadTracking() {
         g_hmdYawReference = hmdYaw;
         g_hmdPitchReference = 0.0f;
         for (int i = 0; i < 3; ++i) posRef[i] = pos[i];
-        vr::log::Line("Ricentrato: hmdYaw=" + std::to_string(hmdYaw) + " hmdPitch=" + std::to_string(hmdPitch) +
+        vr::log::Line("Recentered: hmdYaw=" + std::to_string(hmdYaw) + " hmdPitch=" + std::to_string(hmdPitch) +
                       " pos=(" + std::to_string(pos[0]) + ", " + std::to_string(pos[1]) + ", " + std::to_string(pos[2]) + ")");
     }
     // Altezza di riferimento = altezza della testa in piedi (la massima vista
@@ -2015,7 +2015,7 @@ void UpdateHeadTracking() {
     g_deltaYaw = vr::control::g_yawSign * RadiansToUnreal(hmdYaw - g_hmdYawReference);
     g_deltaPitch = vr::control::g_pitchSign * RadiansToUnreal(hmdPitch - g_hmdPitchReference);
     if (vr::control::g_sixDof) {
-        // Rollio: inclinazione del vettore "destra" del visore (colonna 0).
+        // Rollio: inclinazione del vettore "right" del visore (colonna 0).
         float rightY = m.m[1][0];
         if (rightY > 1.0f) rightY = 1.0f;
         if (rightY < -1.0f) rightY = -1.0f;
@@ -2092,7 +2092,7 @@ void UpdateHeadTracking() {
 bool PatchCode(uintptr_t addr, const uint8_t* expected, const uint8_t* replacement, size_t len, const char* what) {
     uint8_t* p = reinterpret_cast<uint8_t*>(addr);
     if (std::memcmp(p, expected, len) != 0) {
-        vr::log::Line(std::string("PATCH ") + what + ": byte inattesi, non applicata.");
+        vr::log::Line(std::string("PATCH ") + what + ": unexpected bytes, not applied.");
         return false;
     }
     DWORD old;
@@ -2100,7 +2100,7 @@ bool PatchCode(uintptr_t addr, const uint8_t* expected, const uint8_t* replaceme
     std::memcpy(p, replacement, len);
     VirtualProtect(p, len, old, &old);
     FlushInstructionCache(GetCurrentProcess(), p, len);
-    vr::log::Line(std::string("PATCH ") + what + ": applicata.");
+    vr::log::Line(std::string("PATCH ") + what + ": applied.");
     return true;
 }
 
@@ -2254,7 +2254,7 @@ const WeaponInfo& CurrentWeaponInfo(void* weapon) {
         g_weaponInfo.cls = weapon ? vr::script::ClassName(weapon) : std::string();
         g_weaponInfo.stationary = weapon && vr::script::IsA(weapon, "YWeapon_Stationary");
         if (weapon)
-            vr::log::Line("ARMA: " + g_weaponInfo.cls + (g_weaponInfo.stationary ? " (postazione fissa: resta al suo posto)" : ""));
+            vr::log::Line("WEAPON: " + g_weaponInfo.cls + (g_weaponInfo.stationary ? " (mounted weapon: left in place)" : ""));
     }
     return g_weaponInfo;
 }
@@ -2409,7 +2409,7 @@ bool AcquireArms(void* mesh) {
     }
     g_rig.mesh = mesh;
     g_rig.meshCls = ObjClass(mesh);
-    vr::log::Line("BRACCIA: controlli IK di Walker:" + names);
+    vr::log::Line("ARMS: Walker's IK controls:" + names);
     return g_rig.ctrl[0] != nullptr;
 }
 
@@ -2522,13 +2522,13 @@ void DriveHand(int side, const float* center, int32_t bodyYaw, const float* off,
     }
     if (debug) {
         char b3[240];
-        snprintf(b3, sizeof(b3), "BRACCIA %s: assi mano voluti X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)",
-                 side == 0 ? "destra" : "sinistra", hf[0], hf[1], hf[2], hr[0], hr[1], hr[2], hu[0], hu[1], hu[2]);
+        snprintf(b3, sizeof(b3), "ARMS %s: wanted hand axes X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)",
+                 side == 0 ? "right" : "left", hf[0], hf[1], hf[2], hr[0], hr[1], hr[2], hu[0], hu[1], hu[2]);
         vr::log::Line(b3);
         char buf[320];
         snprintf(buf, sizeof(buf),
-                 "BRACCIA %s: mano voluta mondo=(%.1f, %.1f, %.1f) attore=(%.1f, %.1f, %.1f) rot attore=(%d, %d, %d)",
-                 side == 0 ? "destra" : "sinistra", pos[0], pos[1], pos[2], eff[0], eff[1], eff[2], lrot[0], lrot[1],
+                 "ARMS %s: wanted hand world=(%.1f, %.1f, %.1f) actor=(%.1f, %.1f, %.1f) actor rot=(%d, %d, %d)",
+                 side == 0 ? "right" : "left", pos[0], pos[1], pos[2], eff[0], eff[1], eff[2], lrot[0], lrot[1],
                  lrot[2]);
         vr::log::Line(buf);
     }
@@ -2562,7 +2562,7 @@ void MeasureHandInWeapon(void* mesh, int side) {
             g_handInWeapon[side][a][b] = h[a][0] * w[b][0] + h[a][1] * w[b][1] + h[a][2] * w[b][2];
     g_handInWeaponValid[side] = true;
     char buf[200];
-    snprintf(buf, sizeof(buf), "BRACCIA: %s nel riferimento di %s: X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)",
+    snprintf(buf, sizeof(buf), "ARMS: %s in the frame of %s: X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)",
              hand, weap, g_handInWeapon[side][0][0], g_handInWeapon[side][0][1], g_handInWeapon[side][0][2],
              g_handInWeapon[side][1][0], g_handInWeapon[side][1][1], g_handInWeapon[side][1][2],
              g_handInWeapon[side][2][0], g_handInWeapon[side][2][1], g_handInWeapon[side][2][2]);
@@ -2579,11 +2579,11 @@ void LogBones(void* mesh) {
         if (!vr::script::CallFunction(mesh, "GetBoneName", &parms) || parms.ret[0] <= 0) break;
         line += " " + std::to_string(i) + ":" + vr::script::NameFromIndex(parms.ret[0]);
         if (line.size() > 400) {
-            vr::log::Line("OSSA:" + line);
+            vr::log::Line("BONES:" + line);
             line.clear();
         }
     }
-    vr::log::Line("OSSA:" + line);
+    vr::log::Line("BONES:" + line);
 }
 
 void LogBoneLocation(void* mesh, const char* bone) {
@@ -2595,7 +2595,7 @@ void LogBoneLocation(void* mesh, const char* bone) {
     if (parms.name[0] < 0) return;
     if (vr::script::CallFunction(mesh, "GetBoneLocation", &parms)) {
         char buf[160];
-        snprintf(buf, sizeof(buf), "BRACCIA: osso %s nel mondo=(%.1f, %.1f, %.1f)", bone, parms.ret[0], parms.ret[1],
+        snprintf(buf, sizeof(buf), "ARMS: bone %s in the world=(%.1f, %.1f, %.1f)", bone, parms.ret[0], parms.ret[1],
                  parms.ret[2]);
         vr::log::Line(buf);
     }
@@ -2651,7 +2651,7 @@ void UpdateFirstPersonBody(void* pawn) {
         if (!SafeCopy(g_fpSavedCylinders, static_cast<char*>(pawn) + kOffPawnInvisCylinders, 32)) return;
         g_fpPawn = pawn;
         g_fpPawnCls = ObjClass(pawn);
-        vr::log::Line("CORPO: prima persona, Walker opaco e testa nascosta.");
+        vr::log::Line("BODY: first person, Walker opaque and head hidden.");
     }
     static const float zero[8] = {};
     SetCylinders(pawn, zero);  // ogni frame: lo script potrebbe rimetterli
@@ -2773,7 +2773,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         for (int i : {1, 3})
             if (g_rig.ctrl[i] && StillAlive(g_rig.ctrl[i], g_rig.ctrlCls[i]))
                 SafeCopy(static_cast<char*>(g_rig.ctrl[i]) + kCtrlSaveFrom, g_rig.saved[i], kCtrlSaveLen);
-        vr::log::Line("BRACCIA: mano sinistra sull'arma (animazione del gioco).");
+        vr::log::Line("ARMS: left hand on the weapon (game animation).");
     }
     leftOnGun = onGun;
     if (g_leftValid && g_rig.ctrl[1] && !onGun) {
@@ -2787,13 +2787,13 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         float mo[3], md[3];
         if (GunBarrel(pawn, mo, md)) {
             char b5[200];
-            snprintf(b5, sizeof(b5), "BRACCIA: canna origine=(%.1f, %.1f, %.1f) asse=(%.2f %.2f %.2f) mira dalla canna=%d (%d, %d)",
+            snprintf(b5, sizeof(b5), "ARMS: barrel origin=(%.1f, %.1f, %.1f) axis=(%.2f %.2f %.2f) barrel aim=%d (%d, %d)",
                      mo[0], mo[1], mo[2], md[0], md[1], md[2], (int)g_muzzleAimValid.load(), g_muzzleAimPitch.load(),
                      g_muzzleAimYaw.load());
             vr::log::Line(b5);
         }
         char buf[200];
-        snprintf(buf, sizeof(buf), "BRACCIA: pawn loc=(%.1f, %.1f, %.1f) rot=(%d, %d, %d) scala=%.2f occhi=(%.1f, %.1f, %.1f)",
+        snprintf(buf, sizeof(buf), "ARMS: pawn loc=(%.1f, %.1f, %.1f) rot=(%d, %d, %d) scale=%.2f eyes=(%.1f, %.1f, %.1f)",
                  actorLoc[0], actorLoc[1], actorLoc[2], actorRot[0], actorRot[1], actorRot[2], scale, center[0],
                  center[1], center[2]);
         vr::log::Line(buf);
@@ -2801,7 +2801,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             float mf[3], mr[3], mu[3];
             RotatorToAxes(g_bodyPitch.load() + g_aimDeltaPitch.load(), g_bodyYaw.load() + g_aimDeltaYaw.load(), 0, mf, mr, mu);
             char b4[200];
-            snprintf(b4, sizeof(b4), "BRACCIA: mira avanti=(%.2f %.2f %.2f) rollio mano=%d twohand=%d sinistra valida=%d",
+            snprintf(b4, sizeof(b4), "ARMS: aim forward=(%.2f %.2f %.2f) hand roll=%d twohand=%d left valid=%d",
                      mf[0], mf[1], mf[2], g_handRoll.load(), (int)g_twoHandActive.load(), (int)g_leftValid.load());
             vr::log::Line(b4);
         }
@@ -2812,7 +2812,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             float ax[3][3];
             if (BoneAxes(g_rig.mesh, bn, ax)) {
                 char b2[200];
-                snprintf(b2, sizeof(b2), "BRACCIA: assi %s X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)", bn,
+                snprintf(b2, sizeof(b2), "ARMS: axes %s X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)", bn,
                          ax[0][0], ax[0][1], ax[0][2], ax[1][0], ax[1][1], ax[1][2], ax[2][0], ax[2][1], ax[2][2]);
                 vr::log::Line(b2);
             }
@@ -2977,6 +2977,8 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
 // dove punta la canna del fucile visibile, qualunque calcolo faccia lo script
 // prima (17/10: i colpi andavano a sinistra del mirino).
 constexpr uintptr_t kCalcWeaponFireAddr = 0x004A3D50;
+constexpr uintptr_t kOffPawnArsenalMgr = 0x1590;   // YGamePawn.m_arsenalManager
+constexpr uintptr_t kOffArsenalAccuracy = 0x81C;   // YArsenalManager.m_accuracy, m_oldAccuracy
 struct FVec3 {
     float x, y, z;
 };
@@ -2991,27 +2993,52 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
     bool mine = pawn && TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) &&
                 reinterpret_cast<void*>(weapon) == self;
     FVec3 origEnd = end;
-    if (mine && vr::control::g_muzzleAim && g_muzzleAimValid && g_armsActive) {
-        float d[3] = {g_muzzleTarget[0] - start.x, g_muzzleTarget[1] - start.y, g_muzzleTarget[2] - start.z};
-        float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    float bo[3], bd[3];
+    if (mine && vr::control::g_muzzleAim && g_muzzleAimValid && g_armsActive && GunBarrel(pawn, bo, bd)) {
+        // Il raggio del colpo diventa quello della canna, lo stesso del mirino:
+        // il gioco lo fa partire 25-30 unita' fuori dall'asse (17/10, misurato
+        // col punto d'impatto) e verso il bersaglio passava da un'altra parte,
+        // fermandosi a volte su ostacoli che la canna non "vede". Origine =
+        // punto dell'asse della canna piu' vicino all'origine del gioco.
         float range = std::sqrt((end.x - start.x) * (end.x - start.x) + (end.y - start.y) * (end.y - start.y) +
                                 (end.z - start.z) * (end.z - start.z));
-        if (len > 1.0f && range > 1.0f) {
-            end = {start.x + d[0] / len * range, start.y + d[1] / len * range, start.z + d[2] / len * range};
+        float t = (start.x - bo[0]) * bd[0] + (start.y - bo[1]) * bd[1] + (start.z - bo[2]) * bd[2];
+        if (t < 10.0f) t = 10.0f;
+        if (range > 1.0f) {
+            start = {bo[0] + bd[0] * t, bo[1] + bd[1] * t, bo[2] + bd[2] * t};
+            end = {start.x + bd[0] * range, start.y + bd[1] * range, start.z + bd[2] * range};
         }
     }
-    if (mine && vr::control::g_fireLog) {
-        float bo[3] = {0, 0, 0}, bd[3] = {0, 0, 0};
-        GunBarrel(pawn, bo, bd);
-        char b[400];
-        snprintf(b, sizeof(b),
-                 "COLPO: da (%.1f, %.1f, %.1f) verso (%.1f, %.1f, %.1f), il gioco voleva (%.1f, %.1f, %.1f), canna -> (%.1f, %.1f, %.1f), "
-                 "canna origine (%.1f, %.1f, %.1f) asse (%.3f, %.3f, %.3f)",
-                 start.x, start.y, start.z, end.x, end.y, end.z, origEnd.x, origEnd.y, origEnd.z, g_muzzleTarget[0],
-                 g_muzzleTarget[1], g_muzzleTarget[2], bo[0], bo[1], bo[2], bd[0], bd[1], bd[2]);
-        vr::log::Line(b);
+    // Dispersione: l'arsenale tiene l'imprecisione del giocatore (0 = colpo
+    // perfetto, sale fino a 1 sparando) e CalcWeaponFire la applica attorno al
+    // raggio. Con la mira dalla canna (spread off) vale 0 durante il colpo:
+    // i colpi vanno dove punta la canna, come chiede la VR.
+    float savedAcc[2] = {0, 0};
+    char* arsenal = nullptr;
+    uint32_t arsenalPtr = 0;
+    bool zeroSpread = mine && !vr::control::g_spread && vr::control::g_muzzleAim && g_armsActive &&
+                      TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnArsenalMgr, &arsenalPtr) && arsenalPtr;
+    if (zeroSpread) {
+        arsenal = reinterpret_cast<char*>(arsenalPtr);
+        static const float zero2[2] = {0, 0};
+        if (!SafeCopy(savedAcc, arsenal + kOffArsenalAccuracy, 8) || !SafeCopy(arsenal + kOffArsenalAccuracy, zero2, 8))
+            zeroSpread = false;
     }
     g_CalcWeaponFire_Original(self, start, end, impact);
+    if (zeroSpread) SafeCopy(arsenal + kOffArsenalAccuracy, savedAcc, 8);
+    if (mine && vr::control::g_fireLog) {
+        // FImpactInfo: HitActor +0, HitLocation +4.
+        float hit[3] = {0, 0, 0};
+        SafeCopy(hit, static_cast<char*>(impact) + 4, 12);
+        if (!GunBarrel(pawn, bo, bd)) bo[0] = bo[1] = bo[2] = bd[0] = bd[1] = bd[2] = 0.0f;
+        char b[512];
+        snprintf(b, sizeof(b),
+                 "SHOT: from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f), game wanted (%.1f, %.1f, %.1f), barrel -> (%.1f, %.1f, %.1f), "
+                 "barrel origin (%.1f, %.1f, %.1f) axis (%.3f, %.3f, %.3f), impact (%.1f, %.1f, %.1f)",
+                 start.x, start.y, start.z, end.x, end.y, end.z, origEnd.x, origEnd.y, origEnd.z, g_muzzleTarget[0],
+                 g_muzzleTarget[1], g_muzzleTarget[2], bo[0], bo[1], bo[2], bd[0], bd[1], bd[2], hit[0], hit[1], hit[2]);
+        vr::log::Line(b);
+    }
 }
 
 void* GetPlayerViewPointThunkAddress() {
@@ -3128,10 +3155,10 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     ok &= MH_EnableHook(setVsConstTarget) == MH_OK;
 
     if (ok) {
-        vr::log::Line("Hook sul device IDirect3DDevice9 installati (Present/EndScene/SetTransform/SetVertexShaderConstantF).");
+        vr::log::Line("IDirect3DDevice9 hooks installed (Present/EndScene/SetTransform/SetVertexShaderConstantF).");
         g_deviceHooksInstalled = true;
     } else {
-        vr::log::Line("ERRORE: installazione di uno o piu' hook sul device fallita.");
+        vr::log::Line("ERROR: one or more device hooks failed.");
     }
 
     // Aggancio alla funzione nativa fissa che ci da' il puntatore al Pawn
@@ -3142,70 +3169,70 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     if (MH_CreateHook(pawnFnTarget, GetPawnHookThunkAddress(),
                        reinterpret_cast<void**>(&g_ExecGetPawnViewLocation_Original)) == MH_OK &&
         MH_EnableHook(pawnFnTarget) == MH_OK) {
-        vr::log::Line("Hook su APawn::execGetPawnViewLocation installato (per catturare il puntatore al Pawn).");
+        vr::log::Line("Hook on APawn::execGetPawnViewLocation installed (captures the Pawn pointer).");
     } else {
-        vr::log::Line("ERRORE: hook su APawn::execGetPawnViewLocation fallito.");
+        vr::log::Line("ERROR: hook on APawn::execGetPawnViewLocation failed.");
     }
 
     void* viewTargetFnTarget = reinterpret_cast<void*>(kExecGetViewTargetAddr);
     if (MH_CreateHook(viewTargetFnTarget, GetViewTargetHookThunkAddress(),
                        reinterpret_cast<void**>(&g_ExecGetViewTarget_Original)) == MH_OK &&
         MH_EnableHook(viewTargetFnTarget) == MH_OK) {
-        vr::log::Line("Hook su APlayerController::execGetViewTarget installato.");
+        vr::log::Line("Hook on APlayerController::execGetViewTarget installed.");
     } else {
-        vr::log::Line("ERRORE: hook su APlayerController::execGetViewTarget fallito.");
+        vr::log::Line("ERROR: hook on APlayerController::execGetViewTarget failed.");
     }
 
     void* cameraFnTarget = reinterpret_cast<void*>(kCameraHookAddr);
     if (MH_CreateHook(cameraFnTarget, GetCameraHookThunkAddress(),
                        reinterpret_cast<void**>(&g_CameraSetter_Original)) == MH_OK &&
         MH_EnableHook(cameraFnTarget) == MH_OK) {
-        vr::log::Line("Hook sulla vera camera installato (0x007ECAB2, da cheat table pubblica).");
+        vr::log::Line("Real camera hook installed (0x007ECAB2, from a public cheat table).");
     } else {
-        vr::log::Line("ERRORE: hook sulla vera camera fallito.");
+        vr::log::Line("ERROR: real camera hook failed.");
     }
 
     void* drawTarget = reinterpret_cast<void*>(kViewportDrawAddr);
     if (MH_CreateHook(drawTarget, GetViewportDrawThunkAddress(),
                       reinterpret_cast<void**>(&g_ViewportDraw_Original)) == MH_OK &&
         MH_EnableHook(drawTarget) == MH_OK) {
-        vr::log::Line("Hook su FViewport::Draw installato (stereo sincrono).");
+        vr::log::Line("Hook on FViewport::Draw installed (synchronous stereo).");
     } else {
-        vr::log::Line("ERRORE: hook su FViewport::Draw fallito.");
+        vr::log::Line("ERROR: hook on FViewport::Draw failed.");
     }
 
     void* fovTarget = reinterpret_cast<void*>(kGetFovAngleAddr);
     if (MH_CreateHook(fovTarget, GetFovThunkAddress(),
                       reinterpret_cast<void**>(&g_GetFovAngle_Original)) == MH_OK &&
         MH_EnableHook(fovTarget) == MH_OK) {
-        vr::log::Line("Hook su APlayerController::GetFOVAngle installato.");
+        vr::log::Line("Hook on APlayerController::GetFOVAngle installed.");
     } else {
-        vr::log::Line("ERRORE: hook su GetFOVAngle fallito.");
+        vr::log::Line("ERROR: hook on GetFOVAngle failed.");
     }
 
     void* gpvpTarget = reinterpret_cast<void*>(kGetPlayerViewPointAddr);
     if (MH_CreateHook(gpvpTarget, GetPlayerViewPointThunkAddress(),
                       reinterpret_cast<void**>(&g_GetPlayerViewPoint_Original)) == MH_OK &&
         MH_EnableHook(gpvpTarget) == MH_OK) {
-        vr::log::Line("Hook su GetPlayerViewPoint installato (testa solo nella vista).");
+        vr::log::Line("Hook on GetPlayerViewPoint installed (head only in the view).");
     }
 
     void* cwfTarget = reinterpret_cast<void*>(kCalcWeaponFireAddr);
     if (MH_CreateHook(cwfTarget, reinterpret_cast<void*>(&Hooked_CalcWeaponFire),
                       reinterpret_cast<void**>(&g_CalcWeaponFire_Original)) == MH_OK &&
         MH_EnableHook(cwfTarget) == MH_OK) {
-        vr::log::Line("Hook su YWeapon::CalcWeaponFire installato (colpi dalla canna).");
+        vr::log::Line("Hook on YWeapon::CalcWeaponFire installed (shots from the barrel).");
     } else {
-        vr::log::Line("ERRORE: hook su CalcWeaponFire fallito.");
+        vr::log::Line("ERROR: hook on CalcWeaponFire failed.");
     }
 
     void* csvTarget = reinterpret_cast<void*>(kCalcSceneViewAddr);
     if (MH_CreateHook(csvTarget, GetCalcSceneViewThunkAddress(),
                       reinterpret_cast<void**>(&g_CalcSceneView_Original)) == MH_OK &&
         MH_EnableHook(csvTarget) == MH_OK) {
-        vr::log::Line("Hook su ULocalPlayer::CalcSceneView installato (vista a tutto schermo).");
+        vr::log::Line("Hook on ULocalPlayer::CalcSceneView installed (full-screen view).");
     } else {
-        vr::log::Line("ERRORE: hook su CalcSceneView fallito.");
+        vr::log::Line("ERROR: hook on CalcSceneView failed.");
     }
 
     PatchIat(kIatMemcpy, "memcpy", reinterpret_cast<void*>(&Hooked_memcpy), &g_memcpyReal);
@@ -3246,10 +3273,10 @@ DWORD ExUsage(DWORD usage) {
 void CountManaged(HRESULT hr, const char* what) {
     if (SUCCEEDED(hr)) {
         uint32_t n = ++g_managedConverted;
-        if (n == 1 || n % 2000 == 0) vr::log::Line("GPUSHARE: risorse MANAGED convertite: " + std::to_string(n));
+        if (n == 1 || n % 2000 == 0) vr::log::Line("GPUSHARE: MANAGED resources converted: " + std::to_string(n));
     } else {
         uint32_t n = ++g_managedFailed;
-        if (n <= 10) vr::log::Line(std::string("GPUSHARE: conversione fallita (") + what + ") hr=" + std::to_string(hr));
+        if (n <= 10) vr::log::Line(std::string("GPUSHARE: conversion failed (") + what + ") hr=" + std::to_string(hr));
     }
 }
 
@@ -3318,16 +3345,16 @@ void InstallExResourceHooks(IDirect3DDevice9* device) {
     for (auto& h : hooks) {
         void* t = VTableEntry(device, h.index);
         bool ok = MH_CreateHook(t, h.detour, h.original) == MH_OK && MH_EnableHook(t) == MH_OK;
-        if (!ok) vr::log::Line("GPUSHARE: hook di creazione risorse fallito (indice " + std::to_string(h.index) + ")");
+        if (!ok) vr::log::Line("GPUSHARE: resource creation hook failed (index " + std::to_string(h.index) + ")");
     }
-    vr::log::Line("GPUSHARE: hook di conversione delle risorse MANAGED installati.");
+    vr::log::Line("GPUSHARE: MANAGED resource conversion hooks installed.");
 }
 
 HRESULT WINAPI Hooked_CreateDevice(
     IDirect3D9* self, UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow,
     DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters,
     IDirect3DDevice9** ppReturnedDeviceInterface) {
-    vr::log::Line("CreateDevice chiamato (Adapter=" + std::to_string(Adapter) + ").");
+    vr::log::Line("CreateDevice called (Adapter=" + std::to_string(Adapter) + ").");
     // Vsync off: il ritmo lo da' WaitGetPoses del visore, e in stereo
     // sincrono ci sono due Present per tick.
     if (pPresentationParameters) pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
@@ -3349,10 +3376,10 @@ HRESULT WINAPI Hooked_CreateDevice(
         }
         if (SUCCEEDED(hr) && devEx) {
             *ppReturnedDeviceInterface = devEx;
-            vr::log::Line("GPUSHARE: device creato con CreateDeviceEx.");
+            vr::log::Line("GPUSHARE: device created with CreateDeviceEx.");
             InstallExResourceHooks(devEx);
         } else {
-            vr::log::Line("GPUSHARE: CreateDeviceEx fallita hr=" + std::to_string(hr) + ", device normale.");
+            vr::log::Line("GPUSHARE: CreateDeviceEx failed hr=" + std::to_string(hr) + ", normal device.");
             g_d3d9ex = false;
         }
     }
@@ -3362,10 +3389,10 @@ HRESULT WINAPI Hooked_CreateDevice(
     }
 
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
-        vr::log::Line("CreateDevice riuscito, installo gli hook sul device.");
+        vr::log::Line("CreateDevice succeeded, installing the device hooks.");
         InstallDeviceHooks(*ppReturnedDeviceInterface);
     } else {
-        vr::log::Line("CreateDevice fallito o device nullo, hr=" + std::to_string(hr));
+        vr::log::Line("CreateDevice failed or null device, hr=" + std::to_string(hr));
     }
 
     return hr;
@@ -3375,7 +3402,7 @@ HRESULT WINAPI Hooked_CreateDevice(
 
 bool InstallIDirect3D9Hook(IDirect3D9* realD3D9) {
     if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
-        vr::log::Line("ERRORE: MH_Initialize fallita.");
+        vr::log::Line("ERROR: MH_Initialize failed.");
         return false;
     }
 
@@ -3383,15 +3410,15 @@ bool InstallIDirect3D9Hook(IDirect3D9* realD3D9) {
 
     if (MH_CreateHook(createDeviceTarget, &Hooked_CreateDevice,
                        reinterpret_cast<void**>(&g_CreateDevice_Original)) != MH_OK) {
-        vr::log::Line("ERRORE: MH_CreateHook su CreateDevice fallita.");
+        vr::log::Line("ERROR: MH_CreateHook on CreateDevice failed.");
         return false;
     }
     if (MH_EnableHook(createDeviceTarget) != MH_OK) {
-        vr::log::Line("ERRORE: MH_EnableHook su CreateDevice fallita.");
+        vr::log::Line("ERROR: MH_EnableHook on CreateDevice failed.");
         return false;
     }
 
-    vr::log::Line("Hook su IDirect3D9::CreateDevice installato correttamente.");
+    vr::log::Line("Hook on IDirect3D9::CreateDevice installed.");
     return true;
 }
 

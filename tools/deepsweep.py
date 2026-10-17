@@ -106,7 +106,7 @@ def deep_map(name):
     g.send_cmds(['console open TheLine_P?mission=%s?game=SRAssets.YGameInfo_SP_Content' % name])
     while time.time() - t0 < 180 and ls.running():
         time.sleep(2)
-        if time.time() - t0 > 8 and re.search(r'Puntatore al Pawn catturato', ls.log_since(pos)):
+        if time.time() - t0 > 8 and re.search(r'Pawn pointer captured', ls.log_since(pos)):
             break
     rep['inizio'] = []
     wait_gameplay(rep['inizio'], 50)
@@ -145,18 +145,18 @@ def deep_map(name):
                 play_test(r['stati'])
                 save_shot('dp_%s_%s_b' % (name, cp), d)
         txt = ls.log_since(cpos)
-        r['blocchi'] = [int(x) for x in re.findall(r'WATCHDOG: thread di rendering fermo da (\d+)s', txt)]
-        r['cinema_eventi'] = len(re.findall(r'CINEMA: schermo virtuale \(', txt))
-        r['ucall'] = re.findall(r'UCALL: (eccezione[^\n]*|ritorno[^\n]*)', txt)
+        r['blocchi'] = [int(x) for x in re.findall(r'WATCHDOG: render thread stalled for (\d+)s', txt)]
+        r['cinema_eventi'] = len(re.findall(r'CINEMA: virtual screen \(', txt))
+        r['ucall'] = re.findall(r'UCALL: (exception[^\n]*|returned[^\n]*)', txt)
         rep['checkpoint'][cp] = r
         last = [s for s in r['stati'] if s]
         print('   %-10s raggiunto=%s forzata=%s cinema_eventi=%d blocchi=%s ultimo=%s' % (
             cp, r['raggiunto'], r.get('cinematica_forzata', False), r['cinema_eventi'], r['blocchi'],
             last[-1] if last else None), flush=True)
     txt = ls.log_since(pos)
-    rep['fps'] = [float(x) for x in re.findall(r'PROFILO: tick [\d.]+ ms \(([\d.]+) fps', txt)]
-    rep['errori'] += sorted(set(re.findall(r'(ERRORE[^\n]*|eccezione[^\n]*)', txt)))[:10]
-    rep['armi'] = sorted(set(re.findall(r'ARMA: (\S+)', txt)))
+    rep['fps'] = [float(x) for x in re.findall(r'PROFILE: tick [\d.]+ ms \(([\d.]+) fps', txt)]
+    rep['errori'] += sorted(set(re.findall(r'(ERROR[^\n]*|exception[^\n]*)', txt)))[:10]
+    rep['armi'] = sorted(set(re.findall(r'WEAPON: (\S+)', txt)))
     rep['viste'] = sorted(set(re.findall(r'viewtarget=(\S+)', txt)))
     rep['pawn'] = sorted(set(re.findall(r'pawn=(\S+)', txt)))
     if not ls.running():
