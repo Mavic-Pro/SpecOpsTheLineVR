@@ -290,6 +290,21 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
         } else if (type == "ObjectProperty") {
             void* o = ResolveObject(pc, pawn, a);
             std::memcpy(dst, &o, 4);
+        } else if (type == "StructProperty" && a.find(',') != std::string::npos) {
+            // Vector "x,y,z" (float) o Rotator "r:pitch,yaw,roll" (int).
+            bool rot = a.compare(0, 2, "r:") == 0;
+            const char* s = a.c_str() + (rot ? 2 : 0);
+            for (int i = 0; i < 3 && s; ++i) {
+                if (rot) {
+                    int32_t v = atoi(s);
+                    std::memcpy(dst + 4 * i, &v, 4);
+                } else {
+                    float v = static_cast<float>(atof(s));
+                    std::memcpy(dst + 4 * i, &v, 4);
+                }
+                s = strchr(s, ',');
+                if (s) ++s;
+            }
         } else {
             vr::log::Line("UCALL: parameter type " + type + " not supported.");
             return;

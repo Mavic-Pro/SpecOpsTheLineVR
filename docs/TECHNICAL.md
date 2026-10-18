@@ -173,7 +173,10 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 - **6DOF**: head position relative to the recenter reference (standing
   height = highest head position seen), rotated into the body frame.
 - **Head collision**: `UWorld::SingleLineCheck` (`0x009BDE30`) on `GWorld`
-  (`[0x014DF734]`).
+  (`[0x014DF734]`). The trace starts at the Pawn's center at eye height,
+  not at the eye point (which is `fp` forward units ahead): with Walker
+  pressed against a wall in scripted scenes the eye point is inside the wall,
+  and a trace starting there kept the view stuck inside it (0.9.5).
 
 ## Engine objects (UE3)
 

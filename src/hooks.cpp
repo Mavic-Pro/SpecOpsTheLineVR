@@ -4454,9 +4454,22 @@ public:
             // UE3: X avanti, Y destra, Z su.
             float target[3] = {base[0] + f * std::cos(b) - r * std::sin(b), base[1] + f * std::sin(b) + r * std::cos(b),
                                base[2] + u};
-            // Protezione della testa: se tra gli occhi del corpo e la testa
-            // c'e' un ostacolo, la testa si ferma ~8 unita' prima.
-            float dx = target[0] - base[0], dy = target[1] - base[1], dz = target[2] - base[2];
+            // Protezione della testa: se tra il corpo e la testa c'e' un
+            // ostacolo, la testa si ferma ~8 unita' prima. Il controllo parte
+            // dal centro del Pawn (all'altezza degli occhi), sempre libero:
+            // gli occhi sono g_fpForward unita' piu' avanti e con Walker
+            // contro un muro (ostaggi del cap. 2, 18/10) finivano dentro il
+            // muro, il trace colpiva subito e la vista restava bloccata li'.
+            float origin[3] = {base[0], base[1], base[2]};
+            if (g_pawnViewLocValid && vr::control::g_headCollision) {
+                float px = g_pawnLocAtView[0] - base[0], py = g_pawnLocAtView[1] - base[1];
+                float lim = std::fabs(vr::control::g_fpForward.load()) + 45.0f;
+                if (px * px + py * py < lim * lim) {  // stesso Pawn di questa vista
+                    origin[0] = g_pawnLocAtView[0];
+                    origin[1] = g_pawnLocAtView[1];
+                }
+            }
+            float dx = target[0] - origin[0], dy = target[1] - origin[1], dz = target[2] - origin[2];
             float len = std::sqrt(dx * dx + dy * dy + dz * dz);
             static float tickT = 1.0f;  // calcolato sull'occhio sinistro, riusato dal destro
             float t = 1.0f;
@@ -4464,12 +4477,12 @@ public:
                 t = tickT;
             } else if (vr::control::g_headCollision && len > 0.5f) {
                 const float margin = 8.0f;
-                float ext[3] = {base[0] + dx / len * (len + margin), base[1] + dy / len * (len + margin),
-                                base[2] + dz / len * (len + margin)};
+                float ext[3] = {origin[0] + dx / len * (len + margin), origin[1] + dy / len * (len + margin),
+                                origin[2] + dz / len * (len + margin)};
                 float hitTime;
                 char* camForTrace = static_cast<char*>(g_cameraPtr.load());
                 void* self = HasCameraSignature(camForTrace) ? PlayerPawnIfViewTarget(camForTrace) : nullptr;
-                if (TraceLine(self, base, ext, &hitTime)) {
+                if (TraceLine(self, origin, ext, &hitTime)) {
                     float allowed = hitTime * (len + margin) - margin;
                     t = allowed <= 0.0f ? 0.0f : (allowed < len ? allowed / len : 1.0f);
                     g_headBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -4489,9 +4502,9 @@ public:
                 if (dj < 500.0f && dj > g_maxViewJump) g_maxViewJump = dj;  // >500: teletrasporto/checkpoint
                 for (int i = 0; i < 3; ++i) lastView[i] = outLoc[i];
             }
-            outLoc[0] = base[0] + dx * t;
-            outLoc[1] = base[1] + dy * t;
-            outLoc[2] = base[2] + dz * t;
+            outLoc[0] = origin[0] + dx * t;
+            outLoc[1] = origin[1] + dy * t;
+            outLoc[2] = origin[2] + dz * t;
             if (vr::control::g_camLogFrames.load() > 0 && g_drawEye != 1) {
                 vr::control::g_camLogFrames.fetch_sub(1);
                 char b[260];
