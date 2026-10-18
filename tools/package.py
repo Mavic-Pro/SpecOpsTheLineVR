@@ -72,6 +72,8 @@ $dst = Find-Game $args[0]
 foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst $f)
 }
+# Controller bindings written by the mod (SteamVR Input).
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $dst 'specopsvr_input')
 Write-Host "SpecOpsTheLineVR removed from $dst (specopsvr.ini and the logs were kept)."
 """
 
@@ -119,7 +121,8 @@ INSTALL
      install.bat "D:\\SteamLibrary\\steamapps\\common\\SpecOps_TheLine").
   2. In Steam, game Properties > Launch options, add:
        -windowed ResX=2400 ResY=2500
-     (a nearly square window gives the sharpest image in the headset).
+     (the mod then uses the resolution SteamVR recommends for your headset:
+     change sharpness with the SteamVR resolution slider).
   3. Start SteamVR, put the headset on and start the game.
 
 UNINSTALL
@@ -133,7 +136,9 @@ UPDATES
   gets them too. If an update causes problems, close the game and run
   rollback.bat to go back to the previous version.
 
-CONTROLS (Touch controllers, shown to the game as an Xbox pad)
+CONTROLS (Touch layout; Index: A/B on each hand = A/B and X/Y, left trackpad
+click = pause; every button can be changed in SteamVR > Settings >
+Controllers > Manage controller bindings > Spec Ops: The Line)
   Left stick: move                 Right stick: turn
   Right trigger: fire              Left trigger: aim
   Left grip: grenade (LB)          Right grip: squad orders (RB)

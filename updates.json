@@ -1,4 +1,6 @@
 {
-  "revoked": ["0.9.1"],
-  "recommended": "v0.9.3"
+  "revoked": [
+    "0.9.1"
+  ],
+  "recommended": "v0.9.4"
 }

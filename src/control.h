@@ -203,6 +203,57 @@ extern std::atomic<bool> g_cinemaWalker3D;
 extern std::atomic<bool> g_stockCalibRequest;
 // Feedback aptico esterno: ProTubeVR (ForceTubeVR_API_x32.dll) e bHaptics Player.
 extern std::atomic<bool> g_protube, g_bhaptics;
+// Mirino del gioco (al centro della vista, cioe' legato alla testa): nascosto
+// mirando con la mano, il mirino verde sulla canna lo sostituisce
+// ("gamecrosshair on|off", predefinito off).
+extern std::atomic<bool> g_gameCrosshair;
+// Input dei controller: azioni di SteamVR Input (binding per Index, Touch,
+// Vive, WMR, rimappabili in SteamVR) o API legacy ("vrinput actions|legacy").
+extern std::atomic<bool> g_actionInput;
+// Stato della vista (occlusione, LOD) separato per l'occhio destro
+// ("eyestate on|off").
+extern std::atomic<bool> g_perEyeViewState;
+// Proiezione decentrata per occhio: tutto il back buffer e' l'occhio, niente
+// ritaglio ("offcenter on|off").
+extern std::atomic<bool> g_offCenter;
+// Prova dei display inclinati senza Pimax ("eyecant <gradi>", 0 = visore reale).
+extern std::atomic<float> g_simCantDeg;
+// Risoluzione dinamica: con la GPU vicina al limite del frame del visore la
+// scena si disegna piu' piccola (ScreenPercentage di UE3) e il mod la riallarga
+// ("dynres on|off", "dynres min <percento>").
+extern std::atomic<bool> g_dynRes;
+extern std::atomic<int> g_dynResMin;
+// Prova: frame del visore finto in ms ("dynres budget <ms>", 0 = dal visore).
+extern std::atomic<float> g_dynResBudgetMs;
+// Prova: "dynres test" alterna 100/70% per 10 s e controlla che ogni immagine
+// abbia il ritaglio giusto (viewport della scena = percentuale del frame tag).
+extern std::atomic<int> g_dynResTestFrames;
+// Preset grafico VR: spegne gli effetti a schermo che costano e cambiano tra
+// i due occhi (SSAO, distorsione filtrata) ("vrpreset on|off").
+extern std::atomic<bool> g_vrPreset;
+// Invio delle immagini nello stesso tick quando la GPU ha margine
+// ("lowlatency on|off").
+extern std::atomic<bool> g_lowLatency;
+// Risoluzione del gioco = quella consigliata da SteamVR per un occhio (che
+// segue il cursore della risoluzione di SteamVR), "resolution auto"; oppure
+// quella della finestra (ResX/ResY), "resolution window".
+extern std::atomic<bool> g_autoResolution;
+// Misura del tempo GPU con query di timestamp ("gputimer on|off").
+extern std::atomic<bool> g_gpuTimer;
+// Quest via Link: l'ASW di Meta, una volta acceso, blocca il gioco a meta'
+// frequenza (36 fps a 72 Hz) anche con margine. "linkasw off" (predefinito):
+// spento all'avvio della sessione VR e rimesso su Auto all'uscita del gioco;
+// "linkasw keep": non si tocca.
+extern std::atomic<bool> g_linkAswOff;
+// Motion Smoothing di SteamVR (Index, Vive, Pimax, WMR) spento solo per
+// questo gioco ("motionsmoothing off|keep").
+extern std::atomic<bool> g_motionSmoothingOff;
+// OneFrameThreadLag di UE3 ("threadlag on|off", predefinito on come nel gioco).
+extern std::atomic<bool> g_threadLag;
+// Pose dei controller riportate al riferimento dei Touch tramite il punto
+// "tip" del modello SteamVR, cosi' la mira e' uguale con ogni controller
+// ("controllerpose auto|raw").
+extern std::atomic<bool> g_poseCorrect;
 // Scrive "chiave valore" in specopsvr.ini (sostituisce la riga o la aggiunge).
 void SaveIniValue(const std::string& key, const std::string& value);
 extern std::atomic<float> g_armRotDeg[3];

@@ -360,10 +360,25 @@ void RunConsole(void* pc, const std::string& cmd) {
         uint32_t writeToLog;
         void* retData;
         int32_t retNum, retMax;
-    } parms = {text, n + 1, n + 1, 1, nullptr, 0, 0};
+    } parms = {text, n + 1, n + 1, 0, nullptr, 0, 0};
     vr::log::Line("CONSOLE: " + cmd);
     bool ok = CallProcessEvent(pc, func, &parms);
     if (!ok) vr::log::Line("CONSOLE: exception in ProcessEvent");
+    // Testo restituito dal comando (es. "scale dump"), riga per riga.
+    if (ok && parms.retData && parms.retNum > 1 && parms.retNum < 200000) {
+        const wchar_t* w = static_cast<const wchar_t*>(parms.retData);
+        std::string line;
+        for (int i = 0; i < parms.retNum - 1; ++i) {
+            wchar_t c = w[i];
+            if (c == 10 || c == 13) {
+                if (!line.empty()) vr::log::Line("CONSOLE> " + line);
+                line.clear();
+            } else {
+                line += (c < 128 ? static_cast<char>(c) : '?');
+            }
+        }
+        if (!line.empty()) vr::log::Line("CONSOLE> " + line);
+    }
 }
 
 }  // namespace
@@ -460,5 +475,7 @@ void Tick(void* pc, void* pawn) {
     vr::log::Line("GIVEWEAPON " + cls + ": " + (ok ? (parms.ret ? "weapon given (" + ClassName(parms.ret) + ")" : "no weapon")
                                                   : "exception in ProcessEvent"));
 }
+
+void ExecConsole(void* pc, const std::string& command) { RunConsole(pc, command); }
 
 }  // namespace vr::script

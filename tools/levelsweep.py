@@ -37,7 +37,10 @@ def _find_save_dir():
 
 
 SAVE_DIR = _find_save_dir()
-SAVE_BACKUP = os.path.join(ROOT, 'savebackup_20261017')
+# Backup fresco a ogni esecuzione: ripristinare sempre la copia del 17/10
+# avrebbe cancellato i progressi fatti giocando dopo (18/10). Se un test si
+# interrompe prima del ripristino, la cartella resta: "restore_saves <cartella>".
+SAVE_BACKUP = os.path.join(ROOT, 'savebackup_' + time.strftime('%Y%m%d_%H%M%S'))
 MAPS = ['SP_Desert01_p', 'SP_Desert02_p', 'SP_Gorge01_P', 'SP_Gorge02_P', 'SP_CityGate01_P', 'SP_CityGate02_p',
         'SP_Road_P', 'SP_ShipsGraveyard_P', 'SP_StealingWater01_p', 'SP_StealingWater02_p', 'SP_Atrium01_P',
         'SP_Atrium02_P', 'SP_RadioMan02_P', 'SP_RadioMan03_P', 'SP_Bridge_p', 'SP_DollsHouse_P',
@@ -53,12 +56,13 @@ def backup_saves():
         print('backup dei salvataggi in', SAVE_BACKUP)
 
 
-def restore_saves():
-    for f in os.listdir(SAVE_BACKUP):
+def restore_saves(folder=None):
+    folder = folder or SAVE_BACKUP
+    for f in os.listdir(folder):
         dst = os.path.join(SAVE_DIR, f)
-        shutil.copyfile(os.path.join(SAVE_BACKUP, f), dst)
+        shutil.copyfile(os.path.join(folder, f), dst)
         os.utime(dst, None)  # piu' recente della copia nel cloud: Steam tiene questa
-    print('salvataggi originali ripristinati')
+    print('salvataggi ripristinati da', folder)
 
 
 def gamectl(*args, timeout=900):

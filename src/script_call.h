@@ -20,6 +20,8 @@ bool IsA(void* obj, const char* base);
 void QueueGiveWeapon(const std::string& weaponClass);
 // "console <comando>": PlayerController.ConsoleCommand (es. "open SP_Gorge01_P").
 void QueueConsole(const std::string& command);
+// Thread di gioco: esegue subito un comando da console (PlayerController).
+void ExecConsole(void* pc, const std::string& command);
 // Indice FName di un testo (senza distinzione maiuscole), -1 se non esiste.
 // Il risultato e' messo in cache.
 int32_t NameIndex(const std::string& text);

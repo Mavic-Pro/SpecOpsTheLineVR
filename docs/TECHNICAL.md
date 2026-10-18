@@ -71,6 +71,97 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 - **Cinema screen**: entered only after 0.6 s of cinematic mode (0.15 s when
   the camera leaves Walker), so short scripted moments stay in VR.
 
+## Per-eye projection and view state (0.9.4)
+
+- Off-center projection: `FPerspectiveMatrix(HalfFOV, W, H, MinZ)`
+  (`0x009EAE80`, thiscall) is hooked; when it returns to
+  `ULocalPlayer::CalcSceneView` (`0x0075CAC5` / `0x0075CBBA`) during an eye's
+  Draw, M[0][0], M[1][1], M[2][0], M[2][1] are replaced with the eye's exact
+  frustum from `GetProjectionRaw` (Quest 3: m00 0.903, m11 0.835, m20
+  +-0.243, m21 -0.193). The whole back buffer is the eye: no crop, full
+  texture bounds; before, 1932x2087 of 2400x2500 pixels were used. The mode
+  travels in the frame tag, so crop/bounds, the aim marker, the HUD canvas
+  and the vignette always match how the image was drawn. Not used while a
+  sniper scope zooms (the game's mask is centred). Verified: the off-center
+  image equals the scaled crop of the symmetric one (mean difference 5/255,
+  moving squadmate only).
+- Per-eye view state: `ULocalPlayer.ViewState` (+0x88) holds occlusion
+  history and LOD fades. With one state for two views per tick, the left
+  eye's occlusion results decided what the right eye drew. The right eye now
+  gets its own state from `AllocateViewState` (`0x00C4F370`, `new
+  FSceneViewState`, 0x2F0 bytes), swapped in only for its Draw, re-created if
+  the engine re-creates its own. Frame-to-frame draw-call jitter per eye
+  dropped 2-8x in a still scene (`EYEDRAWS` line).
+- Canted displays (Pimax and similar): `GetEyeToHeadTransform` also carries
+  a rotation of each eye, and `GetProjectionRaw` tangents are in that rotated
+  eye frame. With the off-center projection the eye's view rotation is the
+  head rotation composed with the eye's (in the `GetPlayerViewPoint` hook, so
+  the aim marker follows), and the HUD is moved to the head-forward direction
+  inside each eye. Logged as `VR-FOV: left eye canted N degrees`. Headsets
+  with parallel eyes (Quest, Index, Vive, Pico...) are unaffected.
+  `eyecant <deg>` simulates it for testing: at 10 degrees the left eye image
+  moves 105 px right on a 1200 px shot (expected ~95).
+- GPU timing (0.9.4): D3D9 timestamp queries from the first draw after a
+  Present to the Present, read back a few frames later without waiting;
+  `GPU:` line = both eyes per tick, max, headset frame time, scene percent and
+  the game-thread Draw to render-thread Present latency.
+- Dynamic resolution: `ScreenPercentage` (UE3 `scale set`) draws the scene in
+  a centred sub-rectangle and, in this build, does not upscale it
+  (`UpscaleScreenPercentage` has no effect); the mod crops that rectangle and
+  the compositor scales it. The percentage travels in the frame tag; `dynres
+  test` (alternating 100/70% every 0.5 s, checking the scene viewport of every
+  frame) found 0 wrong crops in 1200 frames. Controller: every 0.7 s,
+  `pct * sqrt(0.85 * frame / gpu)`, -10/+5 steps of 5, between `dynres min`
+  and 100, only in stereo gameplay (100% on the cinema screen). `dynres budget
+  <ms>` fakes the headset frame for tests (3 ms: down to 65%; 12 ms: back to
+  100%). Changing it costs at most one ~20 ms frame.
+- GPU A/B (scale set, still scene, each setting A/B/A/B): AmbientOcclusion
+  -15%, FilteredDistortion -17%, Distortion -9%, ScreenPercentage 70 -25%;
+  Bloom, LensFlares, FogVolumes, DynamicShadows, whole-scene dominant shadows,
+  MaxShadowResolution, ShadowFilterQualityBias, MaxAnisotropy, DetailMode all
+  under 5%. `vrpreset` turns off the first two. `OneFrameThreadLag` off
+  (Draw->Present 4.1 -> 1.9 ms at 300 fps, ~14 -> ~3 ms in the headset) was
+  in the preset at first, but in the headset it serialises the game and
+  render threads: 48-53 fps instead of 75-86 in a chapter 1 fight. It stays
+  as in the game (`threadlag off` to try it). `scale dump` output is not returned to the
+  console; `ConsoleCommand` output is now logged as `CONSOLE>`.
+- Same-tick submit: after the right eye's Present the render thread waits up
+  to a quarter of the headset frame for both GPU copies and hands this tick's
+  pair to the output thread (before: always the previous tick's pair). Only
+  with GPU time under half the frame; both eyes or neither. Forced Scene test:
+  1198 of 1201 pairs in the same tick, no repeated eyes, tags agree.
+- `resolution auto`: `GetRecommendedRenderTargetSize` (per eye, includes the
+  SteamVR resolution slider) applied with `setres WxHw` when it differs by more
+  than 4%, max 4096 (display_spoof desktop). Quest 3 here: 2528x2776; the
+  device reset went through and the game kept running.
+- Meta ASW (Quest over Link), first headset test of 0.9.4: 36 fps locked, GPU
+  6 ms of 13.9, compositor wait 17-20 ms per frame; `OculusDebugToolCLI -f`
+  with `server: asw.Off` -> 70-72 fps at once. `linkasw off` (default) does
+  this when the first Scene session starts on an `oculus` tracking system,
+  and a hidden PowerShell (`Wait-Process` on the game) sets `asw.Auto` back
+  when the game exits.
+- SteamVR Motion Smoothing: per-application override
+  `motionSmoothingOverride = 2` in the game's app section
+  (`GetApplicationKeyByProcessId`, normally `steam.app.50300`) through
+  `IVRSettings`. Values from the SteamVR dashboard enum: 0 use global,
+  1 force on, 2 force off, 3 force always-on. Virtual Desktop's SSW has no API: detected from the
+  tracking system / model name and logged as a hint. Headset model and
+  tracking system are logged once (`VR: headset ...`).
+- Squad orders: `YCheapShooter` actors (simplified long-range shooters, e.g.
+  the billboard sniper of chapter 1, `m_health` +0x264) are not in the Pawn
+  list; they are found in GObjects (every 2 s while the squad button is held)
+  and accepted within 4 degrees without the visibility trace. The chosen
+  target is kept while within 1.5x the tolerance and only replaced by one at
+  least 40% better centred (switching every frame between two enemies made
+  the game reject the selection).
+- Not done, with reasons: texture pool size (in the encrypted engine ini, no
+  sign of streaming problems); LOD biases (GPU at ~4 ms of 13.9); rendering
+  both eyes as two views of one scene (UE3 splitscreen style): CPU tick is
+  3-4 ms for both eyes at 250+ fps, so the gain does not justify the risk, and
+  it would lose the per-eye view states.
+- `HITCHES` (every 300 stereo ticks): ticks over 20 ms and the longest one;
+  gaps over 1 s (cinema screen, loading) are no longer counted as ticks.
+
 ## Camera and head tracking
 
 - The game copies the camera point of view with `memcpy`; the mod replaces
@@ -169,8 +260,15 @@ Useful offsets (`ue3.py props`):
   `YPlayerController.SetAsCurrentSelectedMarkable` (screen distance 0), before
   and after the frame is drawn.
 - Cover: body yaw changes made by the game (not by the stick or the mod, more
-  than 7 degrees in a frame, e.g. the ~50 degree snap when taking cover) are
-  moved into the yaw reference, so the view does not spin (`coversnap`).
+  than 7 degrees in a frame) are moved into the yaw reference, so the view
+  does not spin (`coversnap`). Since 0.9.4 only within 1.5 s of cover or a
+  special move (`YGamePawn.m_specialMove` +0x491: 19 = entering cover, the
+  turn happens there while `m_coverFaceState` is still 0; 20 = leaving), with
+  a 0.4 s window for a turn that comes just before the special move. Measured
+  on 18/10: entering cover turns only the Pawn (+0x64), the PlayerController
+  yaw does not change; every compensation in the logs until then was a
+  checkpoint jump, a mode switch or a scripted turn, which left Walker's
+  body turned away from the view (stick forward walked into walls).
   In cover, raising the head 12 cm or leaning 18 cm from where it was when
   entering cover holds LT: Walker pops out to aim (`coverpeek`).
 - Turrets (`YWeapon_Stationary`): the PlayerController is steered towards the
@@ -253,9 +351,29 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
 
 ## Input
 
-- Touch controllers are read through the OpenVR legacy API and returned to
-  the game from hooked `XInputGetState` / `XInputSetState` (IAT `0x0110974C` /
-  `0x01109748`). The game's actions come from `YGamepadInputScheme`.
+- Controllers are returned to the game as an Xbox pad from hooked
+  `XInputGetState` / `XInputSetState` (IAT `0x0110974C` / `0x01109748`). The
+  game's actions come from `YGamepadInputScheme`.
+- Since 0.9.4 they are read through SteamVR Input (`vrinput actions`). The
+  legacy API maps every controller onto the old Vive layout: on Index
+  controllers `A` arrives as grip and there is no `X`/`A` at all
+  (`legacy_bindings_index_controller.json`), so cover and reload were missing.
+  The dll writes `specopsvr_inputctions.json` and default bindings for
+  `oculus_touch`, `knuckles`, `vive_controller` and `holographic_controller`
+  next to the game (so they also arrive with the auto-updater), calls
+  `SetActionManifestPath` once per OpenVR session (Scene only), and turns the
+  actions back into the Touch legacy state the rest of the code reads (axis 0
+  stick, axis 1 trigger, Grip, A = primary, ApplicationMenu = secondary,
+  Touchpad = stick click, System = left menu). Haptics go through
+  `TriggerHapticVibrationAction`. SteamVR registers the app as
+  `steam.app.50300`, so players can rebind it in the SteamVR binding UI.
+  `vrinput legacy` restores the old path.
+- Controller pose: aiming and the gun are tuned on the Touch raw pose. Other
+  controllers' raw poses differ (Vive: ~38 degrees), so the pose is converted
+  with the `tip` component of the SteamVR render models:
+  `raw * tip(controller) * inverse(tip(Touch))` (`controllerpose auto`).
+  Touch controllers (`oculus_*` models) are left untouched; the correction
+  is logged once per controller (`INPUT: right controller knuckles ...`).
 - Gestures are detected from controller and headset poses and velocities and
   injected as short button presses.
 

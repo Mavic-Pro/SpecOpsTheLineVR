@@ -16,6 +16,7 @@ namespace {
 SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<bool> g_ready{false};
 std::atomic<bool> g_scene{false};
+std::atomic<unsigned> g_generation{0};
 
 const char* TypeName(vr::EVRApplicationType t) { return t == vr::VRApplication_Scene ? "Scene" : "Background"; }
 
@@ -31,9 +32,136 @@ bool InitAs(vr::EVRApplicationType type) {
         return false;
     }
     g_ready = true;
+    ++g_generation;
     g_scene = (type == vr::VRApplication_Scene);
     vr::log::Line(std::string("OpenVR initialised as ") + TypeName(type) + ".");
     return true;
+}
+
+// --- ASW di Meta (Quest via Link) --------------------------------------------
+//
+// 18/10, prova col visore: 36 fps fissi con la GPU a 6 ms su 13,9; l'attesa
+// del compositor era di 17-20 ms per frame. Spento l'ASW con l'Oculus Debug
+// Tool il gioco e' tornato subito a 70-72 fps. L'ASW non serve: la
+// risoluzione dinamica tiene il frame e le immagini partono con la loro posa.
+// OculusDebugToolCLI.exe -f <file> con "server: asw.Off"; un PowerShell
+// nascosto aspetta la chiusura del gioco e lo rimette su Auto (l'impostazione
+// vale fino al riavvio del servizio Oculus e toccherebbe anche gli altri giochi).
+void RunOdtCommands(const std::string& odt, const std::string& dir, const char* name, const char* commands) {
+    std::string file = dir + name;
+    HANDLE f = CreateFileA(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD put = 0;
+    WriteFile(f, commands, static_cast<DWORD>(strlen(commands)), &put, nullptr);
+    CloseHandle(f);
+    std::string cmd = "\"" + odt + "\" -f \"" + file + "\"";
+    STARTUPINFOA si = {sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 15000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+// Ricostruzione dei frame mancanti per piattaforma (stesso problema dell'ASW:
+// puo' tenere il gioco a meta' frequenza anche con margine):
+// - SteamVR nativo (Index, Vive, Pimax, WMR): Motion Smoothing, spento solo
+//   per questo gioco con l'override per applicazione di SteamVR
+//   (motionSmoothingOverride: 0 globale, 1 forzato acceso, 2 spento, 3 sempre
+//   acceso: enum della dashboard di SteamVR, chunk~8012d0c89.js);
+//   resta salvato in steamvr.vrsettings solo per Spec Ops.
+// - Virtual Desktop: l'SSW si imposta solo dallo Streamer di VD: lo si segnala
+//   nel log.
+// - Quest via Link: ASW di Meta (sotto).
+void ConfigureReprojection() {
+    static bool done = false;
+    if (done) return;
+    char system[64] = {}, model[128] = {}, appKey[128] = {};
+    {
+        Shared s;
+        if (!vr::VRSystem()) return;
+        vr::VRSystem()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String,
+                                                       system, sizeof(system));
+        vr::VRSystem()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_ModelNumber_String, model,
+                                                       sizeof(model));
+        done = true;
+        vr::log::Line(std::string("VR: headset ") + model + ", tracking system " + system + ".");
+        if (vr::control::g_motionSmoothingOff && vr::VRSettings() && vr::VRApplications() &&
+            vr::VRApplications()->GetApplicationKeyByProcessId(GetCurrentProcessId(), appKey, sizeof(appKey)) ==
+                vr::VRApplicationError_None &&
+            appKey[0]) {
+            vr::EVRSettingsError e = vr::VRSettingsError_None;
+            int32_t cur = vr::VRSettings()->GetInt32(appKey, vr::k_pch_SteamVR_MotionSmoothingOverride_Int32, &e);
+            if (e != vr::VRSettingsError_None || cur != 2) {
+                vr::VRSettings()->SetInt32(appKey, vr::k_pch_SteamVR_MotionSmoothingOverride_Int32, 2, &e);
+                vr::log::Line(std::string("VR: SteamVR Motion Smoothing forced off for ") + appKey +
+                              (e == vr::VRSettingsError_None ? "." : " FAILED (" + std::to_string(e) + ")."));
+            }
+        }
+    }
+    std::string sys(system);
+    for (char& c : sys) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (sys.find("virtual") != std::string::npos || std::string(model).find("Virtual Desktop") != std::string::npos)
+        vr::log::Line("VR: Virtual Desktop detected. If the game stays at half the headset refresh rate, set "
+                      "\"Synchronous Spacewarp\" to Disabled in the Virtual Desktop Streamer settings.");
+    if (sys != "oculus" || !vr::control::g_linkAswOff) return;  // ASW: solo Link
+    // Il gioco e' a 32 bit: qui "ProgramFiles" e' Program Files (x86). Prima
+    // OculusBase (impostata dall'installazione di Meta), poi ProgramW6432.
+    std::string odt;
+    char buf[MAX_PATH] = {};
+    if (GetEnvironmentVariableA("OculusBase", buf, MAX_PATH)) {
+        odt = buf;
+        if (!odt.empty() && odt.back() != '\\') odt += '\\';
+        odt += "Support\\oculus-diagnostics\\OculusDebugToolCLI.exe";
+    }
+    if ((odt.empty() || GetFileAttributesA(odt.c_str()) == INVALID_FILE_ATTRIBUTES) &&
+        GetEnvironmentVariableA("ProgramW6432", buf, MAX_PATH))
+        odt = std::string(buf) + "\\Oculus\\Support\\oculus-diagnostics\\OculusDebugToolCLI.exe";
+    if (odt.empty() || GetFileAttributesA(odt.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        vr::log::Line("ASW: Oculus Debug Tool not found, Meta ASW left as it is.");
+        return;
+    }
+    char tmp[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, tmp);
+    std::string dir(tmp);
+    std::thread([odt, dir] {
+        RunOdtCommands(odt, dir, "specopsvr_asw_off.txt", "server: asw.Off\nexit\n");
+        vr::log::Line("ASW: Meta ASW turned off for this session (\"linkasw keep\" in specopsvr.ini to leave it).");
+        // Rimesso su Auto quando il gioco si chiude.
+        std::string restore = dir + "specopsvr_asw_auto.txt";
+        HANDLE f = CreateFileA(restore.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            const char* c = "server: asw.Auto\nexit\n";
+            DWORD put = 0;
+            WriteFile(f, c, static_cast<DWORD>(strlen(c)), &put, nullptr);
+            CloseHandle(f);
+        }
+        std::string ps = "powershell -NoProfile -WindowStyle Hidden -Command \"Wait-Process -Id " +
+                         std::to_string(GetCurrentProcessId()) + "; & '" + odt + "' -f '" + restore + "'\"";
+        STARTUPINFOA si = {sizeof(si)};
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+        // Niente DETACHED_PROCESS: senza console PowerShell esce subito senza
+        // eseguire nulla (provato il 18/10). Fuori dal job di Steam se
+        // possibile, cosi' non viene chiuso insieme al gioco.
+        std::string ps2 = ps;
+        bool ok = CreateProcessA(nullptr, &ps[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+                                 nullptr, nullptr, &si, &pi) != FALSE;
+        if (!ok)
+            ok = CreateProcessA(nullptr, &ps2[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) !=
+                 FALSE;
+        if (ok) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        vr::log::Line(ok ? "ASW: Meta ASW goes back to Auto when the game closes."
+                         : "ASW: could not start the restore helper (" + std::to_string(GetLastError()) +
+                               "): run the Oculus Debug Tool to set ASW back to Auto.");
+    }).detach();
 }
 
 void Switch(vr::EVRApplicationType type) {
@@ -94,6 +222,7 @@ void MonitorLoop() {
         if (wantScene) {
             inactiveSince = 0;
             if (!g_scene) Switch(vr::VRApplication_Scene);
+            if (g_scene) ConfigureReprojection();
         } else if (g_scene) {
             if (!inactiveSince) inactiveSince = now;
             if (now - inactiveSince > 20000) {
@@ -119,6 +248,7 @@ Shared::~Shared() {
 bool Ready() { return g_ready; }
 bool IsScene() { return g_scene; }
 bool HmdPresent() { return g_present; }
+unsigned Generation() { return g_generation; }
 
 bool Init() {
     // Senza SteamVR in esecuzione un'app Background non puo' partire: in quel

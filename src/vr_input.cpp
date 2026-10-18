@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -70,6 +71,330 @@ bool ButtonPressed(const vr::VRControllerState_t& s, vr::EVRButtonId id) {
     return (s.ulButtonPressed & vr::ButtonMaskFromId(id)) != 0;
 }
 
+// --- SteamVR Input (18/10) ----------------------------------------------------
+//
+// Con l'API legacy SteamVR traduce ogni controller nel layout dei vecchi
+// controller Vive: sugli Index "A" arriva come grip e X/A non esistono
+// (legacy_bindings_index_controller.json), quindi copertura e ricarica
+// mancavano ("my index controllers are probably missing bindings", 18/10).
+// Con un manifest di azioni ogni controller ha i suoi binding predefiniti
+// e il giocatore puo' cambiarli in SteamVR. Le azioni vengono poi rimesse nello
+// stesso stato "legacy dei Touch" letto dal resto del codice (asse 0 = stick,
+// asse 1 = grilletto, Grip, A = primario, ApplicationMenu = secondario,
+// SteamVR_Touchpad = clic dello stick, System = menu sinistro).
+// Il manifest e i binding li scrive la dll accanto al gioco (cartella
+// specopsvr_input), cosi' arrivano anche con l'aggiornamento automatico.
+namespace act {
+
+const char* const kHand[2] = {"left", "right"};
+const char* const kNames[] = {"stick", "trigger", "grip", "primary", "secondary", "stickclick", "menu"};
+enum { kStick, kTrigger, kGrip, kPrimary, kSecondary, kStickClick, kMenu, kCount };
+
+struct Bind {
+    int hand;  // 0 sinistra, 1 destra, -1 entrambe
+    const char* input;
+    const char* mode;
+    const char* key;
+    int action;
+};
+struct Profile {
+    const char* type;
+    std::vector<Bind> binds;
+};
+
+const std::vector<Profile>& Profiles() {
+    static const std::vector<Profile> p = {
+        {"oculus_touch",
+         {{-1, "joystick", "joystick", "position", kStick}, {-1, "joystick", "joystick", "click", kStickClick},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "trigger", "click", kGrip},
+          {1, "a", "button", "click", kPrimary}, {1, "b", "button", "click", kSecondary},
+          {0, "x", "button", "click", kPrimary}, {0, "y", "button", "click", kSecondary},
+          {0, "system", "button", "click", kMenu}}},
+        {"knuckles",
+         {{-1, "thumbstick", "joystick", "position", kStick}, {-1, "thumbstick", "joystick", "click", kStickClick},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "trigger", "click", kGrip},
+          {-1, "a", "button", "click", kPrimary}, {-1, "b", "button", "click", kSecondary},
+          {0, "trackpad", "button", "click", kMenu}}},
+        {"vive_controller",
+         {{-1, "trackpad", "trackpad", "position", kStick}, {-1, "trackpad", "trackpad", "click", kStickClick},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "button", "click", kGrip},
+          {0, "application_menu", "button", "click", kMenu}, {1, "application_menu", "button", "click", kPrimary}}},
+        {"holographic_controller",
+         {{-1, "joystick", "joystick", "position", kStick}, {-1, "joystick", "joystick", "click", kStickClick},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "button", "click", kGrip},
+          {-1, "trackpad", "button", "click", kPrimary}, {0, "application_menu", "button", "click", kMenu},
+          {1, "application_menu", "button", "click", kSecondary}}},
+    };
+    return p;
+}
+
+std::string ActionName(int hand, int a) {
+    return std::string("/actions/main/in/") + kHand[hand] + "_" + kNames[a];
+}
+
+std::string BindingJson(const Profile& p) {
+    // Una sorgente per (mano, ingresso, modo) con tutti i suoi tasti.
+    struct Src {
+        int hand;
+        std::string input, mode, inputs;
+    };
+    std::vector<Src> src;
+    for (const Bind& b : p.binds) {
+        for (int h = 0; h < 2; ++h) {
+            if (b.hand != -1 && b.hand != h) continue;
+            Src* s = nullptr;
+            for (Src& x : src)
+                if (x.hand == h && x.input == b.input && x.mode == b.mode) s = &x;
+            if (!s) {
+                src.push_back({h, b.input, b.mode, ""});
+                s = &src.back();
+            }
+            if (!s->inputs.empty()) s->inputs += ",";
+            s->inputs += std::string("\"") + b.key + "\":{\"output\":\"" + ActionName(h, b.action) + "\"}";
+        }
+    }
+    std::string j = std::string("{\"controller_type\":\"") + p.type +
+                    "\",\"action_manifest_version\":1,\"name\":\"SpecOpsTheLineVR default\","
+                    "\"description\":\"Spec Ops: The Line VR default bindings\",\"bindings\":{\"/actions/main\":{\"sources\":[";
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (i) j += ",";
+        j += std::string("{\"path\":\"/user/hand/") + kHand[src[i].hand] + "/input/" + src[i].input + "\",\"mode\":\"" +
+             src[i].mode + "\",\"inputs\":{" + src[i].inputs + "}}";
+    }
+    j += "],\"haptics\":[{\"output\":\"/actions/main/out/haptic_left\",\"path\":\"/user/hand/left/output/haptic\"},"
+         "{\"output\":\"/actions/main/out/haptic_right\",\"path\":\"/user/hand/right/output/haptic\"}]}}}";
+    return j;
+}
+
+std::string ManifestJson() {
+    static const char* const kTypes[] = {"vector2", "vector1", "boolean", "boolean", "boolean", "boolean", "boolean"};
+    static const char* const kLabel[] = {"stick", "trigger", "grip", "A / X button", "B / Y button", "stick click",
+                                         "pause menu"};
+    std::string j = "{\"default_bindings\":[";
+    for (size_t i = 0; i < Profiles().size(); ++i) {
+        if (i) j += ",";
+        j += std::string("{\"controller_type\":\"") + Profiles()[i].type + "\",\"binding_url\":\"bindings_" +
+             Profiles()[i].type + ".json\"}";
+    }
+    j += "],\"actions\":[";
+    std::string loc = "\"language_tag\":\"en_US\",\"/actions/main\":\"Spec Ops: The Line VR\"";
+    for (int h = 0; h < 2; ++h) {
+        for (int a = 0; a < kCount; ++a) {
+            j += "{\"name\":\"" + ActionName(h, a) + "\",\"type\":\"" + kTypes[a] + "\"},";
+            loc += ",\"" + ActionName(h, a) + "\":\"" + (h ? "Right " : "Left ") + kLabel[a] + "\"";
+        }
+    }
+    j += "{\"name\":\"/actions/main/out/haptic_left\",\"type\":\"vibration\"},"
+         "{\"name\":\"/actions/main/out/haptic_right\",\"type\":\"vibration\"}],"
+         "\"action_sets\":[{\"name\":\"/actions/main\",\"usage\":\"leftright\"}],\"localization\":[{" +
+         loc + ",\"/actions/main/out/haptic_left\":\"Left haptics\",\"/actions/main/out/haptic_right\":\"Right haptics\"}]}";
+    return j;
+}
+
+bool WriteIfChanged(const std::string& path, const std::string& text) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        std::string old(static_cast<size_t>(GetFileSize(f, nullptr)), '\0');
+        DWORD got = 0;
+        bool same = old.size() == text.size() && ReadFile(f, &old[0], static_cast<DWORD>(old.size()), &got, nullptr) &&
+                    old == text;
+        CloseHandle(f);
+        if (same) return true;
+    }
+    f = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    bool ok = WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &put, nullptr) && put == text.size();
+    CloseHandle(f);
+    return ok;
+}
+
+// Scrive i file e restituisce il percorso del manifest ("" se fallisce).
+std::string WriteFiles() {
+    char path[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&WriteFiles), &self);
+    GetModuleFileNameA(self, path, MAX_PATH);
+    std::string dir(path);
+    dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "specopsvr_input\\";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    for (const Profile& p : Profiles())
+        if (!WriteIfChanged(dir + "bindings_" + p.type + ".json", BindingJson(p))) return "";
+    if (!WriteIfChanged(dir + "actions.json", ManifestJson())) return "";
+    return dir + "actions.json";
+}
+
+vr::VRActionSetHandle_t g_set = vr::k_ulInvalidActionSetHandle;
+vr::VRActionHandle_t g_action[2][kCount];
+vr::VRActionHandle_t g_haptic[2];
+unsigned g_gen = 0;      // generazione della sessione per cui valgono gli handle
+bool g_ready = false;    // azioni attive in questa generazione
+
+// Con il lock di sessione, dal thread che legge il pad. Solo in Scene (le app
+// Background non ricevono input).
+bool Ensure() {
+    if (!vr::control::g_actionInput || !vr::session::IsScene()) return false;
+    unsigned gen = vr::session::Generation();
+    if (gen == g_gen) return g_ready;
+    g_gen = gen;
+    g_ready = false;
+    vr::IVRInput* in = vr::VRInput();
+    if (!in) return false;
+    static std::string manifest = WriteFiles();
+    if (manifest.empty()) {
+        vr::log::Line("INPUT: could not write specopsvr_input\\*.json, using the legacy input API.");
+        return false;
+    }
+    vr::EVRInputError e = in->SetActionManifestPath(manifest.c_str());
+    if (e != vr::VRInputError_None) {
+        vr::log::Line("INPUT: SetActionManifestPath failed (" + std::to_string(e) + "), using the legacy input API.");
+        return false;
+    }
+    in->GetActionSetHandle("/actions/main", &g_set);
+    for (int h = 0; h < 2; ++h) {
+        for (int a = 0; a < kCount; ++a) in->GetActionHandle(ActionName(h, a).c_str(), &g_action[h][a]);
+        in->GetActionHandle(h ? "/actions/main/out/haptic_right" : "/actions/main/out/haptic_left", &g_haptic[h]);
+    }
+    g_ready = true;
+    vr::log::Line("INPUT: SteamVR Input actions active (" + manifest + ").");
+    return true;
+}
+
+// Stato in formato "legacy dei Touch" per una mano; false se la mano non da' dati.
+bool ReadHand(vr::IVRInput* in, int h, vr::VRControllerState_t* s) {
+    *s = {};
+    bool any = false;
+    vr::InputAnalogActionData_t an = {};
+    if (in->GetAnalogActionData(g_action[h][kStick], &an, sizeof(an), vr::k_ulInvalidInputValueHandle) ==
+            vr::VRInputError_None && an.bActive) {
+        s->rAxis[0].x = an.x;
+        s->rAxis[0].y = an.y;
+        any = true;
+    }
+    if (in->GetAnalogActionData(g_action[h][kTrigger], &an, sizeof(an), vr::k_ulInvalidInputValueHandle) ==
+            vr::VRInputError_None && an.bActive) {
+        s->rAxis[1].x = an.x;
+        any = true;
+    }
+    static const vr::EVRButtonId kBit[kCount] = {vr::k_EButton_Max, vr::k_EButton_Max, vr::k_EButton_Grip, vr::k_EButton_A,
+                                                 vr::k_EButton_ApplicationMenu, vr::k_EButton_SteamVR_Touchpad,
+                                                 vr::k_EButton_System};
+    for (int a = kGrip; a < kCount; ++a) {
+        vr::InputDigitalActionData_t d = {};
+        if (in->GetDigitalActionData(g_action[h][a], &d, sizeof(d), vr::k_ulInvalidInputValueHandle) !=
+                vr::VRInputError_None || !d.bActive)
+            continue;
+        any = true;
+        if (d.bState) s->ulButtonPressed |= vr::ButtonMaskFromId(kBit[a]);
+    }
+    return any;
+}
+
+}  // namespace act
+
+// Ultimo stato letto dei controller (anche per i gesti, su un altro thread).
+std::mutex g_handStateMutex;
+vr::VRControllerState_t g_handState[2] = {};
+bool g_handStateValid[2] = {false, false};
+
+// --- Pose dei controller --------------------------------------------------------
+//
+// Mira e fucile sono tarati sulla posa "raw" dei Touch. La posa raw cambia da
+// un controller all'altro (Vive: ~38 gradi; Index: qualche grado e qualche
+// cm), mentre il punto "tip" dei modelli SteamVR indica per tutti la
+// direzione in cui si punta. Correzione: raw * tip(controller) * inv(tip(Touch)).
+struct Mat34 {
+    float m[3][4];
+};
+
+Mat34 Mul(const Mat34& a, const Mat34& b) {
+    Mat34 r = {};
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float v = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] + a.m[i][2] * b.m[2][j];
+            if (j == 3) v += a.m[i][3];
+            r.m[i][j] = v;
+        }
+    }
+    return r;
+}
+
+Mat34 Inverse(const Mat34& a) {  // solo rotazione + traslazione
+    Mat34 r = {};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) r.m[i][j] = a.m[j][i];
+    for (int i = 0; i < 3; ++i) r.m[i][3] = -(r.m[i][0] * a.m[0][3] + r.m[i][1] * a.m[1][3] + r.m[i][2] * a.m[2][3]);
+    return r;
+}
+
+Mat34 FromHmd(const vr::HmdMatrix34_t& h) {
+    Mat34 r;
+    std::memcpy(r.m, h.m, sizeof(r.m));
+    return r;
+}
+
+// Componente "tip" di un modello (false se il modello non lo ha o non e'
+// ancora caricato: il caricamento parte qui e si riprova al frame dopo).
+bool TipOf(const char* model, Mat34* out) {
+    vr::IVRRenderModels* rm = vr::VRRenderModels();
+    if (!rm || !model || !*model) return false;
+    if (rm->GetComponentCount(model) == 0) {
+        vr::RenderModel_t* m = nullptr;
+        if (rm->LoadRenderModel_Async(model, &m) == vr::VRRenderModelError_None && m) rm->FreeRenderModel(m);
+        if (rm->GetComponentCount(model) == 0) return false;
+    }
+    vr::VRControllerState_t cs = {};
+    vr::RenderModel_ControllerMode_State_t mode = {};
+    vr::RenderModel_ComponentState_t comp = {};
+    if (!rm->GetComponentState(model, "tip", &cs, &mode, &comp)) return false;
+    *out = FromHmd(comp.mTrackingToComponentLocal);
+    return true;
+}
+
+struct PoseFix {
+    unsigned gen = 0;
+    std::string model;
+    bool valid = false;
+    int tries = 0;
+    Mat34 fix = {};
+};
+PoseFix g_poseFix[2];
+
+void UpdatePoseFix(vr::IVRSystem* sys, int h, vr::TrackedDeviceIndex_t idx) {
+    PoseFix& f = g_poseFix[h];
+    char model[256] = {};
+    sys->GetStringTrackedDeviceProperty(idx, vr::Prop_RenderModelName_String, model, sizeof(model));
+    unsigned gen = vr::session::Generation();
+    if (f.gen == gen && f.model == model) return;
+    if (f.model != model) f.tries = 0;
+    f.gen = gen;
+    f.model = model;
+    f.valid = false;
+    char type[64] = {};
+    sys->GetStringTrackedDeviceProperty(idx, vr::Prop_ControllerType_String, type, sizeof(type));
+    std::string what = std::string("INPUT: ") + act::kHand[h] + " controller " + type + " (" + model + ")";
+    if (std::strncmp(model, "oculus_", 7) == 0) {  // Touch: e' il riferimento
+        vr::log::Line(what + ", raw pose used.");
+        return;
+    }
+    Mat34 tip, tipRef;
+    if (!TipOf(model, &tip) || !TipOf(h ? "oculus_quest2_controller_right" : "oculus_quest2_controller_left", &tipRef)) {
+        // Modelli in caricamento: si riprova (circa 5 s), poi posa raw.
+        if (++f.tries < 300) f.gen = 0;  // generazione mai valida: si riprova
+        else vr::log::Line(what + ": no tip pose, raw pose used.");
+        return;
+    }
+    f.fix = Mul(tip, Inverse(tipRef));
+    f.valid = true;
+    float pitch = std::asin((std::max)(-1.0f, (std::min)(1.0f, f.fix.m[1][2]))) * 57.2957795f;
+    float yaw = std::atan2(f.fix.m[0][2], f.fix.m[2][2]) * 57.2957795f;
+    char b[200];
+    std::snprintf(b, sizeof(b), ": pose aligned to Touch (%.1f deg pitch, %.1f deg yaw, offset %.1f %.1f %.1f cm).", pitch,
+                  yaw, f.fix.m[0][3] * 100.0f, f.fix.m[1][3] * 100.0f, f.fix.m[2][3] * 100.0f);
+    vr::log::Line(what + b);
+}
+
 // Vibrazione: il gioco chiama XInputSetState solo quando cambia il motore,
 // mentre l'API legacy di SteamVR accetta impulsi di ~4 ms: l'intensita' viene
 // ricordata e l'impulso ripetuto a ogni lettura del pad (ogni frame) finche'
@@ -88,6 +413,11 @@ void UpdateHaptics(vr::IVRSystem* sys) {
         if (game && gunHand) us = static_cast<unsigned short>(600 + game / 20);
         if (now < g_hapticUntil[h]) us = 3500;
         if (!us) continue;
+        if (act::g_ready) {
+            vr::VRInput()->TriggerHapticVibrationAction(act::g_haptic[h], 0.0f, 0.02f, 150.0f,
+                                                        us > 3900 ? 1.0f : us / 3900.0f, vr::k_ulInvalidInputValueHandle);
+            continue;
+        }
         vr::TrackedDeviceIndex_t idx = sys->GetTrackedDeviceIndexForControllerRole(
             h == 0 ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
         if (idx != vr::k_unTrackedDeviceIndexInvalid) sys->TriggerHapticPulse(idx, 0, us > 3900 ? 3900 : us);
@@ -113,10 +443,40 @@ bool ReadTouchControllers(XGamepad* out) {
     vr::TrackedDeviceIndex_t left = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
     vr::TrackedDeviceIndex_t right = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
     vr::VRControllerState_t ls = {}, rs = {};
-    bool haveL = left != vr::k_unTrackedDeviceIndexInvalid && sys->IsTrackedDeviceConnected(left) &&
-                 sys->GetControllerState(left, &ls, sizeof(ls));
-    bool haveR = right != vr::k_unTrackedDeviceIndexInvalid && sys->IsTrackedDeviceConnected(right) &&
-                 sys->GetControllerState(right, &rs, sizeof(rs));
+    bool haveL = false, haveR = false;
+    static double lastActionRead = 0.0;
+    double nowMs = static_cast<double>(GetTickCount64());
+    if (act::Ensure() && nowMs - lastActionRead < 4.0) {
+        // Il gioco interroga il pad piu' volte per frame: le azioni si leggono
+        // al massimo ogni 4 ms, le altre volte vale l'ultimo stato.
+        std::lock_guard<std::mutex> lock(g_handStateMutex);
+        ls = g_handState[0];
+        rs = g_handState[1];
+        haveL = g_handStateValid[0];
+        haveR = g_handStateValid[1];
+    } else if (act::Ensure()) {
+        lastActionRead = nowMs;
+        vr::IVRInput* in = vr::VRInput();
+        vr::VRActiveActionSet_t set = {};
+        set.ulActionSet = act::g_set;
+        set.ulRestrictedToDevice = vr::k_ulInvalidInputValueHandle;
+        set.ulSecondaryActionSet = vr::k_ulInvalidActionSetHandle;
+        in->UpdateActionState(&set, sizeof(set), 1);
+        haveL = left != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, 0, &ls);
+        haveR = right != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, 1, &rs);
+    } else {
+        haveL = left != vr::k_unTrackedDeviceIndexInvalid && sys->IsTrackedDeviceConnected(left) &&
+                sys->GetControllerState(left, &ls, sizeof(ls));
+        haveR = right != vr::k_unTrackedDeviceIndexInvalid && sys->IsTrackedDeviceConnected(right) &&
+                sys->GetControllerState(right, &rs, sizeof(rs));
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_handStateMutex);
+        g_handState[0] = ls;
+        g_handState[1] = rs;
+        g_handStateValid[0] = haveL;
+        g_handStateValid[1] = haveR;
+    }
     if (!haveL && !haveR) return false;
     if (vr::control::g_inputLogFrames.load() > 0) {
         static ULONGLONG last = 0;
@@ -344,6 +704,7 @@ bool ReadGestureSample(GestureSample* s) {
     if (!sys) return false;
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
     sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses, vr::k_unMaxTrackedDeviceCount);
+    CorrectControllerPoses(sys, poses);
     const vr::TrackedDevicePose_t& h = poses[vr::k_unTrackedDeviceIndex_Hmd];
     if (!h.bPoseIsValid) return false;
     *s = {};
@@ -368,10 +729,10 @@ bool ReadGestureSample(GestureSample* s) {
     };
     s->leftValid = hand(vr::TrackedControllerRole_LeftHand, s->left, s->leftVel);
     s->rightValid = hand(vr::TrackedControllerRole_RightHand, s->right, nullptr);
-    vr::TrackedDeviceIndex_t ri = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
-    vr::VRControllerState_t rs = {};
-    if (ri != vr::k_unTrackedDeviceIndexInvalid && sys->GetControllerState(ri, &rs, sizeof(rs)))
-        s->rightGrip = GripValue(rs) > 0.6f;
+    {
+        std::lock_guard<std::mutex> lock(g_handStateMutex);  // letto da ReadTouchControllers
+        s->rightGrip = g_handStateValid[1] && GripValue(g_handState[1]) > 0.6f;
+    }
     if (g_gestures.TakeHaptic()) {
         ULONGLONG until = GetTickCount64() + 70;  // conferma del gesto su entrambe le mani
         g_hapticUntil[0] = until;
@@ -623,6 +984,19 @@ void InstallXInputHooks() {
     bool b = PatchSlot(kIatXInputSetState, "XInputSetState", reinterpret_cast<void*>(&Hooked_XInputSetState),
                        reinterpret_cast<void**>(&g_SetState_Real));
     vr::log::Line(std::string("INPUT: XInput hooks ") + (a && b ? "installed" : "NOT installed"));
+}
+
+void CorrectControllerPoses(vr::IVRSystem* sys, vr::TrackedDevicePose_t* poses) {
+    if (!vr::control::g_poseCorrect || !sys || !poses) return;
+    for (int h = 0; h < 2; ++h) {
+        vr::TrackedDeviceIndex_t idx = sys->GetTrackedDeviceIndexForControllerRole(
+            h ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
+        if (idx == vr::k_unTrackedDeviceIndexInvalid || idx >= vr::k_unMaxTrackedDeviceCount) continue;
+        UpdatePoseFix(sys, h, idx);
+        if (!g_poseFix[h].valid || !poses[idx].bPoseIsValid) continue;
+        Mat34 r = Mul(FromHmd(poses[idx].mDeviceToAbsoluteTracking), g_poseFix[h].fix);
+        std::memcpy(poses[idx].mDeviceToAbsoluteTracking.m, r.m, sizeof(r.m));
+    }
 }
 
 void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons, unsigned durationMs) {

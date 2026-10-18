@@ -88,6 +88,7 @@ struct EyePacket {
     uint32_t seq = 0;                   // numero del Present che l'ha prodotto
     bool poseValid = false;             // posa del visore usata per disegnarlo
     vr::HmdMatrix34_t pose = {};
+    vr::VRTextureBounds_t bounds = {0, 0, 1, 1};  // parte della texture con l'immagine
 };
 std::mutex g_mutex;
 std::condition_variable g_cv;
@@ -120,6 +121,22 @@ double QpcMs() {
 // del back buffer.
 vr::VRTextureBounds_t g_eyeBounds[2] = {{0, 0, 1, 1}, {0, 0, 1, 1}};
 RECT g_eyeCrop[2] = {};
+// Tangenti dei frustum degli occhi (GetProjectionRaw: sinistra, destra, alto,
+// basso; alto negativo = in su), per la proiezione decentrata.
+std::atomic<float> g_tan[2][4];
+std::atomic<bool> g_tanValid{false};
+// Display inclinati (Pimax e simili): rotazione di ogni occhio rispetto alla
+// testa (GetEyeToHeadTransform), come assi avanti/destra/su dell'occhio nella
+// testa di UE3 (componenti avanti, destra, su).
+std::atomic<float> g_eyeAxes[2][9];
+std::atomic<bool> g_eyeCanted[2];
+std::atomic<float> g_hmdHz{0.0f};
+std::atomic<float> g_sameTickWaitMs{0.0f};
+int g_renderPercent[2] = {100, 100};
+// Immagine disegnata con la proiezione decentrata (tutto il back buffer e'
+// l'occhio): niente ritaglio. Per occhio, dal frame tag.
+bool g_renderOffCenter[2] = {};
+vr::VRTextureBounds_t g_slotBounds[2][kSlots] = {};
 UINT g_cropW = 0, g_cropH = 0;
 float g_boundsForFov = -1.0f;
 
@@ -143,6 +160,25 @@ bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
     float maxH = 0.0f, maxV = 0.0f;
     for (int e = 0; e < 2; ++e) {
         sys->GetProjectionRaw(static_cast<vr::EVREye>(e), &l[e], &r[e], &t[e], &b[e]);
+        vr::HmdMatrix34_t eh = sys->GetEyeToHeadTransform(static_cast<vr::EVREye>(e));
+        // Colonne OpenVR: x destra, y su, z indietro; UE3: (avanti, destra, su) = (-z, x, y).
+        float ax[9] = {eh.m[2][2],  -eh.m[0][2], -eh.m[1][2],   // avanti = -colonna z
+                       -eh.m[2][0], eh.m[0][0],  eh.m[1][0],    // destra = colonna x
+                       -eh.m[2][1], eh.m[0][1],  eh.m[1][1]};   // su = colonna y
+        for (int i = 0; i < 9; ++i) g_eyeAxes[e][i] = ax[i];
+        bool canted = ax[0] < 0.99999f;  // piu' di ~0,25 gradi
+        if (canted != g_eyeCanted[e]) {
+            char cb[160];
+            std::snprintf(cb, sizeof(cb), "VR-FOV: %s eye canted %.1f degrees (yaw %.1f) relative to the head.",
+                          e ? "right" : "left", std::acos((std::min)(1.0f, ax[0])) * 57.2957795f,
+                          std::atan2(ax[1], ax[0]) * 57.2957795f);
+            vr::log::Line(cb);
+        }
+        g_eyeCanted[e] = canted;
+        g_tan[e][0] = l[e];
+        g_tan[e][1] = r[e];
+        g_tan[e][2] = t[e];
+        g_tan[e][3] = b[e];
         maxH = std::fmax(maxH, std::fmax(std::fabs(l[e]), std::fabs(r[e])));
         maxV = std::fmax(maxV, std::fmax(std::fabs(t[e]), std::fabs(b[e])));
     }
@@ -165,6 +201,14 @@ bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
                         static_cast<LONG>(u1 * bbW), static_cast<LONG>(d1 * bbH)};
         g_cropW = std::max<UINT>(g_cropW, g_eyeCrop[e].right - g_eyeCrop[e].left);
         g_cropH = std::max<UINT>(g_cropH, g_eyeCrop[e].bottom - g_eyeCrop[e].top);
+    }
+    g_tanValid = true;
+    g_hmdHz = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+    // Proiezione decentrata: ogni occhio riempie tutto il back buffer, quindi
+    // le texture devono poterlo contenere.
+    if (vr::control::g_offCenter) {
+        g_cropW = std::max<UINT>(g_cropW, bbW);
+        g_cropH = std::max<UINT>(g_cropH, bbH);
     }
     for (int e = 0; e < 2; ++e) {
         // Il ritaglio dell'occhio sta in alto a sinistra della texture (le due
@@ -584,8 +628,8 @@ void WorkerLoop() {
             g_workerBusy = true;
             tex[0] = g_eyeTexture[0];
             tex[1] = g_eyeTexture[1];
-            bounds[0] = g_eyeBounds[0];
-            bounds[1] = g_eyeBounds[1];
+            bounds[0] = pk[0].slot >= 0 ? pk[0].bounds : g_eyeBounds[0];
+            bounds[1] = pk[1].slot >= 0 ? pk[1].bounds : g_eyeBounds[1];
         }
         g_cv.notify_all();  // il thread di rendering puo' preparare il frame seguente
         double tc = QpcMs();
@@ -710,8 +754,49 @@ void StartWorker() {
 
 }  // namespace
 
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick) {
+bool OffCenterProjection(int eye, EyeProjection* out) {
+    if (eye < 0 || eye > 1 || !g_tanValid) return false;
+    float l = g_tan[eye][0], r = g_tan[eye][1];
+    float up = -g_tan[eye][2], down = -g_tan[eye][3];  // in su positivo, come la vista di UE3
+    if (!(r - l > 0.2f) || !(up - down > 0.2f)) return false;
+    out->m00 = 2.0f / (r - l);
+    out->m20 = -(r + l) / (r - l);
+    out->m11 = 2.0f / (up - down);
+    out->m21 = -(up + down) / (up - down);
+    return true;
+}
+
+float HmdRefreshHz() { return g_hmdHz; }
+
+void SetSameTickWait(float ms) { g_sameTickWaitMs = ms; }
+
+void SetRenderScreenPercent(int eye, int percent) {
+    if (eye >= 0 && eye <= 1) g_renderPercent[eye] = percent < 10 ? 100 : (percent > 100 ? 100 : percent);
+}
+
+bool EyeCant(int eye, float* fwd, float* right, float* up) {
+    float sim = vr::control::g_simCantDeg;
+    if (sim != 0.0f && eye >= 0 && eye <= 1) {
+        // Prova senza Pimax: ogni occhio ruotato verso l'esterno di "sim" gradi.
+        float a = (eye == 0 ? 1.0f : -1.0f) * sim / 57.2957795f;  // sinistro verso sinistra
+        float s = std::sin(a), c = std::cos(a);
+        fwd[0] = c; fwd[1] = -s; fwd[2] = 0.0f;
+        right[0] = s; right[1] = c; right[2] = 0.0f;
+        up[0] = 0.0f; up[1] = 0.0f; up[2] = 1.0f;
+        return true;
+    }
+    if (eye < 0 || eye > 1 || !g_eyeCanted[eye]) return false;
+    for (int i = 0; i < 3; ++i) {
+        fwd[i] = g_eyeAxes[eye][i];
+        right[i] = g_eyeAxes[eye][3 + i];
+        up[i] = g_eyeAxes[eye][6 + i];
+    }
+    return true;
+}
+
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter) {
     if (eye < 0 || eye > 1) return;
+    g_renderOffCenter[eye] = offCenter;
     g_renderTick[eye] = tick;
     g_renderPoseValid[eye] = pose != nullptr;
     if (pose) g_renderPose[eye] = *pose;
@@ -725,6 +810,31 @@ RECT EyeCropRect(int eye) {
     }
     return r;
 }
+
+// Consegna al thread di uscita la texture condivisa dello slot (copia GPU finita).
+void DeliverGpuSlot(int e, int g) {
+    g_slotState[e][g] = kLocked;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    int old = g_ready[e].slot;
+    if (old >= 0) {
+        if (!g_slotGpu[e][old]) g_sysmem[e][old]->UnlockRect();
+        g_slotState[e][old] = kFree;
+    }
+    EyePacket pk;
+    pk.slot = g;
+    pk.w = g_slotW[e][g];
+    pk.h = g_slotH[e][g];
+    pk.gpuSrc = g_shTex11[e][g];
+    pk.poseValid = g_slotPoseValid[e][g];
+    pk.tick = g_slotTick[e][g];
+    pk.seq = g_slotSeq[e][g];
+    pk.pose = g_slotPose[e][g];
+    pk.bounds = g_slotBounds[e][g];
+    g_ready[e] = pk;
+    g_gpuSlot[e] = -1;
+}
+
+int g_sameTickOk = 0, g_sameTickMissed = 0;
 
 void OnPresent(IDirect3DDevice9* device, int eye) {
     if (g_disabled || !vr::control::g_vrOutput) return;
@@ -842,24 +952,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             double tq = QpcMs();
             while (g_shQuery[e][g]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE && QpcMs() - tq < 8.0)
                 YieldProcessor();
-            g_slotState[e][g] = kLocked;
-            std::lock_guard<std::mutex> lock(g_mutex);
-            int old = g_ready[e].slot;
-            if (old >= 0) {
-                if (!g_slotGpu[e][old]) g_sysmem[e][old]->UnlockRect();
-                g_slotState[e][old] = kFree;
-            }
-            EyePacket pk;
-            pk.slot = g;
-            pk.w = g_slotW[e][g];
-            pk.h = g_slotH[e][g];
-            pk.gpuSrc = g_shTex11[e][g];
-            pk.poseValid = g_slotPoseValid[e][g];
-            pk.tick = g_slotTick[e][g];
-            pk.seq = g_slotSeq[e][g];
-            pk.pose = g_slotPose[e][g];
-            g_ready[e] = pk;
-            g_gpuSlot[e] = -1;
+            DeliverGpuSlot(e, g);
         } else if (g >= 0) {
             D3DLOCKED_RECT lr;
             if (SUCCEEDED(g_sysmem[e][g]->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
@@ -876,6 +969,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
                 g_ready[e].tick = g_slotTick[e][g];
                 g_ready[e].seq = g_slotSeq[e][g];
                 g_ready[e].pose = g_slotPose[e][g];
+                g_ready[e].bounds = g_slotBounds[e][g];
             } else {
                 g_slotState[e][g] = kFree;
             }
@@ -889,7 +983,14 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
                 break;
             }
         if (s < 0 || vr::control::g_outputTest == 1 || vr::control::g_outputTest == 2) continue;
-        const RECT& src = cinema ? cinemaRect : g_eyeCrop[e];
+        RECT fullRect = {0, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height)};
+        RECT src = cinema ? cinemaRect : (g_renderOffCenter[e] ? fullRect : g_eyeCrop[e]);
+        if (!cinema && g_renderPercent[e] < 100) {
+            // Scena piu' piccola al centro del back buffer (ScreenPercentage).
+            float k = g_renderPercent[e] / 100.0f, cx = desc.Width * 0.5f, cy = desc.Height * 0.5f;
+            src = {static_cast<LONG>(cx + (src.left - cx) * k + 0.5f), static_cast<LONG>(cy + (src.top - cy) * k + 0.5f),
+                   static_cast<LONG>(cx + (src.right - cx) * k + 0.5f), static_cast<LONG>(cy + (src.bottom - cy) * k + 0.5f)};
+        }
         UINT sw = static_cast<UINT>((src.right - src.left) * scale + 0.5f);
         UINT sh = static_cast<UINT>((src.bottom - src.top) * scale + 0.5f);
         if (cinema) {
@@ -905,6 +1006,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         if (sw > texW) sw = texW;
         if (sh > texH) sh = texH;
         RECT dst = {0, 0, static_cast<LONG>(sw), static_cast<LONG>(sh)};
+        vr::VRTextureBounds_t texBounds = {0.0f, 0.0f, float(sw) / texW, float(sh) / texH};
         bool gpu = g_gpuReady && !cinema && vr::control::g_gpuCopy;
         if (gpu) {
             // Percorso GPU: ritaglio direttamente nella texture condivisa.
@@ -920,6 +1022,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotH[e][s] = sh;
             g_slotCinema[e][s] = false;
             g_slotPoseValid[e][s] = g_renderPoseValid[e];
+            g_slotBounds[e][s] = texBounds;
             g_slotPose[e][s] = g_renderPose[e];
             g_slotTick[e][s] = g_renderTick[e];
             g_slotSeq[e][s] = g_presentSeq;
@@ -937,6 +1040,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         g_slotH[e][s] = sh;
         g_slotCinema[e][s] = cinema;
         g_slotPoseValid[e][s] = g_renderPoseValid[e];
+        g_slotBounds[e][s] = texBounds;
         g_slotPose[e][s] = g_renderPose[e];
         g_slotTick[e][s] = g_renderTick[e];
         g_slotSeq[e][s] = g_presentSeq;
@@ -946,6 +1050,34 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     backBuffer->Release();
     g_copyMsAccum += QpcMs() - t0;
 
+    // Invio nello stesso tick (bassa latenza): dopo l'occhio destro si aspetta
+    // un poco che la GPU finisca entrambe le copie e si consegna subito la
+    // coppia di questo tick, invece di quella del tick precedente (~un frame,
+    // 14 ms a 72 Hz, in meno su mani e fucile). Solo se la GPU ha margine
+    // (g_sameTickWaitMs > 0, deciso da hooks.cpp); la coppia va consegnata
+    // intera o per niente: con un occhio solo si unirebbero due tick diversi.
+    float waitBudget = g_sameTickWaitMs;
+    if (eye == 1 && waitBudget > 0.0f && g_gpuSlot[0] >= 0 && g_gpuSlot[1] >= 0 && g_slotGpu[0][g_gpuSlot[0]] &&
+        g_slotGpu[1][g_gpuSlot[1]]) {
+        double tq = QpcMs();
+        bool done = false;
+        while (true) {
+            done = g_shQuery[0][g_gpuSlot[0]]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK &&
+                   g_shQuery[1][g_gpuSlot[1]]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK;
+            if (done || QpcMs() - tq > waitBudget) break;
+            YieldProcessor();
+        }
+        if (done) {
+            DeliverGpuSlot(0, g_gpuSlot[0]);
+            DeliverGpuSlot(1, g_gpuSlot[1]);
+            ++g_sameTickOk;
+        } else {
+            ++g_sameTickMissed;
+        }
+        if ((g_sameTickOk + g_sameTickMissed) % 600 == 1)
+            vr::log::Line("VR-OUTPUT: same-tick submit " + std::to_string(g_sameTickOk) + " ok, " +
+                          std::to_string(g_sameTickMissed) + " left for the next tick.");
+    }
     // Stereo: la coppia e' completa dopo l'occhio destro (mono: subito).
     if (eye == 0) return;
     {

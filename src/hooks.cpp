@@ -7,6 +7,7 @@
 #include "script_call.h"
 #include "display_spoof.h"
 #include "haptics_ext.h"
+#include "vr_input.h"
 
 #include <tlhelp32.h>
 #include <intrin.h>
@@ -211,8 +212,11 @@ void* VTableEntry(void* obj, int index) {
     return vtable[index];
 }
 
+void GpuQueriesRelease();
+
 HRESULT WINAPI Hooked_Reset(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* params) {
     vr::output::OnBeforeReset();
+    GpuQueriesRelease();
     if (params) params->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     HRESULT hr = g_Reset_Original(self, params);
     vr::log::Line("Device reset, hr=" + std::to_string(hr));
@@ -368,9 +372,145 @@ std::atomic<uint32_t> g_presentRepeats{0};
 // Porta occhio, tick e posa del visore usata per QUEL frame: il riconoscimento
 // tramite l'origine della vista (c5) resta come controllo incrociato, ma stando
 // fermi l'origine e' uguale in molti tick e non dice quale tick e' (0.9.1).
+// --- Proiezione decentrata per occhio -----------------------------------------
+//
+// Gli occhi del visore hanno frustum asimmetrici (Quest 3: 1,376 verso
+// l'esterno e 0,839 verso il naso, 1,428 in su e 0,966 in giu'). Prima il
+// gioco disegnava un'immagine simmetrica che li conteneva entrambi e se ne
+// ritagliava la parte di ciascun occhio: 1932x2087 pixel usati su 2400x2500
+// disegnati, un terzo del lavoro della GPU buttato. Ora la matrice di
+// proiezione del gioco (FPerspectiveMatrix in ULocalPlayer::CalcSceneView)
+// viene sostituita, durante il disegno di ogni occhio, con quella decentrata
+// dell'occhio: tutto il back buffer e' l'occhio ("offcenter on|off").
+// Thread di gioco: decisione per il Draw in corso. Thread di rendering:
+// modalita' dell'immagine presentata (dal frame tag) per mirino, HUD, vignetta.
+std::atomic<bool> g_drawOffCenter{false};
+vr::output::EyeProjection g_drawProj = {};
+std::atomic<bool> g_presentOffCenter{false};
+// Risoluzione dinamica: ScreenPercentage attuale (thread di gioco) e quella
+// dell'immagine presentata (thread di rendering).
+std::atomic<int> g_screenPercent{100};
+std::atomic<int> g_presentPercent{100};
+UINT g_testVpMax = 0;  // "dynres test" (thread di rendering)
+int g_testFrames = 0, g_testBad = 0;
+
+// --- Tempo della GPU --------------------------------------------------------
+//
+// Query D3D9 di timestamp: inizio al primo disegno dopo un Present, fine al
+// Present; lette qualche frame dopo senza aspettare. Tempo di GPU per tick =
+// occhio sinistro + destro (prima non c'era alcuna misura della GPU).
+struct GpuQuerySet {
+    IDirect3DQuery9* disjoint = nullptr;
+    IDirect3DQuery9* freq = nullptr;
+    IDirect3DQuery9* t0 = nullptr;
+    IDirect3DQuery9* t1 = nullptr;
+    int state = 0;  // 0 libero, 1 iniziato, 2 in attesa dei risultati
+    int eye = -1;
+};
+constexpr int kGpuQuerySets = 8;
+GpuQuerySet g_gq[kGpuQuerySets];
+int g_gqWrite = 0;
+bool g_gqNeedStart = true;
+bool g_gqFailed = false;
+double g_gpuEye0Ms = 0.0;
+// Statistiche per la riga GPU (somme dal thread di rendering).
+std::mutex g_gpuStatsMutex;
+double g_gpuSum = 0.0, g_gpuMax = 0.0;
+int g_gpuCount = 0;
+std::atomic<float> g_gpuTickMsEma{0.0f};
+
+void GpuQueriesRelease() {
+    for (GpuQuerySet& q : g_gq) {
+        for (IDirect3DQuery9** p : {&q.disjoint, &q.freq, &q.t0, &q.t1})
+            if (*p) {
+                (*p)->Release();
+                *p = nullptr;
+            }
+        q.state = 0;
+    }
+    g_gqNeedStart = true;
+}
+
+void GpuFrameStart(IDirect3DDevice9* d) {
+    g_gqNeedStart = false;
+    if (g_gqFailed) return;
+    GpuQuerySet& q = g_gq[g_gqWrite];
+    if (q.state != 0) return;  // risultati non ancora letti: frame saltato
+    if (!q.t0) {
+        if (FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &q.disjoint)) ||
+            FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &q.freq)) ||
+            FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &q.t0)) || FAILED(d->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &q.t1))) {
+            g_gqFailed = true;
+            vr::log::Line("GPU: timestamp queries not supported, no GPU timing.");
+            return;
+        }
+    }
+    q.disjoint->Issue(D3DISSUE_BEGIN);
+    q.t0->Issue(D3DISSUE_END);
+    q.state = 1;
+}
+
+void GpuFrameEnd(int eye) {
+    GpuQuerySet& q = g_gq[g_gqWrite];
+    if (q.state == 1) {
+        q.t1->Issue(D3DISSUE_END);
+        q.freq->Issue(D3DISSUE_END);
+        q.disjoint->Issue(D3DISSUE_END);
+        q.state = 2;
+        q.eye = eye;
+        g_gqWrite = (g_gqWrite + 1) % kGpuQuerySets;
+    }
+    g_gqNeedStart = true;
+    // Risultati pronti (in ordine): niente attese.
+    for (int k = 0; k < kGpuQuerySets; ++k) {
+        GpuQuerySet& r = g_gq[(g_gqWrite + k) % kGpuQuerySets];
+        if (r.state != 2) continue;
+        BOOL disjoint = TRUE;
+        UINT64 f = 0, a = 0, b = 0;
+        if (r.disjoint->GetData(&disjoint, sizeof(disjoint), 0) != S_OK || r.freq->GetData(&f, sizeof(f), 0) != S_OK ||
+            r.t0->GetData(&a, sizeof(a), 0) != S_OK || r.t1->GetData(&b, sizeof(b), 0) != S_OK)
+            break;
+        r.state = 0;
+        if (disjoint || !f || b < a) continue;
+        double ms = 1000.0 * static_cast<double>(b - a) / static_cast<double>(f);
+        if (r.eye == 0) {
+            g_gpuEye0Ms = ms;
+        } else if (r.eye == 1) {
+            double tick = g_gpuEye0Ms + ms;
+            float ema = g_gpuTickMsEma;
+            g_gpuTickMsEma = ema <= 0.0f ? static_cast<float>(tick) : ema + 0.1f * (static_cast<float>(tick) - ema);
+            std::lock_guard<std::mutex> lock(g_gpuStatsMutex);
+            g_gpuSum += tick;
+            g_gpuMax = (std::max)(g_gpuMax, tick);
+            ++g_gpuCount;
+        } else {
+            std::lock_guard<std::mutex> lock(g_gpuStatsMutex);  // mono (menu, schermo virtuale)
+            g_gpuSum += ms;
+            g_gpuMax = (std::max)(g_gpuMax, ms);
+            ++g_gpuCount;
+        }
+    }
+}
+
+// NDC dell'occhio per una direzione nella vista (tangenti x a destra, y in
+// su): proiezione decentrata se l'immagine lo e', altrimenti simmetrica.
+void TanToNdc(int eye, bool offCenter, float tx, float ty, float thSym, float tvSym, float* nx, float* ny) {
+    vr::output::EyeProjection pj;
+    if (offCenter && vr::output::OffCenterProjection(eye, &pj)) {
+        *nx = tx * pj.m00 + pj.m20;
+        *ny = ty * pj.m11 + pj.m21;
+    } else {
+        *nx = tx / thSym;
+        *ny = ty / tvSym;
+    }
+}
+
 struct FrameTag {
+    double pushMs = 0.0;  // momento del Draw (latenza fino al Present)
     int eye = -1;
     uint32_t tick = 0;
+    bool offCenter = false;  // disegnato con la proiezione decentrata dell'occhio
+    int screenPercent = 100;  // ScreenPercentage del disegno (risoluzione dinamica)
     bool poseValid = false;
     vr::HmdMatrix34_t pose = {};
 };
@@ -378,7 +518,14 @@ std::mutex g_frameTagMutex;
 std::deque<FrameTag> g_frameTags;
 std::atomic<uint32_t> g_frameTagDisagree{0}, g_frameTagResync{0}, g_frameTagEmpty{0};
 
-void PushFrameTag(const FrameTag& t) {
+double ProfMs();
+std::mutex g_tagLatencyMutex;
+double g_tagLatencySum = 0.0, g_tagLatencyMax = 0.0;
+int g_tagLatencyCount = 0;
+
+void PushFrameTag(const FrameTag& t0) {
+    FrameTag t = t0;
+    t.pushMs = ProfMs();
     std::lock_guard<std::mutex> lock(g_frameTagMutex);
     if (g_frameTags.size() >= 16) g_frameTags.pop_front();
     g_frameTags.push_back(t);
@@ -409,7 +556,48 @@ bool PopFrameTag(int c5Eye, FrameTag* out) {
     return true;
 }
 
+// Coerenza tra gli occhi: disegni e triangoli di ogni immagine (thread di
+// rendering). Con la stessa scena i due occhi disegnano quasi le stesse cose;
+// una differenza grande = visibilita' diversa tra gli occhi (sfarfallio).
+uint32_t g_frameDraws = 0, g_frameTris = 0;
+struct EyeDrawStats {
+    uint64_t pairs = 0, drawsL = 0, drawsR = 0, mismatch2 = 0;
+    double triDiff = 0.0;
+    uint64_t jitter[2] = {0, 0};  // somma di |disegni - disegni del frame prima| per occhio
+};
+std::mutex g_eyeDrawMutex;
+EyeDrawStats g_eyeDraws;
+
+void RecordEyeDraws(int eye) {
+    static uint32_t lDraws = 0, lTris = 0;
+    static bool haveL = false;
+    static uint32_t prevDraws[2] = {0, 0};
+    if (eye == 0 || eye == 1) {
+        uint32_t d = g_frameDraws > prevDraws[eye] ? g_frameDraws - prevDraws[eye] : prevDraws[eye] - g_frameDraws;
+        prevDraws[eye] = g_frameDraws;
+        std::lock_guard<std::mutex> lock(g_eyeDrawMutex);
+        g_eyeDraws.jitter[eye] += d;
+    }
+    if (eye == 0) {
+        lDraws = g_frameDraws;
+        lTris = g_frameTris;
+        haveL = true;
+    } else if (eye == 1 && haveL) {
+        haveL = false;
+        uint32_t mx = (std::max)(lTris, g_frameTris);
+        double diff = mx ? std::fabs(static_cast<double>(lTris) - g_frameTris) / mx : 0.0;
+        std::lock_guard<std::mutex> lock(g_eyeDrawMutex);
+        ++g_eyeDraws.pairs;
+        g_eyeDraws.drawsL += lDraws;
+        g_eyeDraws.drawsR += g_frameDraws;
+        g_eyeDraws.triDiff += diff;
+        if (diff > 0.02) ++g_eyeDraws.mismatch2;
+    }
+    g_frameDraws = g_frameTris = 0;
+}
+
 void RecordPresentEye(int eye) {
+    RecordEyeDraws(eye);
     static int last = -2;
     g_presentByEye[eye + 1].fetch_add(1, std::memory_order_relaxed);
     if (eye >= 0 && eye == last) g_presentRepeats.fetch_add(1, std::memory_order_relaxed);
@@ -428,6 +616,12 @@ std::atomic<float> g_markerNdc[2][2];
 std::atomic<bool> g_markerVisible[2];
 std::atomic<bool> g_markerFrameValid{false};
 void DrawAimMarker(IDirect3DDevice9* dev, int eye);
+// Bersaglio del comando alla squadra (tasto squadra tenuto): posizione nel
+// mondo (thread di gioco) e NDC per occhio, disegnato come riquadro arancione.
+float g_squadTargetLoc[3] = {0, 0, 0};
+std::atomic<unsigned long long> g_squadTargetMs{0};
+std::atomic<float> g_targetNdc[2][2];
+std::atomic<bool> g_targetVisible[2];
 
 double ProfMs();
 extern double g_profOutput, g_profPresent;
@@ -441,13 +635,44 @@ HRESULT WINAPI Hooked_Present(
         FrameTag tag;
         if (PopFrameTag(eye, &tag)) {
             if (tag.eye >= 0) eye = tag.eye;
-            if (eye >= 0) vr::output::SetRenderPose(eye, tag.poseValid ? &tag.pose : nullptr, tag.tick);
+            if (tag.pushMs > 0.0 && tag.eye >= 0) {
+                // Dal Draw sul thread di gioco al Present sul thread di rendering.
+                double lat = ProfMs() - tag.pushMs;
+                std::lock_guard<std::mutex> lock(g_tagLatencyMutex);
+                g_tagLatencySum += lat;
+                g_tagLatencyMax = (std::max)(g_tagLatencyMax, lat);
+                ++g_tagLatencyCount;
+            }
+            if (eye >= 0) vr::output::SetRenderPose(eye, tag.poseValid ? &tag.pose : nullptr, tag.tick, tag.offCenter);
+            g_presentOffCenter = tag.offCenter;
+            g_presentPercent = tag.screenPercent;
+            if (eye >= 0) vr::output::SetRenderScreenPercent(eye, tag.screenPercent);
         } else if (eye >= 0) {
-            vr::output::SetRenderPose(eye, nullptr, 0);
+            vr::output::SetRenderPose(eye, nullptr, 0, false);
+            vr::output::SetRenderScreenPercent(eye, g_screenPercent);
+            g_presentOffCenter = false;
+            g_presentPercent = g_screenPercent.load();
         }
     }
     RecordPresentEye(eye);
     DrawAimMarker(self, eye);
+    if (vr::control::g_gpuTimer) GpuFrameEnd(eye);
+    if (vr::control::g_dynResTestFrames > 0 && eye >= 0) {
+        vr::control::g_dynResTestFrames.fetch_sub(1);
+        UINT expect = static_cast<UINT>(g_backBufferW * (g_presentPercent / 100.0f) + 0.5f);
+        bool ok = g_testVpMax + 2 >= expect && g_testVpMax <= expect + 2;
+        ++g_testFrames;
+        if (!ok) {
+            ++g_testBad;
+            if (g_testBad <= 10)
+                vr::log::Line("DYNRES TEST: frame with viewport " + std::to_string(g_testVpMax) + " but tag " +
+                              std::to_string(g_presentPercent.load()) + "% (expected " + std::to_string(expect) + ")");
+        }
+        if (vr::control::g_dynResTestFrames == 0)
+            vr::log::Line("DYNRES TEST: " + std::to_string(g_testFrames) + " frames, " + std::to_string(g_testBad) +
+                          " with the wrong crop.");
+    }
+    g_testVpMax = 0;
     std::string shotPath;
     if (vr::control::TakeScreenshotRequest(&shotPath)) {
         vr::screenshot::SaveBackBuffer(self, shotPath);
@@ -526,10 +751,23 @@ void DrawVignette(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int eye) {
     D3DSURFACE_DESC d;
     bb->GetDesc(&d);
     RECT crop = vr::output::EyeCropRect(eye == 1 ? 1 : 0);
-    if (crop.right <= crop.left || crop.bottom <= crop.top)
+    vr::output::EyeProjection pj;
+    bool oc = g_presentOffCenter && vr::output::OffCenterProjection(eye == 1 ? 1 : 0, &pj);
+    if (oc || crop.right <= crop.left || crop.bottom <= crop.top)
         crop = {0, 0, static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)};
     float cx = 0.5f * (crop.left + crop.right), cy = 0.5f * (crop.top + crop.bottom);
     float hx = 0.5f * (crop.right - crop.left), hy = 0.5f * (crop.bottom - crop.top);
+    if (oc) {  // centro dell'occhio (davanti) nell'immagine decentrata
+        cx = (0.5f + 0.5f * pj.m20) * d.Width;
+        cy = (0.5f - 0.5f * pj.m21) * d.Height;
+    }
+    {  // scena ristretta al centro (risoluzione dinamica)
+        float pk = g_presentPercent / 100.0f, mx = d.Width * 0.5f, my = d.Height * 0.5f;
+        cx = mx + (cx - mx) * pk;
+        cy = my + (cy - my) * pk;
+        hx *= pk;
+        hy *= pk;
+    }
     // Raggi relativi alla mezza larghezza/altezza dell'occhio: libero fino a
     // r0, nero da r1 in poi; con intensita' massima r0 = 0,55, r1 = 0,9.
     float r0 = 1.45f - 0.9f * level, r1 = 1.75f - 0.85f * level;
@@ -590,6 +828,40 @@ void DrawVignette(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int eye) {
     }
 }
 
+// Riquadro arancione (angoli) sul bersaglio dell'ordine alla squadra.
+void DrawTargetBox(IDirect3DDevice9* dev, IDirect3DSurface9* bb, const D3DSURFACE_DESC& d, int e) {
+    if (!g_targetVisible[e]) return;
+    float nx = g_targetNdc[e][0], ny = g_targetNdc[e][1];
+    if (std::fabs(nx) > 1.0f || std::fabs(ny) > 1.0f) return;
+    float pk = g_presentPercent / 100.0f;
+    LONG cx = static_cast<LONG>((nx * 0.5f * pk + 0.5f) * d.Width);
+    LONG cy = static_cast<LONG>((0.5f - ny * 0.5f * pk) * d.Height);
+    IDirect3DSurface9* oldRt = nullptr;
+    dev->GetRenderTarget(0, &oldRt);
+    D3DVIEWPORT9 oldVp;
+    dev->GetViewport(&oldVp);
+    DWORD scissor = FALSE;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor);
+    dev->SetRenderTarget(0, bb);
+    D3DVIEWPORT9 vp = {0, 0, d.Width, d.Height, 0.0f, 1.0f};
+    dev->SetViewport(&vp);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    const LONG s = 34, l = 14, t = 4;  // mezzo lato, lunghezza degli angoli, spessore
+    D3DRECT r[8] = {
+        {cx - s, cy - s, cx - s + l, cy - s + t}, {cx - s, cy - s, cx - s + t, cy - s + l},
+        {cx + s - l, cy - s, cx + s, cy - s + t}, {cx + s - t, cy - s, cx + s, cy - s + l},
+        {cx - s, cy + s - t, cx - s + l, cy + s}, {cx - s, cy + s - l, cx - s + t, cy + s},
+        {cx + s - l, cy + s - t, cx + s, cy + s}, {cx + s - t, cy + s - l, cx + s, cy + s},
+    };
+    dev->Clear(8, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 150, 30), 1.0f, 0);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, scissor);
+    dev->SetViewport(&oldVp);
+    if (oldRt) {
+        dev->SetRenderTarget(0, oldRt);
+        oldRt->Release();
+    }
+}
+
 void DrawAimMarker(IDirect3DDevice9* dev, int eye) {
     IDirect3DSurface9* bb = nullptr;
     if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
@@ -599,6 +871,7 @@ void DrawAimMarker(IDirect3DDevice9* dev, int eye) {
     g_backBufferH = d.Height;
     DrawVignette(dev, bb, eye);
     int e = (eye == 1) ? 1 : 0;
+    DrawTargetBox(dev, bb, d, e);
     if (!g_markerVisible[e]) {
         bb->Release();
         return;
@@ -608,8 +881,9 @@ void DrawAimMarker(IDirect3DDevice9* dev, int eye) {
         bb->Release();
         return;
     }
-    LONG cx = static_cast<LONG>((nx * 0.5f + 0.5f) * d.Width);
-    LONG cy = static_cast<LONG>((0.5f - ny * 0.5f) * d.Height);
+    float pk = g_presentPercent / 100.0f;  // scena ristretta al centro (risoluzione dinamica)
+    LONG cx = static_cast<LONG>((nx * 0.5f * pk + 0.5f) * d.Width);
+    LONG cy = static_cast<LONG>((0.5f - ny * 0.5f * pk) * d.Height);
 
     IDirect3DSurface9* oldRt = nullptr;
     dev->GetRenderTarget(0, &oldRt);
@@ -843,6 +1117,20 @@ HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UIN
 }
 HRESULT WINAPI Hooked_DrawIndexedPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bv, UINT mi, UINT nv, UINT si, UINT pc) {
     LogHudDraw(d, "DIP", pc, nullptr, 0);
+    if (g_gqNeedStart && vr::control::g_gpuTimer) GpuFrameStart(d);
+    if (vr::control::g_dynResTestFrames > 0) {
+        // Larghezza massima del viewport sui render target grandi come il back buffer.
+        D3DVIEWPORT9 vp;
+        IDirect3DSurface9* rt = nullptr;
+        if (SUCCEEDED(d->GetViewport(&vp)) && SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt) {
+            D3DSURFACE_DESC rd;
+            rt->GetDesc(&rd);
+            rt->Release();
+            if (rd.Width == g_backBufferW && vp.Width > g_testVpMax) g_testVpMax = vp.Width;
+        }
+    }
+    ++g_frameDraws;
+    g_frameTris += pc;
     return g_DrawIndexedPrimitive_Original(d, t, bv, mi, nv, si, pc);
 }
 HRESULT WINAPI Hooked_DrawPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT pc, const void* v, UINT stride) {
@@ -900,6 +1188,26 @@ bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
     int eye = vr::control::g_presentEye;  // occhio del Draw in corso (thread di rendering)
     float half = vr::control::g_stereoHalfIpd;
     float th = std::tan(vr::control::g_fovOverride * 0.5f / 57.2957795f);
+    vr::output::EyeProjection pj;
+    if (eye >= 0 && th > 0.0f && g_presentOffCenter && vr::output::OffCenterProjection(eye, &pj)) {
+        // Immagine decentrata: l'HUD (disposto come nella vista simmetrica,
+        // tangente = NDC * th) va riportato nella proiezione dell'occhio, piu'
+        // la parallasse della distanza apparente.
+        float tv = th * (g_backBufferW && g_backBufferH ? float(g_backBufferH) / g_backBufferW : 1.0f);
+        float par = (depth > 0.0f && half > 0.0f) ? (eye == 0 ? 1.0f : -1.0f) * half / depth : 0.0f;
+        float parY = 0.0f;
+        float cf[3], cr[3], cu[3];
+        if (vr::output::EyeCant(eye, cf, cr, cu) && cf[0] > 0.1f) {
+            // Occhio inclinato: "davanti alla testa" non e' il centro dell'occhio.
+            par += cr[0] / cf[0];
+            parY = cu[0] / cf[0];
+        }
+        for (int i = 0; i < 4; ++i) {
+            out[4 * i + 0] = out[4 * i + 0] * th * pj.m00 + (par * pj.m00 + pj.m20) * out[4 * i + 3];
+            out[4 * i + 1] = out[4 * i + 1] * tv * pj.m11 + (parY * pj.m11 + pj.m21) * out[4 * i + 3];
+        }
+        return true;
+    }
     if (depth > 0.0f && half > 0.0f && eye >= 0 && th > 0.0f) {
         // x_ndc += shift  <=>  colonna x += shift * colonna w.
         float shiftNdc = (eye == 0 ? 1.0f : -1.0f) * (half / depth) / th;
@@ -1807,6 +2115,206 @@ void LogStats() {
     vr::log::Line(b);
     for (int i = 0; i < 10; ++i) last[i] = now[i];
     g_maxViewJump = 0.0f;
+    {
+        double sum, mx;
+        int n;
+        {
+            std::lock_guard<std::mutex> lock(g_gpuStatsMutex);
+            sum = g_gpuSum;
+            mx = g_gpuMax;
+            n = g_gpuCount;
+            g_gpuSum = g_gpuMax = 0.0;
+            g_gpuCount = 0;
+        }
+        float hz = vr::output::HmdRefreshHz();
+        double ls = 0.0, lm = 0.0;
+        int ln = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_tagLatencyMutex);
+            ls = g_tagLatencySum;
+            lm = g_tagLatencyMax;
+            ln = g_tagLatencyCount;
+            g_tagLatencySum = g_tagLatencyMax = 0.0;
+            g_tagLatencyCount = 0;
+        }
+        std::snprintf(b, sizeof(b),
+                      "GPU: %.2f ms per tick (max %.2f, %d ticks) | headset frame %.2f ms | scene %d%% | draw to present "
+                      "%.2f ms (max %.2f)",
+                      n ? sum / n : 0.0, mx, n, hz > 0 ? 1000.0f / hz : 0.0f, g_screenPercent.load(),
+                      ln ? ls / ln : 0.0, lm);
+        vr::log::Line(b);
+    }
+    EyeDrawStats e;
+    {
+        std::lock_guard<std::mutex> lock(g_eyeDrawMutex);
+        e = g_eyeDraws;
+        g_eyeDraws = EyeDrawStats();
+    }
+    if (e.pairs) {
+        std::snprintf(b, sizeof(b), "EYEDRAWS: pairs=%llu draws L=%.0f R=%.0f | triangles differ %.2f%% | pairs over 2%%=%llu | "
+                      "draw jitter L=%.2f R=%.2f",
+                      e.pairs, double(e.drawsL) / e.pairs, double(e.drawsR) / e.pairs, 100.0 * e.triDiff / e.pairs,
+                      e.mismatch2, double(e.jitter[0]) / e.pairs, double(e.jitter[1]) / e.pairs);
+        vr::log::Line(b);
+    }
+}
+
+// --- Stato della vista per occhio -------------------------------------------
+//
+// ULocalPlayer.ViewState (+0x88, FSceneViewStateInterface*) contiene lo
+// storico dell'occlusione (query dei frame precedenti), le dissolvenze dei LOD
+// e le matrici del frame precedente. Disegnando due occhi per tick con lo
+// stesso stato, i risultati di un occhio decidono cosa disegna l'altro:
+// oggetti che appaiono e spariscono tra i due occhi (sfarfallio) e nemici
+// "occlusi" per un attimo sporgendosi da un riparo. L'occhio destro usa un
+// secondo stato creato con AllocateViewState (0x00C4F370: new FSceneViewState,
+// 0x2F0 byte, lo stesso che usa il motore). Se il motore ricrea il suo (reset
+// del device, cambio di risoluzione) si ricrea anche il nostro.
+constexpr uintptr_t kAllocateViewStateAddr = 0x00C4F370;
+constexpr uint32_t kOffPcPlayer = 0x388, kOffLpViewState = 0x88;
+typedef void*(__cdecl* AllocateViewState_t)();
+
+void* CallAllocateViewState() {
+    __try {
+        return reinterpret_cast<AllocateViewState_t>(kAllocateViewStateAddr)();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Indirizzo di LocalPlayer.ViewState del giocatore (nullptr se non valido).
+uint32_t* ViewStateSlot(char* cam) {
+    uint32_t lp = 0, vs = 0;
+    if (!HasCameraSignature(cam) || !TrySafeReadUint32(cam - 0x77C + kOffPcPlayer, &lp) || !lp) return nullptr;
+    if (!TrySafeReadUint32(reinterpret_cast<char*>(lp) + kOffLpViewState, &vs) || !vs) return nullptr;
+    return reinterpret_cast<uint32_t*>(lp + kOffLpViewState);
+}
+
+// Stato da usare per l'occhio destro (0 = condiviso, come il gioco).
+uint32_t RightEyeViewState(uint32_t engineState) {
+    static uint32_t owner = 0, mine = 0;
+    static bool failed = false;
+    if (!vr::control::g_perEyeViewState || failed) return 0;
+    if (engineState != owner) {
+        owner = engineState;
+        mine = reinterpret_cast<uint32_t>(CallAllocateViewState());
+        if (!mine) failed = true;
+        vr::log::Line(mine ? "STEREO: separate view state for the right eye (occlusion, LOD fades)."
+                           : "STEREO: AllocateViewState failed, both eyes share the view state.");
+    }
+    return mine;
+}
+
+// --- Risoluzione dinamica ----------------------------------------------------
+//
+// Obiettivo: tenere il tempo di GPU per tick sotto ~85% del frame del visore
+// (13,9 ms a 72 Hz) invece di cadere a meta' frequenza (riproiezione). Il
+// lavoro di pixel scala col quadrato della percentuale: passo proporzionale
+// sqrt(obiettivo / misurato), al massimo -10 / +5 per volta, ogni 0,7 s, a
+// multipli di 5. Fuori dal gioco in 3D (schermo virtuale, menu) sempre 100:
+// lo schermo virtuale mostra il back buffer intero.
+void ApplyVrPreset(char* cam) {
+    static bool applied = false;
+    if (applied || !vr::control::g_vrPreset || !HasCameraSignature(cam)) return;
+    applied = true;
+    // Misure del 18/10 (tempo GPU per tick, A/B): SSAO -15%, distorsione
+    // filtrata -17%; ombre, anisotropia, bloom, LOD sotto il 5%: restano.
+    for (const char* c : {"scale set AmbientOcclusion false", "scale set FilteredDistortion false"})
+        vr::script::ExecConsole(cam - 0x77C, c);
+    // OneFrameThreadLag (il thread di gioco un frame avanti a quello di
+    // rendering) resta come nel gioco: spento toglie ~10 ms di latenza ma mette
+    // in serie gioco e rendering; nel combattimento del capitolo 1 (18/10, nel
+    // visore) 48-53 fps contro 75-86 acceso. "threadlag off" per provarlo.
+    if (!vr::control::g_threadLag) vr::script::ExecConsole(cam - 0x77C, "scale set OneFrameThreadLag false");
+    vr::log::Line(std::string("VRPRESET: screen-space ambient occlusion and filtered distortion off") +
+                  (vr::control::g_threadLag ? "." : ", no one-frame thread lag."));
+}
+
+// Risoluzione automatica: con la proiezione decentrata il back buffer e'
+// l'occhio, quindi la sua dimensione giusta e' quella che SteamVR consiglia
+// per un occhio (GetRecommendedRenderTargetSize, gia' moltiplicata per il
+// cursore della risoluzione di SteamVR). Prima la finestra era fissa
+// (ResX/ResY a mano): su visori ad alta risoluzione (Dream Air, Pimax) troppo
+// piccola o, se impostata grande, troppo pesante. Controllo ogni 5 s; il
+// cambio (setres, con reset del device) solo se la differenza supera il 4%.
+// Massimo 4096 (desktop finto di display_spoof).
+void UpdateAutoResolution(char* cam) {
+    static ULONGLONG last = 0;
+    if (!vr::control::g_autoResolution || !vr::control::g_offCenter || GetTickCount64() - last < 5000) return;
+    last = GetTickCount64();
+    uint32_t w = 0, h = 0;
+    {
+        vr::session::Shared vrLock(true);
+        if (!vrLock.ok() || !vr::session::IsScene() || !vr::VRSystem()) return;
+        vr::VRSystem()->GetRecommendedRenderTargetSize(&w, &h);
+    }
+    if (w < 640 || h < 640) return;
+    w = (std::min)(w, 4096u) & ~7u;
+    h = (std::min)(h, 4096u) & ~7u;
+    UINT bw = g_backBufferW, bh = g_backBufferH;
+    if (!bw || !bh) return;
+    if (std::abs(static_cast<int>(w) - static_cast<int>(bw)) <= static_cast<int>(bw) / 25 &&
+        std::abs(static_cast<int>(h) - static_cast<int>(bh)) <= static_cast<int>(bh) / 25)
+        return;
+    static uint32_t lastW = 0, lastH = 0;
+    if (w == lastW && h == lastH) return;  // gia' chiesta: il gioco puo' averla limitata
+    lastW = w;
+    lastH = h;
+    char cmd[64];
+    std::snprintf(cmd, sizeof(cmd), "setres %ux%uw", w, h);
+    vr::log::Line("AUTORES: SteamVR recommends " + std::to_string(w) + "x" + std::to_string(h) + " per eye, game is " +
+                  std::to_string(bw) + "x" + std::to_string(bh) + ": " + cmd);
+    vr::script::ExecConsole(cam - 0x77C, cmd);
+}
+
+void UpdateDynamicResolution(char* cam, bool mono) {
+    static ULONGLONG last = 0;
+    if (!mono) ApplyVrPreset(cam);
+    if (!mono && HasCameraSignature(cam)) UpdateAutoResolution(cam);
+    int cur = g_screenPercent;
+    int want = cur;
+    float hz = vr::output::HmdRefreshHz();
+    float fakeBudget = vr::control::g_dynResBudgetMs;
+    if (fakeBudget > 0.0f) hz = 1000.0f / fakeBudget;
+    bool active = vr::control::g_dynRes && !mono && hz > 30.0f && (vr::session::IsScene() || fakeBudget > 0.0f) &&
+                  HasCameraSignature(cam);
+    if (vr::control::g_dynResTestFrames > 0 && HasCameraSignature(cam) && !mono) {
+        static ULONGLONG flip = 0;
+        if (GetTickCount64() - flip > 500) {
+            flip = GetTickCount64();
+            want = cur == 100 ? 70 : 100;
+        }
+    } else if (!active) {
+        want = 100;
+    } else if (GetTickCount64() - last > 700) {
+        last = GetTickCount64();
+        float budget = 1000.0f / hz, gpu = g_gpuTickMsEma;
+        if (gpu > 0.0f) {
+            float target = 0.85f * budget;
+            if (gpu > 0.92f * budget || (gpu < 0.70f * budget && cur < 100)) {
+                float next = cur * std::sqrt(target / gpu);
+                next = (std::max)(next, cur - 10.0f);
+                next = (std::min)(next, cur + 5.0f);
+                want = static_cast<int>(next / 5.0f + 0.5f) * 5;
+                want = (std::max)(want, vr::control::g_dynResMin.load());
+                want = (std::min)(want, 100);
+            }
+        }
+    }
+    {
+        // Invio nello stesso tick: solo con la GPU sotto meta' del frame del
+        // visore; si aspetta al massimo un quarto di frame.
+        float gpu = g_gpuTickMsEma, frame = hz > 30.0f ? 1000.0f / hz : 0.0f;
+        bool ok = vr::control::g_lowLatency && frame > 0.0f && gpu > 0.0f && gpu < 0.5f * frame;
+        vr::output::SetSameTickWait(ok ? 0.25f * frame : 0.0f);
+    }
+    if (want == cur || !HasCameraSignature(cam)) return;
+    vr::script::ExecConsole(cam - 0x77C, "scale set ScreenPercentage " + std::to_string(want));
+    g_screenPercent = want;
+    char b[160];
+    std::snprintf(b, sizeof(b), "DYNRES: scene %d%% -> %d%% (GPU %.1f ms per tick, headset frame %.1f ms)", cur, want,
+                  g_gpuTickMsEma.load(), hz > 0 ? 1000.0f / hz : 0.0f);
+    vr::log::Line(b);
 }
 
 class ViewportDrawThunk {
@@ -1822,6 +2330,21 @@ public:
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        // Mirino del gioco: al centro dello schermo segue la testa e non l'arma;
+        // con la mira dalla canna lo sostituisce il mirino verde.
+        // YHUD.m_hideCrosshair (+0x480, bit 0x40) sull'HUD del PlayerController (+0x3EC).
+        {
+            static bool weHid = false;
+            bool hide = HasCameraSignature(cam) && vr::control::g_aimHand && g_muzzleAimValid &&
+                        !vr::control::g_gameCrosshair;
+            uint32_t hud = 0, flags = 0;
+            if ((hide || weHid) && HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0x3EC, &hud) && hud &&
+                TrySafeReadUint32(reinterpret_cast<char*>(hud) + 0x480, &flags)) {
+                uint32_t want = hide ? (flags | 0x40u) : (flags & ~0x40u);
+                if (want != flags) SafeCopy(reinterpret_cast<char*>(hud) + 0x480, &want, 4);
+                weHid = hide;
+            }
+        }
         {
             // Danno subito (giubbotto bHaptics / ProTube): salute di Walker in calo.
             static void* lastPawn = nullptr;
@@ -1890,6 +2413,7 @@ public:
             vr::log::Line(cinema ? "CINEMA: virtual screen (outside gameplay)" : "CINEMA: end, back to VR");
             vr::control::g_cinemaActive = cinema;
         }
+        UpdateDynamicResolution(cam, cinema || half <= 0 || !vr::control::g_syncStereo);
         if (cinema || half <= 0 || !vr::control::g_syncStereo || !HasCameraSignature(cam)) {
             if (bShouldPresent) PushFrameTag(FrameTag{});
             g_ViewportDraw_Original(self, bShouldPresent);
@@ -1915,6 +2439,9 @@ public:
             }
         }
         g_headSnap.valid = true;
+        uint32_t* vsSlot = ViewStateSlot(cam);
+        uint32_t vsEngine = vsSlot ? *vsSlot : 0;
+        uint32_t vsRight = vsSlot ? RightEyeViewState(vsEngine) : 0;
         for (int eye = 0; eye < 2; ++eye) {
             loc[0] = base[0];
             loc[1] = base[1];
@@ -1922,21 +2449,37 @@ public:
             g_drawEye = eye;
             OffsetLocationForEye(cam, eye, half);
             double t0 = ProfMs();
+            g_drawOffCenter = vr::control::g_offCenter && !g_scopeActive && vr::output::OffCenterProjection(eye, &g_drawProj);
             if (bShouldPresent) {
                 FrameTag tag;
                 tag.eye = eye;
+                tag.offCenter = g_drawOffCenter;
+                tag.screenPercent = g_screenPercent;
                 tag.tick = g_stereoDraws.load(std::memory_order_relaxed);
                 tag.poseValid = g_headSnap.poseValid;
                 tag.pose = g_headSnap.pose;
                 PushFrameTag(tag);
             }
+            if (eye == 1 && vsRight) *vsSlot = vsRight;
             g_ViewportDraw_Original(self, bShouldPresent);
+            if (eye == 1 && vsRight) *vsSlot = vsEngine;
             g_profDraw[eye] += ProfMs() - t0;
         }
         {
             static double last = 0.0;
+            // Scatti: tick oltre 20 ms (a 72-90 Hz = almeno un frame perso) e il
+            // piu' lungo, che la media dei 300 tick nasconde.
+            static int longTicks = 0;
+            static double maxTick = 0.0;
             double now = ProfMs();
-            if (last > 0.0) g_profTick += now - last;
+            // Oltre 1 s senza disegni stereo = schermo virtuale o caricamento,
+            // non un tick: escluso (prima gonfiava la media dopo ogni cinematica).
+            if (last > 0.0 && now - last < 1000.0) {
+                double dt = now - last;
+                g_profTick += dt;
+                if (dt > 20.0) ++longTicks;
+                if (dt > maxTick) maxTick = dt;
+            }
             last = now;
             if (++g_profCount >= 300) {
                 char b[300];
@@ -1947,12 +2490,17 @@ public:
                               (g_profTick - g_profDraw[0] - g_profDraw[1]) / g_profCount);
                 g_profOutput = g_profPresent = 0.0;
                 vr::log::Line(b);
+                std::snprintf(b, sizeof(b), "HITCHES: ticks over 20 ms=%d, longest %.1f ms", longTicks, maxTick);
+                vr::log::Line(b);
+                longTicks = 0;
+                maxTick = 0.0;
                 LogStats();
                 g_profDraw[0] = g_profDraw[1] = g_profTick = 0.0;
                 g_profCount = 0;
             }
         }
         g_drawEye = -1;
+        g_drawOffCenter = false;
         g_headSnap.valid = false;
         if (HasCameraSignature(cam)) {
             loc[0] = base[0];
@@ -1980,6 +2528,51 @@ GetFovAngle_t g_GetFovAngle_Original = nullptr;
 
 constexpr uintptr_t kOffPawnCurrentWeaponFov = 0x1594;  // YGamePawn.m_currentWeapon
 
+
+// FPerspectiveMatrix(HalfFOV, Width, Height, MinZ) (0x009EAE80, thiscall, il
+// costruttore restituisce this). Si cambia solo la matrice costruita da
+// ULocalPlayer::CalcSceneView (ritorno a 0x0075CAC5 o 0x0075CBBA) durante il
+// Draw di un occhio: M[0][0], M[1][1] (scala) e M[2][0], M[2][1] (centro),
+// riga z della convenzione a vettori riga di UE3.
+constexpr uintptr_t kPerspectiveMatrixAddr = 0x009EAE80;
+typedef void*(__thiscall* PerspectiveMatrix_t)(void* self, float halfFov, float w, float h, float minZ);
+PerspectiveMatrix_t g_PerspectiveMatrix_Original = nullptr;
+
+class PerspectiveThunk {
+public:
+    void* Detour(float halfFov, float w, float h, float minZ) {
+        void* r = g_PerspectiveMatrix_Original(this, halfFov, w, h, minZ);
+        uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        if (g_drawOffCenter && (ret == 0x0075CAC5 || ret == 0x0075CBBA)) {
+            float* m = static_cast<float*>(r);
+            static int logged = 0;
+            if (logged < 2) {
+                ++logged;
+                char b[320];
+                std::snprintf(b, sizeof(b),
+                              "OFFCENTER: game projection [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | "
+                              "%.3f %.3f %.3f %.3f] -> eye m00=%.3f m11=%.3f m20=%.3f m21=%.3f",
+                              m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
+                              m[14], m[15], g_drawProj.m00, g_drawProj.m11, g_drawProj.m20, g_drawProj.m21);
+                vr::log::Line(b);
+            }
+            m[0] = g_drawProj.m00;
+            m[5] = g_drawProj.m11;
+            m[8] = g_drawProj.m20;
+            m[9] = g_drawProj.m21;
+        }
+        return r;
+    }
+};
+
+void* GetPerspectiveThunkAddress() {
+    union {
+        void* (PerspectiveThunk::*mfp)(float, float, float, float);
+        void* fp;
+    } converter;
+    converter.mfp = &PerspectiveThunk::Detour;
+    return converter.fp;
+}
 
 class FovThunk {
 public:
@@ -2330,16 +2923,19 @@ void UpdateHeadTracking() {
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
     float predict = PredictedSecondsToPhotons(vrsys);
     vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, predict, poses, vr::k_unMaxTrackedDeviceCount);
+    vr::input::CorrectControllerPoses(vrsys, poses);
     const vr::TrackedDevicePose_t& hmdPose = poses[vr::k_unTrackedDeviceIndex_Hmd];
     // Controller predetti a parte (handpredict, ms): la testa la corregge la
     // riproiezione del visore, le mani no, quindi il fucile mostrava tutta la
     // latenza del sistema ("weapons felt stiff", 18/10).
     vr::TrackedDevicePose_t handPoses[vr::k_unMaxTrackedDeviceCount];
     float handSec = vr::control::g_handPredictMs * 0.001f;
-    if (handSec > 0.0f)
+    if (handSec > 0.0f) {
         vrsys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, handSec, handPoses, vr::k_unMaxTrackedDeviceCount);
-    else
+        vr::input::CorrectControllerPoses(vrsys, handPoses);
+    } else {
         std::memcpy(handPoses, poses, sizeof(handPoses));
+    }
     if (!hmdPose.bPoseIsValid) {
         if (shouldLog) vr::log::Line("UpdateHeadTracking: invalid HMD pose.");
         return;
@@ -2389,12 +2985,17 @@ void UpdateHeadTracking() {
     void* pcForTurn = g_playerControllerPtr;
     // In copertura (YGamePawn.m_coverFaceState +0x498 != 0) il gioco orienta
     // Walker verso il riparo: niente rotazione del corpo con la testa.
-    bool inCover = false;
+    bool inCover = false, specialMove = false;
     {
         char* camT = static_cast<char*>(g_cameraPtr.load());
         void* pawnT = HasCameraSignature(camT) ? PlayerPawnIfViewTarget(camT) : nullptr;
-        uint32_t cover = 0;
+        uint32_t cover = 0, special = 0;
         inCover = pawnT && TrySafeReadUint32(static_cast<char*>(pawnT) + 0x498, &cover) && (cover & 0xFF) != 0;
+        // YGamePawn.m_specialMove (+0x491): 19 entrando in copertura (la
+        // rotazione verso il riparo avviene qui, m_coverFaceState e' ancora 0),
+        // 20 uscendo; anche scavalcamenti e corpo a corpo.
+        specialMove = pawnT && TrySafeReadUint32(static_cast<char*>(pawnT) + 0x490, &special) &&
+                      ((special >> 8) & 0xFF) != 0;
     }
     // Rotazione del corpo decisa dal gioco (entrando in copertura Walker viene
     // girato di ~50 gradi verso il riparo in pochi frame): la si toglie dalla
@@ -2421,17 +3022,43 @@ void UpdateHeadTracking() {
         static ULONGLONG cinemaSeen = 0;
         if (vr::control::g_cinemaActive || g_gameLockedScene) cinemaSeen = GetTickCount64();
         bool afterCinema = GetTickCount64() - cinemaSeen < 2000;
+        // Solo entrando, stando o appena usciti dalla copertura. Prima valeva per
+        // ogni rotazione del gioco: dopo un salto al checkpoint, una ripartenza o
+        // una rotazione scriptata il corpo restava girato rispetto alla vista e
+        // lo stick in avanti spingeva Walker di lato, contro le pareti (18/10,
+        // "after it ended I was stuck in the fuselage").
+        // La rotazione puo' arrivare un attimo prima che la mossa speciale
+        // risulti: resta in sospeso 0,4 s e si applica se nel frattempo
+        // compare la copertura, altrimenti si scarta.
+        static ULONGLONG coverSeen = 0, pendingT = 0;
+        static int pendingD = 0;
+        ULONGLONG nowC = GetTickCount64();
+        if (inCover || specialMove) coverSeen = nowC;
+        bool nearCover = coverSeen && nowC - coverSeen < 1500;
+        auto compensate = [&](int d) {
+            g_hmdYawReference += vr::control::g_yawSign * d * (6.28318530718f / 65536.0f);
+            static ULONGLONG lastLog = 0;
+            if (nowC - lastLog > 500) {
+                lastLog = nowC;
+                vr::log::Line("COVER: body turned " + std::to_string(d * 360 / 65536) + " degrees by the game" +
+                              (inCover ? " (cover)" : "") + ", view kept still");
+            }
+        };
+        if (pendingD && nowC - pendingT > 400) pendingD = 0;
+        if (pendingD && nearCover) {
+            compensate(pendingD);
+            pendingD = 0;
+        }
         if (haveBody && !vr::control::g_cinemaActive && vr::control::g_coverSnapCompensate &&
             !vr::control::g_stickTurning && !TurretAimActive() && !g_gameLockedScene && !afterCinema) {
             int16_t d = static_cast<int16_t>(bodyYawNow - lastBodyYaw - own);
             const int kMin = 7 * 65536 / 360, kMax = 75 * 65536 / 360;
             if (std::abs(d) > kMin && std::abs(d) < kMax) {
-                g_hmdYawReference += vr::control::g_yawSign * d * (6.28318530718f / 65536.0f);
-                static ULONGLONG lastLog = 0;
-                if (GetTickCount64() - lastLog > 500) {
-                    lastLog = GetTickCount64();
-                    vr::log::Line("COVER: body turned " + std::to_string(d * 360 / 65536) +
-                                  " degrees by the game" + (inCover ? " (cover)" : "") + ", view kept still");
+                if (nearCover) {
+                    compensate(d);
+                } else {
+                    pendingD += d;
+                    pendingT = nowC;
                 }
             }
         }
@@ -3783,6 +4410,22 @@ public:
             outRot[1] += HeadYaw();
         }
         outRot[2] += HeadRoll();
+        // Display inclinati (Pimax e simili): ogni occhio guarda ruotato di
+        // qualche grado verso l'esterno. Le tangenti di GetProjectionRaw sono
+        // nel sistema dell'occhio, quindi la vista va ruotata come l'occhio
+        // (solo con la proiezione decentrata, che usa quelle tangenti).
+        float cf[3], cr[3], cu[3];
+        if (g_drawEye >= 0 && g_drawOffCenter && vr::output::EyeCant(g_drawEye, cf, cr, cu)) {
+            float hf[3], hr[3], hu[3];
+            RotatorToAxes(outRot[0], outRot[1], outRot[2], hf, hr, hu);
+            float ef[3], er[3], eu[3];
+            for (int i = 0; i < 3; ++i) {
+                ef[i] = cf[0] * hf[i] + cf[1] * hr[i] + cf[2] * hu[i];
+                er[i] = cr[0] * hf[i] + cr[1] * hr[i] + cr[2] * hu[i];
+                eu[i] = cu[0] * hf[i] + cu[1] * hr[i] + cu[2] * hu[i];
+            }
+            AxesToRotator(ef, er, eu, outRot);
+        }
         if (outLoc) {
             float b = bodyYaw * (6.28318530718f / 65536.0f);
             float ho[3];
@@ -3891,6 +4534,7 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     char* cam = static_cast<char*>(g_cameraPtr.load());
     if (!vr::control::g_aimMarker || !hand || !HasCameraSignature(cam) || !PlayerPawnIfViewTarget(cam)) {
         g_markerVisible[eye] = false;
+        g_targetVisible[eye] = false;
         if (eye == 0) vr::control::g_adsActive = false;
         return;
     }
@@ -3968,6 +4612,28 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     // Proiezione nella vista dell'occhio.
     float vf[3], vrt[3], vu[3];
     RotatorToAxes(viewRot[0], viewRot[1], viewRot[2], vf, vrt, vu);
+    {
+        bool fresh = GetTickCount64() - g_squadTargetMs.load() < 200;
+        bool vis = false;
+        if (fresh) {
+            float tv[3] = {g_squadTargetLoc[0] - eyeLoc[0], g_squadTargetLoc[1] - eyeLoc[1], g_squadTargetLoc[2] - eyeLoc[2]};
+            float tz = tv[0] * vf[0] + tv[1] * vf[1] + tv[2] * vf[2];
+            if (tz > 1.0f) {
+                float tx = tv[0] * vrt[0] + tv[1] * vrt[1] + tv[2] * vrt[2];
+                float ty = tv[0] * vu[0] + tv[1] * vu[1] + tv[2] * vu[2];
+                float fovT = vr::control::g_fovOverride > 0.0f ? vr::control::g_fovOverride.load() : 90.0f;
+                float th2 = std::tan(fovT * 0.5f / 57.2957795f);
+                UINT w2 = g_backBufferW, h2 = g_backBufferH;
+                float tv2 = (w2 && h2) ? th2 * h2 / w2 : th2;
+                float nx, ny;
+                TanToNdc(eye, g_drawOffCenter, tx / tz, ty / tz, th2, tv2, &nx, &ny);
+                g_targetNdc[eye][0] = nx;
+                g_targetNdc[eye][1] = ny;
+                vis = true;
+            }
+        }
+        g_targetVisible[eye] = vis;
+    }
     float v[3] = {p[0] - eyeLoc[0], p[1] - eyeLoc[1], p[2] - eyeLoc[2]};
     float z = v[0] * vf[0] + v[1] * vf[1] + v[2] * vf[2];
     if (z < 1.0f) {
@@ -3980,8 +4646,10 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
     float th = std::tan(fov * 0.5f / 57.2957795f);
     UINT w = g_backBufferW, h = g_backBufferH;
     float tv = (w && h) ? th * h / w : th;
-    g_markerNdc[eye][0] = (x / z) / th;
-    g_markerNdc[eye][1] = (y / z) / tv;
+    float nx, ny;
+    TanToNdc(eye, g_drawOffCenter, x / z, y / z, th, tv, &nx, &ny);
+    g_markerNdc[eye][0] = nx;
+    g_markerNdc[eye][1] = ny;
     g_markerVisible[eye] = !vr::control::g_adsActive;
 }
 
@@ -4055,6 +4723,53 @@ constexpr uintptr_t kOffPawnNextPawn = 0x218;
 constexpr uintptr_t kOffPawnHealth = 0x304;
 constexpr uintptr_t kOffActorWorldInfo = 0xEC;
 
+// Bersagli degli ordini che non sono Pawn: YCheapShooter (nemici semplificati
+// che sparano da lontano, es. il cecchino sul cartellone del capitolo 1, che
+// il tutorial chiede di far abbattere: 18/10, "non riesco a dare l'ordine").
+// La lista dei Pawn non li contiene: si cercano in GObjects (classe e
+// sottoclassi), ogni 2 s mentre il tasto squadra e' tenuto.
+constexpr uint32_t kOffCheapShooterHealth = 0x264;  // YCheapShooter.m_health (float)
+std::vector<void*> CheapShooters() {
+    static uint32_t cls = 0;
+    static std::vector<void*> cache;
+    static ULONGLONG last = 0;
+    if (GetTickCount64() - last < 2000) return cache;
+    last = GetTickCount64();
+    cache.clear();
+    uint32_t data = 0, num = 0;
+    if (!TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data) ||
+        !TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num) || !data || num > 2000000)
+        return cache;
+    if (!cls) {
+        for (uint32_t i = 0; i < num && !cls; ++i) {
+            uint32_t o = 0;
+            if (TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) && o &&
+                vr::script::ObjectName(reinterpret_cast<void*>(o)) == "YCheapShooter" &&
+                vr::script::ClassName(reinterpret_cast<void*>(o)) == "Class")
+                cls = o;
+        }
+        if (!cls) {
+            last = GetTickCount64() + 60000;  // classe non trovata: si riprova tra un minuto
+            return cache;
+        }
+    }
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
+        uint32_t c = ObjClass(reinterpret_cast<void*>(o));
+        for (int depth = 0; c && depth < 4; ++depth) {  // classe o sottoclasse
+            if (c == cls) {
+                cache.push_back(reinterpret_cast<void*>(o));
+                break;
+            }
+            uint32_t super = 0;
+            if (!TrySafeReadUint32(reinterpret_cast<char*>(c) + 0x3C, &super)) break;
+            c = super;
+        }
+    }
+    return cache;
+}
+
 void UpdateSquadCommandAim(char* cam, void* pawn) {
     static void* lastPick = nullptr;
     // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
@@ -4082,6 +4797,10 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         return;
     void* best = nullptr;
     float bestScore = 1e9f;
+    // Bersaglio gia' scelto: resta finche' e' vicino al mirino (1,5 volte la
+    // tolleranza). Cambiarlo a ogni frame tra due nemici vicini annullava la
+    // convalida del gioco ("not taken by the game", 18/10 in combattimento).
+    float lastPickScore = -1.0f;
     static ULONGLONG lastDiag = 0;
     bool diag = vr::control::g_fireLog && GetTickCount64() - lastDiag > 1000;
     if (diag) lastDiag = GetTickCount64();
@@ -4116,6 +4835,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
                              cls.c_str(), along, off, tol, (int)blocked, hitTime);
                     vr::log::Line(b);
                 }
+                if (other == lastPick && !blocked && off < 1.5f * tol) lastPickScore = score;
                 if (off < tol && score < bestScore) {
                     if (!blocked) {
                         best = other;
@@ -4125,6 +4845,38 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
             }
         }
         p = next;
+    }
+    // Nemici semplificati (cecchini sui cartelloni, tiratori lontani): niente
+    // controllo di visibilita' (stanno dietro parapetti, sono bersagli
+    // scriptati apposta per gli ordini); il gioco li convalida comunque.
+    for (void* cs : CheapShooters()) {
+        if (cs == pawn || !StillAlive(cs, ObjClass(cs))) continue;
+        float health = 0.0f, loc[3];
+        if (!SafeCopy(&health, static_cast<char*>(cs) + kOffCheapShooterHealth, 4) || !(health > 0.0f) ||
+            !SafeCopy(loc, static_cast<char*>(cs) + 0x54, 12))
+            continue;
+        float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
+        float along = v[0] * bd[0] + v[1] * bd[1] + v[2] * bd[2];
+        if (along <= 50.0f) continue;
+        float perp[3] = {v[0] - bd[0] * along, v[1] - bd[1] * along, v[2] - bd[2] * along};
+        float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+        float tol = std::fmax(along * 0.0699f, 60.0f);  // 4 gradi: bersagli piccoli e lontani
+        if (diag) {
+            char b[200];
+            snprintf(b, sizeof(b), "SQUAD check: %s (cheap shooter) along=%.0f off=%.0f tol=%.0f health=%.0f",
+                     vr::script::ClassName(cs).c_str(), along, off, tol, health);
+            vr::log::Line(b);
+        }
+        if (cs == lastPick && off < 1.5f * tol) lastPickScore = off / along;
+        if (off < tol && off / along < bestScore) {
+            best = cs;
+            bestScore = off / along;
+        }
+    }
+    // Si cambia bersaglio solo se il nuovo e' nettamente piu' centrato.
+    if (lastPick && lastPickScore >= 0.0f && best != lastPick && (!best || bestScore > 0.6f * lastPickScore)) {
+        best = lastPick;
+        bestScore = lastPickScore;
     }
     if (!best) {
         lastPick = nullptr;
@@ -4146,6 +4898,14 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         pending = nullptr;
     }
     vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
+    {
+        float tl[3];
+        if (SafeCopy(tl, static_cast<char*>(best) + 0x54, 12)) {
+            tl[2] += 30.0f;  // petto
+            for (int i = 0; i < 3; ++i) g_squadTargetLoc[i] = tl[i];
+            g_squadTargetMs = GetTickCount64();
+        }
+    }
     if (best != lastPick) {
         lastPick = best;
         pending = best;
@@ -4399,6 +5159,15 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
         vr::log::Line("Hook on APlayerController::GetFOVAngle installed.");
     } else {
         vr::log::Line("ERROR: hook on GetFOVAngle failed.");
+    }
+
+    void* projTarget = reinterpret_cast<void*>(kPerspectiveMatrixAddr);
+    if (MH_CreateHook(projTarget, GetPerspectiveThunkAddress(),
+                      reinterpret_cast<void**>(&g_PerspectiveMatrix_Original)) == MH_OK &&
+        MH_EnableHook(projTarget) == MH_OK) {
+        vr::log::Line("Hook on FPerspectiveMatrix installed (off-center eye projection).");
+    } else {
+        vr::log::Line("ERROR: hook on FPerspectiveMatrix failed.");
     }
 
     void* gpvpTarget = reinterpret_cast<void*>(kGetPlayerViewPointAddr);

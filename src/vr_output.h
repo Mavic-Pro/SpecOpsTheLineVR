@@ -21,7 +21,31 @@ void OnBeforeReset();
 // Thread di rendering: posa del visore con cui e' stato disegnato l'occhio del
 // frame in corso (nullptr = sconosciuta). Viaggia col frame fino al Submit.
 // tick: tick stereo del frame; si inviano solo coppie con lo stesso tick.
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick);
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter);
+
+// Proiezione decentrata dell'occhio (tangenti esatte del visore sull'intero
+// back buffer): NDC.x = tan.x * m00 + m20, NDC.y = tan.y * m11 + m21 (vista
+// UE3: x a destra, y in su). false finche' le tangenti non sono note.
+struct EyeProjection {
+    float m00, m11, m20, m21;
+};
+bool OffCenterProjection(int eye, EyeProjection* out);
+
+// Display inclinati: assi dell'occhio nella testa (componenti avanti, destra,
+// su di UE3). false se l'occhio guarda dritto davanti (quasi tutti i visori).
+bool EyeCant(int eye, float* fwd, float* right, float* up);
+
+// Frequenza del visore (Hz, 0 se ignota).
+float HmdRefreshHz();
+
+// Attesa massima (ms) sul thread di rendering per inviare la coppia nello
+// stesso tick in cui e' stata disegnata; 0 = invio al tick seguente.
+void SetSameTickWait(float ms);
+
+// Thread di rendering: percentuale della scena (ScreenPercentage) con cui e'
+// stata disegnata l'immagine dell'occhio; il ritaglio si restringe attorno al
+// centro del back buffer e il compositor la riallarga.
+void SetRenderScreenPercent(int eye, int percent);
 
 // Rettangolo (pixel del back buffer) della porzione di immagine dell'occhio.
 RECT EyeCropRect(int eye);

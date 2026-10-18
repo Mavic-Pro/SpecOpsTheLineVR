@@ -1,5 +1,7 @@
 #pragma once
 
+#include <openvr.h>
+
 // Controller Oculus Touch -> controller Xbox per il gioco.
 //
 // Il gioco legge il pad con XInputGetState / XInputSetState (XINPUT1_3,
@@ -10,6 +12,11 @@
 namespace vr::input {
 
 void InstallXInputHooks();
+
+// Riporta le pose dei controller (mano sinistra e destra) al riferimento dei
+// Touch: pose = raw * tip(controller) * inverse(tip(Touch)). Da chiamare con
+// il lock di sessione dopo GetDeviceToAbsoluteTrackingPose.
+void CorrectControllerPoses(vr::IVRSystem* sys, vr::TrackedDevicePose_t* poses);
 
 // Input finto per i test senza visore: valori stick in [-1,1], grilletti in
 // [0,1], bottoni = maschera XINPUT_GAMEPAD_*; durata in millisecondi.

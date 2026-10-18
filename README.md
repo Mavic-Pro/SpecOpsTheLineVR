@@ -39,6 +39,11 @@ virtual cinema screen.
 - **Comfort options**: smooth or snap turning, vignette, recentering.
 - **Sniper scopes** zoom like in the game.
 - Fast GPU-to-GPU frame copy (D3D9Ex shared surfaces to Direct3D 11 / OpenVR).
+- **Performance**: each eye drawn with its exact field of view (no wasted
+  pixels), resolution taken from SteamVR (use the SteamVR resolution slider),
+  dynamic resolution that keeps the headset frame rate, a VR graphics preset
+  and low-latency frame submission. Works with canted-display headsets
+  (Pimax and similar).
 - **Automatic updates** from the GitHub releases (stable or beta channel,
   withdrawn versions replaced automatically, `rollback.bat`).
 - Detailed **logs and crash dumps** for bug reports.
@@ -49,7 +54,9 @@ virtual cinema screen.
 - *Spec Ops: The Line* (Steam version; the mod checks the executable and stays
   inactive on unsupported versions).
 - SteamVR and a SteamVR headset with two motion controllers. Developed and
-  tested with a Meta Quest 3 over Link; Virtual Desktop works too.
+  tested with a Meta Quest 3 over Link; Virtual Desktop works too. Default
+  bindings for Quest/Rift Touch, Valve Index, Vive and Windows Mixed Reality
+  controllers.
 
 ## Install
 
@@ -60,8 +67,9 @@ virtual cinema screen.
    cannot, pass the folder:
    `install.bat "D:\SteamLibrary\steamapps\common\SpecOps_TheLine"`.
 3. In Steam, *Spec Ops: The Line > Properties > Launch options*, add
-   `-windowed ResX=2400 ResY=2500` (a nearly square window gives the sharpest
-   image in the headset).
+   `-windowed ResX=2400 ResY=2500`. Once the headset is on, the mod switches
+   the game to the resolution SteamVR recommends for your headset: to change
+   sharpness, use the SteamVR resolution slider.
 4. Start SteamVR, put the headset on, start the game.
 
 The game files are never modified: the mod only adds `d3d9.dll` and
@@ -90,6 +98,12 @@ back to the previous version (it also turns automatic updates off).
 | Left menu button | Pause |
 | Right stick held + direction | D-pad (secondary fire, grenade type) |
 | Both sticks held for 1 s | Recenter (stand straight and look ahead) |
+
+On **Valve Index** controllers A and B on the right hand are A and B, on the
+left hand X and Y; the left trackpad click pauses. Every action can be
+rebound in SteamVR: *Settings > Controllers > Manage controller bindings >
+Spec Ops: The Line*. Aiming is aligned to each controller's pointing
+direction, so it feels the same on every controller.
 
 | Gesture | Action |
 |---|---|
@@ -122,6 +136,21 @@ move the controllers on the stock.
 Both are off automatically when no device is found; `protube off` /
 `bhaptics off` in `specopsvr.ini` disable them.
 
+## Frame rate
+
+The mod keeps the game at the headset refresh rate with dynamic resolution.
+The headset software can still lock the game at half the refresh rate (for
+example 36 fps on a 72 Hz Quest) with its frame-synthesis feature, even when
+there is plenty of headroom:
+
+- **Quest over Link**: Meta ASW is turned off automatically while the game
+  runs and set back to Auto when it closes (`linkasw keep` to leave it).
+- **Index, Vive, Pimax, WMR**: SteamVR Motion Smoothing is forced off for
+  this game only (`motionsmoothing keep` to leave it).
+- **Virtual Desktop**: set *Synchronous Spacewarp* to *Disabled* in the
+  Virtual Desktop Streamer app if the game stays at half rate (the mod cannot
+  change it; it writes a reminder in the log when it detects VD).
+
 ## Configuration
 
 `specopsvr.ini` in the game's `Binaries\Win32` folder; every option is
@@ -130,7 +159,7 @@ performance, updates). The same commands can be sent while the game runs by
 writing them to `specopsvr_cmd.txt` in the same folder. If something looks
 wrong, most features can be switched off one by one (`submitpose off`,
 `ads off`, `coverpeek off`, `coversnap off`, `turretaim stick`,
-`cinemawalker screen`, `gesture melee off`).
+`cinemawalker screen`, `gesture melee off`, `vrinput legacy`).
 
 ## Reporting bugs
 

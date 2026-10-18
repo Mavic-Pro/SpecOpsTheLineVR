@@ -50,6 +50,23 @@ std::atomic<bool> g_twoHandEngaged{false};
 std::atomic<bool> g_cinemaWalker3D{true};
 std::atomic<bool> g_stockCalibRequest{false};
 std::atomic<bool> g_protube{true}, g_bhaptics{true};
+std::atomic<bool> g_gameCrosshair{false};
+std::atomic<bool> g_actionInput{true};
+std::atomic<bool> g_perEyeViewState{true};
+std::atomic<bool> g_offCenter{true};
+std::atomic<float> g_simCantDeg{0.0f};
+std::atomic<bool> g_dynRes{true};
+std::atomic<int> g_dynResMin{65};
+std::atomic<float> g_dynResBudgetMs{0.0f};
+std::atomic<int> g_dynResTestFrames{0};
+std::atomic<bool> g_vrPreset{true};
+std::atomic<bool> g_lowLatency{true};
+std::atomic<bool> g_autoResolution{true};
+std::atomic<bool> g_gpuTimer{true};
+std::atomic<bool> g_linkAswOff{true};
+std::atomic<bool> g_motionSmoothingOff{true};
+std::atomic<bool> g_threadLag{true};
+std::atomic<bool> g_poseCorrect{true};
 std::atomic<float> g_predictFrames{-1.0f};
 std::atomic<float> g_handPredictMs{0.0f};
 std::atomic<bool> g_gpuCopy{true};
@@ -525,6 +542,74 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_submitWithPose = (v != "off");
+    } else if (cmd == "threadlag") {
+        std::string v;
+        in >> v;
+        g_threadLag = (v != "off");
+    } else if (cmd == "motionsmoothing") {
+        std::string v;
+        in >> v;
+        g_motionSmoothingOff = (v != "keep");
+    } else if (cmd == "linkasw") {
+        std::string v;
+        in >> v;
+        g_linkAswOff = (v != "keep");
+    } else if (cmd == "gputimer") {
+        std::string v;
+        in >> v;
+        g_gpuTimer = (v != "off");
+    } else if (cmd == "resolution") {
+        std::string v;
+        in >> v;
+        g_autoResolution = (v != "window");
+    } else if (cmd == "lowlatency") {
+        std::string v;
+        in >> v;
+        g_lowLatency = (v != "off");
+    } else if (cmd == "vrpreset") {
+        std::string v;
+        in >> v;
+        g_vrPreset = (v != "off");
+    } else if (cmd == "dynres") {
+        std::string v;
+        in >> v;
+        if (v == "budget") {
+            float ms = 0.0f;
+            in >> ms;
+            g_dynResBudgetMs = ms;
+        } else if (v == "test") {
+            g_dynResTestFrames = 1200;
+        } else if (v == "min") {
+            int m = 65;
+            in >> m;
+            g_dynResMin = m < 40 ? 40 : (m > 100 ? 100 : m);
+        } else {
+            g_dynRes = (v != "off");
+        }
+    } else if (cmd == "eyecant") {
+        float d = 0.0f;
+        in >> d;
+        g_simCantDeg = d;
+    } else if (cmd == "offcenter") {
+        std::string v;
+        in >> v;
+        g_offCenter = (v != "off");
+    } else if (cmd == "eyestate") {
+        std::string v;
+        in >> v;
+        g_perEyeViewState = (v != "off");
+    } else if (cmd == "vrinput") {
+        std::string v;
+        in >> v;
+        g_actionInput = (v != "legacy");
+    } else if (cmd == "controllerpose") {
+        std::string v;
+        in >> v;
+        g_poseCorrect = (v != "raw");
+    } else if (cmd == "gamecrosshair") {
+        std::string v;
+        in >> v;
+        g_gameCrosshair = (v == "on");
     } else if (cmd == "protube") {
         std::string v;
         in >> v;

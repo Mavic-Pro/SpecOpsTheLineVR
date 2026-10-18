@@ -17,6 +17,9 @@ bool Ready();    // OpenVR inizializzato (di qualunque tipo)
 bool IsScene();  // si possono inviare immagini al compositor
 // Visore indossato (con isteresi: Idle breve non conta, vedi MonitorLoop).
 bool HmdPresent();
+// Cresce a ogni (re)inizializzazione di OpenVR: gli handle di SteamVR Input
+// vanno richiesti di nuovo.
+unsigned Generation();
 
 class Shared {
 public:
