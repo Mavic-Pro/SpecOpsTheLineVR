@@ -1,5 +1,7 @@
 #include "display_spoof.h"
 #include "logger.h"
+#include "control.h"
+#include "vr_session.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -150,6 +152,19 @@ BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
 WNDPROC g_originalWndProc = nullptr;
 
 LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // Col visore in uso la finestra del gioco che perde il focus (clic sul
+    // desktop di Virtual Desktop, una notifica) non deve mettere in pausa il
+    // gioco ne' fermare l'input: i messaggi di disattivazione non arrivano
+    // al gioco ("keepfocus off" per il comportamento normale; audit 19/10).
+    if (vr::control::g_keepFocus && vr::session::IsScene()) {
+        bool deactivate = (msg == WM_ACTIVATEAPP && wp == FALSE) || (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) ||
+                          msg == WM_KILLFOCUS;
+        if (deactivate) {
+            static int logged = 0;
+            if (logged++ < 3) vr::log::Line("DISPLAY: game window lost focus, ignored while the headset is in use.");
+            return 0;
+        }
+    }
     LRESULT r = CallWindowProcW(g_originalWndProc, hwnd, msg, wp, lp);
     if (msg == WM_SIZE) {
         static int budget = 20;

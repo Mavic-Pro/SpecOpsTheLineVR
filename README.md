@@ -11,12 +11,13 @@ virtual cinema screen.
 ## Features
 
 - **Stereoscopic 3D** at the headset's resolution, field of view and IPD,
-  synchronous stereo (both eyes rendered from the same game tick). Every frame
-  is sent to SteamVR with the head pose it was rendered with, so the headset's
-  reprojection stays stable when you move your head.
+  synchronous stereo (both eyes rendered from the same game tick), head pose
+  predicted to the moment the image reaches your eyes (measured on your PC).
 - **6DOF head tracking**: look, lean, crouch and side-step; the head stops at
-  walls instead of clipping through them. Crouching and popping up from cover
-  are smoothed.
+  walls instead of clipping through them. **Room-scale**: when you step,
+  Walker walks with you. Your real height sets the eye height (seated mode
+  available). The game's recoil, camera shakes and crouching never move your
+  view; cuts, checkpoints and death fade from black.
 - **First person** with Walker's body: his arms follow your controllers
   (inverse kinematics on the game's own skeleton), the gun stays in his hand,
   and the body turns with you when you turn around.
@@ -36,8 +37,10 @@ virtual cinema screen.
   (ForceTube / ProVolver) recoil and **bHaptics** vest and sleeves.
 - **Virtual cinema screen** for videos, menus and loading screens; scripted
   in-engine scenes stay in 3D.
-- **Comfort options**: smooth or snap turning, vignette, recentering.
-- **Sniper scopes** zoom like in the game.
+- **Comfort options**: smooth turning at a fixed speed or snap turning,
+  movement where you look, vignette, recentering (also follows the
+  headset's own recenter), left-handed mode.
+- **Sniper scopes** work as a lens along the barrel.
 - Fast GPU-to-GPU frame copy (D3D9Ex shared surfaces to Direct3D 11 / OpenVR).
 - **Performance**: each eye drawn with its exact field of view (no wasted
   pixels), resolution taken from SteamVR (use the SteamVR resolution slider),
@@ -55,8 +58,8 @@ virtual cinema screen.
   inactive on unsupported versions).
 - SteamVR and a SteamVR headset with two motion controllers. Developed and
   tested with a Meta Quest 3 over Link; Virtual Desktop works too. Default
-  bindings for Quest/Rift Touch, Valve Index, Vive and Windows Mixed Reality
-  controllers.
+  bindings for Quest/Rift Touch, Valve Index, Vive, Vive Cosmos, HP Reverb G2
+  and Windows Mixed Reality controllers.
 
 ## Install
 
@@ -91,11 +94,11 @@ back to the previous version (it also turns automatic updates off).
 | Left stick | Move |
 | Right stick | Turn (smooth or snap) |
 | Right trigger / left trigger | Fire / aim |
-| Left grip | Grenade (hold: trajectory, release: throw) |
+| Left grip | Grenade (hold: trajectory, release: throw); on the gun it just holds the gun |
 | Right grip (hold, point the gun at an enemy, release) | Squad attack order |
 | A / B / X / Y | Action-cover / melee / reload / next weapon |
 | B + Y held for 1 s | Gunstock calibration |
-| Left menu button | Pause |
+| Left menu button | Pause (hold 0.6 s: Back / objectives) |
 | Right stick held + direction | D-pad (secondary fire, grenade type) |
 | Both sticks held for 1 s | Recenter (stand straight and look ahead) |
 
@@ -114,7 +117,7 @@ direction, so it feels the same on every controller.
 | Lean out sideways (or stand up) while in cover | Pop out and aim |
 | Gun up to your eye | Aim down the sights |
 | Right hand over the right shoulder + grip | Next weapon |
-| Left hand on the barrel | Two-handed aiming |
+| Left hand on the barrel | The hand grips the gun; two-handed aiming |
 | Turn your head past 45 degrees | Walker turns with you |
 
 ## Gunstock

@@ -1,4 +1,5 @@
 #include "control.h"
+#include "default_ini.h"
 #include "logger.h"
 #include "vr_input.h"
 
@@ -6,6 +7,8 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <cctype>
+#include <set>
 #include <vector>
 #include <mutex>
 #include <array>
@@ -48,6 +51,33 @@ std::atomic<bool> g_turretAimHand{true};
 std::atomic<bool> g_adsEnabled{true};
 std::atomic<bool> g_adsActive{false};
 std::atomic<bool> g_twoHandEngaged{false};
+std::atomic<bool> g_leftOnGun{false};
+std::atomic<bool> g_headSampleOnDraw{true};
+std::atomic<float> g_turnSpeedDeg{150.0f};
+std::atomic<bool> g_moveWithHead{true};
+std::atomic<bool> g_vrDashboard{false};
+std::atomic<bool> g_vsDiag{false};
+std::atomic<bool> g_fades{true};
+std::atomic<bool> g_leftHanded{false};
+std::atomic<bool> g_cinemaRecenter{false};
+std::atomic<float> g_forcedMotion{0.0f};
+std::atomic<bool> g_heightAuto{true};
+std::atomic<bool> g_seated{false};
+std::atomic<float> g_eyeHeightAuto{-1.0f};
+std::atomic<bool> g_roomScale{true};
+std::atomic<int32_t> g_stickYawUnits{0};
+std::atomic<bool> g_keepFocus{true};
+std::atomic<bool> g_configLoaded{false};
+std::atomic<bool> g_weaponNeedsAim{false};
+std::atomic<bool> g_handPredictAuto{false};
+std::atomic<bool> g_crouchViewReal{true};
+std::atomic<bool> g_snapFade{true};
+std::atomic<bool> g_vrPauseRequest{false};
+std::atomic<bool> g_vrProjectionDirty{false};
+std::atomic<int32_t> g_headYawUnits{0};
+std::atomic<bool> g_gameLocked{false};
+std::atomic<bool> g_inCover{false};
+std::atomic<bool> g_gamePaused{false};
 std::atomic<bool> g_cinemaWalker3D{true};
 std::atomic<bool> g_stockCalibRequest{false};
 std::atomic<bool> g_protube{true}, g_bhaptics{true};
@@ -133,9 +163,10 @@ std::string UpdateRepo() {
     return g_updateRepo;
 }
 std::atomic<bool> g_fpBody{true};
-std::atomic<bool> g_leftGrip{false};
-std::atomic<float> g_bodyBack{6.0f};
-std::atomic<float> g_bodyBackLook{10.0f};
+std::atomic<bool> g_leftGrip{true};
+std::atomic<float> g_leftGripCm{20.0f};
+std::atomic<float> g_bodyBack{-10.0f};
+std::atomic<float> g_bodyBackLook{26.0f};
 std::atomic<bool> g_bodyFollowsHead{true};
 std::atomic<float> g_armRotDeg[3];
 std::atomic<float> g_armOffsetCm[3];
@@ -160,6 +191,7 @@ std::atomic<bool> g_gestureGrenade{true}, g_gestureReload{true}, g_gestureCover{
 std::atomic<bool> g_gestureMelee{true};
 std::atomic<bool> g_reloadPhysical{true};
 std::atomic<float> g_magwellCm[2] = {4.0f, 10.0f};
+std::atomic<float> g_magwellClassCm[2] = {0.0f, 0.0f};
 std::atomic<float> g_throwDir[3];
 std::atomic<unsigned long long> g_throwStamp{0};
 std::atomic<bool> g_gestureWeapon{true};
@@ -207,12 +239,110 @@ std::string ShotPath(const std::string& name) {
     return dir + "\\" + name + ".bmp";
 }
 
-void Execute(const std::string& line) {
+void ExecuteNormalized(const std::string& line);
+
+// Righe scritte a mano: "hud 0,6 150" (virgola decimale) leggeva 0 e l'HUD
+// spariva, "spread On" spegneva la dispersione, un commento a fine riga
+// finiva nei valori (audit 19/10). Fuori dai comandi che passano nomi del
+// gioco o percorsi, i valori vanno in minuscolo, la virgola tra cifre
+// diventa punto, true/yes/false/no diventano on/off.
+void Execute(const std::string& raw) {
+    std::string line = raw;
+    for (char& c : line)
+        if (c == '\t') c = ' ';
+    std::istringstream head(line);
+    std::string cmd;
+    head >> cmd;
+    static const char* kVerbatim[] = {"ucall", "ce", "console", "giveweapon", "gunoffsetclass", "updaterepo", "shot",
+                                      "mirrorshot", "gesturesim", "armcontrols", "pad"};
+    bool verbatim = false;
+    for (const char* v : kVerbatim)
+        if (cmd == v) verbatim = true;
+    if (!verbatim && !cmd.empty() && cmd[0] != '#') {
+        size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        for (size_t i = 0; i < line.size(); ++i) {
+            line[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(line[i])));
+            if (line[i] == ',' && i > 0 && i + 1 < line.size() && std::isdigit(static_cast<unsigned char>(line[i - 1])) &&
+                std::isdigit(static_cast<unsigned char>(line[i + 1])))
+                line[i] = '.';
+        }
+        std::istringstream words(line);
+        std::string w, out;
+        while (words >> w) {
+            if (w == "true" || w == "yes") w = "on";
+            if (w == "false" || w == "no") w = "off";
+            out += (out.empty() ? "" : " ") + w;
+        }
+        line = out;
+    }
+    ExecuteNormalized(line);
+}
+
+// Comandi aggiunti con l'audit del 19/10, fuori dalla catena principale di
+// Execute (MSVC ha un limite di annidamento degli else if).
+bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
+    if (cmd == "hand") {
+        std::string v;
+        in >> v;
+        g_leftHanded = (v == "left");
+    } else if (cmd == "headsample") {
+        std::string v;
+        in >> v;
+        g_headSampleOnDraw = (v != "render");
+    } else if (cmd == "turnspeed") {
+        float v = 150.0f;
+        in >> v;
+        g_turnSpeedDeg = v < 0.0f ? 0.0f : (v > 720.0f ? 720.0f : v);
+    } else if (cmd == "movedir") {
+        std::string v;
+        in >> v;
+        g_moveWithHead = (v != "body");
+    } else if (cmd == "vsdiag") {
+        std::string v;
+        in >> v;
+        g_vsDiag = (v == "on");
+    } else if (cmd == "fades") {
+        std::string v;
+        in >> v;
+        g_fades = (v != "off");
+    } else if (cmd == "snapfade") {
+        std::string v;
+        in >> v;
+        g_snapFade = (v != "off");
+    } else if (cmd == "crouchview") {
+        std::string v;
+        in >> v;
+        g_crouchViewReal = (v != "game");
+    } else if (cmd == "keepfocus") {
+        std::string v;
+        in >> v;
+        g_keepFocus = (v != "off");
+    } else if (cmd == "roomscale") {
+        std::string v;
+        in >> v;
+        g_roomScale = (v != "off");
+    } else if (cmd == "height") {
+        std::string v;
+        in >> v;
+        g_heightAuto = (v == "auto");
+    } else if (cmd == "seated") {
+        std::string v;
+        in >> v;
+        g_seated = (v == "on");
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void ExecuteNormalized(const std::string& line) {
     std::istringstream in(line);
     std::string cmd;
     in >> cmd;
     if (cmd.empty() || cmd[0] == '#') return;
     vr::log::Line("CMD: " + line);
+    if (ExecuteExtra(cmd, in)) return;
 
     if (cmd == "mode") {
         std::string m;
@@ -381,6 +511,8 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_leftGrip = (v != "off");
+        float cm = 0.0f;
+        if (in >> cm && cm > 0.0f) g_leftGripCm = cm;
     } else if (cmd == "bodyfollow") {
         std::string v;
         in >> v;
@@ -688,8 +820,11 @@ void Execute(const std::string& line) {
         in >> v;
         g_commandFollowsGun = (v != "head");
     } else if (cmd == "handpredict") {
-        float v = 25.0f;
-        in >> v;
+        // handpredict <ms> | auto (= stessa predizione della testa)
+        std::string t;
+        in >> t;
+        g_handPredictAuto = (t == "auto");
+        float v = g_handPredictAuto ? 0.0f : static_cast<float>(std::atof(t.c_str()));
         g_handPredictMs = v < 0.0f ? 0.0f : (v > 60.0f ? 60.0f : v);
     } else if (cmd == "predict") {
         std::string t;
@@ -786,22 +921,33 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // ai vecchi predefiniti (una scelta diversa dell'utente resta).
 // 2 (0.9.6): "submitpose on" -> off, "predict off" -> auto (fisheye e bande
 // nere muovendo la testa, 19/10).
-constexpr int kConfigVersion = 2;
+// 3 (0.9.7): "bodyback 6 10" -> "bodyback -10 26" (corpo sotto la testa: le
+// braccia arrivano ai controller e la sinistra all'astina).
+// 4 (0.9.7, prove del 19/10): "bodyback -10 10" -> "bodyback -10 26" (guardando
+// in basso col corpo avanti si vedeva l'interno del colletto).
+// 5 (0.9.7): "hud 0.6 150" -> "hud 0.5 100" (angoli dell'HUD fuori dalla zona nitida delle lenti, HUD a 3 m
+// davanti a ripari a 30 cm; audit 19/10).
+constexpr int kConfigVersion = 5;
 
 void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
     int version = 1;
     for (const auto& l : lines)
         if (l.rfind("configversion ", 0) == 0) version = std::atoi(l.c_str() + 14);
     if (version >= kConfigVersion) return;
+    // Ogni cambio vale solo per gli ini piu' vecchi della sua versione: chi era
+    // gia' alla 2 e aveva rimesso a mano "submitpose on" non viene toccato.
     struct Change {
+        int version;
         const char* from;
         const char* to;
     };
-    static const Change kChanges[] = {{"submitpose on", "submitpose off"}, {"predict off", "predict auto"}};
+    static const Change kChanges[] = {
+        {2, "submitpose on", "submitpose off"}, {2, "predict off", "predict auto"}, {3, "bodyback 6 10", "bodyback -10 26"},
+        {4, "bodyback -10 10", "bodyback -10 26"}, {5, "hud 0.6 150", "hud 0.5 100"}};
     std::string done;
     for (auto& l : lines)
         for (const auto& c : kChanges)
-            if (l == c.from) {
+            if (version < c.version && l == c.from) {
                 l = c.to;
                 done += std::string(" \"") + c.from + "\" -> \"" + c.to + "\";";
             }
@@ -821,6 +967,41 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
                   (done.empty() ? std::string(" no default to change") : done));
 }
 
+// Chiave di una riga dell'ini: il comando, piu' il sottocomando per quelli
+// che ne hanno ("gesture grenade on", "dynres min 65").
+std::string ConfigKey(const std::string& line) {
+    std::istringstream in(line);
+    std::string cmd, sub;
+    in >> cmd >> sub;
+    if (cmd == "gesture" || (cmd == "dynres" && (sub == "min" || sub == "budget" || sub == "max"))) return cmd + " " + sub;
+    return cmd;
+}
+
+// Predefiniti distribuiti (deploy/specopsvr.ini incorporato) per le voci che
+// l'ini dell'utente non ha: un ini vecchio o accorciato riceve i valori delle
+// versioni nuove invece dei predefiniti del codice (audit 19/10: submitpose,
+// predict e near divergevano).
+void ApplyDefaultsMissingFrom(const std::vector<std::string>& lines) {
+    std::set<std::string> have;
+    for (const auto& l : lines)
+        if (!l.empty() && l[0] != '#') have.insert(ConfigKey(l));
+    std::istringstream all(kDefaultIni);
+    std::string l, added;
+    while (std::getline(all, l)) {
+        if (l.empty() || ConfigKey(l) == "configversion" || have.count(ConfigKey(l))) continue;
+        Execute(l);
+        added += " \"" + l + "\";";
+    }
+    if (!added.empty()) vr::log::Line("CONFIG: defaults for settings missing from specopsvr.ini:" + added);
+}
+
+// I thread partiti all'avvio aspettano l'ini invece di un tempo fisso: con un
+// avvio lento "autoupdate off" o "protube off" arrivavano dopo (audit 19/10).
+void WaitForConfig(unsigned maxMs, unsigned extraMs) {
+    for (unsigned waited = 0; !g_configLoaded && waited < maxMs; waited += 250) Sleep(250);
+    Sleep(extraMs);
+}
+
 void LoadConfigFile() {
     std::string path = ModuleDirectory() + "\\specopsvr.ini";
     std::vector<std::string> lines;
@@ -828,6 +1009,7 @@ void LoadConfigFile() {
         std::ifstream f(path);
         if (!f) {
             vr::log::Line("CONFIG: specopsvr.ini not found, using the defaults.");
+            ApplyDefaultsMissingFrom(lines);
             return;
         }
         std::string line;
@@ -839,6 +1021,7 @@ void LoadConfigFile() {
         }
     }
     MigrateConfig(lines, path);
+    ApplyDefaultsMissingFrom(lines);
     vr::log::Line("CONFIG: loading specopsvr.ini");
     for (const auto& line : lines) Execute(line);
 }
@@ -849,6 +1032,7 @@ void Poll() {
     if (!configLoaded) {
         configLoaded = true;
         LoadConfigFile();
+        g_configLoaded = true;
     }
     ULONGLONG now = GetTickCount64();
     if (now - lastPoll < 500) return;

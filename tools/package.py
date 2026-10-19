@@ -54,7 +54,19 @@ function Find-Game([string]$game) {
 INSTALL_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
-Copy-Item -Force (Join-Path $PSScriptRoot 'd3d9.dll'), (Join-Path $PSScriptRoot 'openvr_api.dll') $dst
+if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
+# Another d3d9.dll (ReShade, dgVoodoo...) is kept aside, uninstall puts it back.
+$cur = Join-Path $dst 'd3d9.dll'
+if ((Test-Path $cur) -and -not (Select-String -Path $cur -Pattern 'specopsvr' -SimpleMatch -Quiet)) {
+  Copy-Item -Force $cur (Join-Path $dst 'd3d9.dll.other')
+  Write-Host 'Another d3d9.dll was found and saved as d3d9.dll.other (uninstall.bat restores it).'
+}
+try {
+  Copy-Item -Force -ErrorAction Stop (Join-Path $PSScriptRoot 'd3d9.dll'), (Join-Path $PSScriptRoot 'openvr_api.dll') $dst
+} catch {
+  Write-Host "Copy failed: $($_.Exception.Message)"
+  exit 1
+}
 $ini = Join-Path $dst 'specopsvr.ini'
 if (Test-Path $ini) {
   Copy-Item -Force (Join-Path $PSScriptRoot 'specopsvr.ini') "$ini.new"
@@ -69,19 +81,29 @@ Write-Host 'Start SteamVR, then the game.'
 UNINSTALL_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
+if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
 foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst $f)
+}
+$other = Join-Path $dst 'd3d9.dll.other'
+if (Test-Path $other) {
+  Move-Item -Force $other (Join-Path $dst 'd3d9.dll')
+  Write-Host 'Your previous d3d9.dll was put back.'
 }
 # Controller bindings written by the mod (SteamVR Input).
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $dst 'specopsvr_input')
 Write-Host "SpecOpsTheLineVR removed from $dst (specopsvr.ini and the logs were kept)."
+Write-Host 'Remember to remove "-windowed ResX=2400 ResY=2500" from the Steam launch options.'
+
 """
 
 ROLLBACK_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
 $prev = Join-Path $dst 'd3d9.dll.prev'
-if (-not (Test-Path $prev)) { Write-Host 'No previous version found (d3d9.dll.prev).'; exit 1 }
+# A dll that never started leaves the replaced version as d3d9.dll.old.
+if (-not (Test-Path $prev)) { $prev = Join-Path $dst 'd3d9.dll.old' }
+if (-not (Test-Path $prev)) { Write-Host 'No previous version found (d3d9.dll.prev / .old).'; exit 1 }
 if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
 Copy-Item -Force (Join-Path $dst 'd3d9.dll') (Join-Path $dst 'd3d9.dll.rolledback')
 Copy-Item -Force $prev (Join-Path $dst 'd3d9.dll')
@@ -141,7 +163,8 @@ click = pause; every button can be changed in SteamVR > Settings >
 Controllers > Manage controller bindings > Spec Ops: The Line)
   Left stick: move                 Right stick: turn
   Right trigger: fire              Left trigger: aim
-  Left grip: grenade (LB)          Right grip: squad orders (RB)
+  Left grip: grenade (LB), or hold the gun when your left hand is on it
+  Right grip: squad orders (RB)
   A: action / cover                B: melee
   X: reload                        Y: next weapon
   Stick clicks: LS / RS            Left menu button: Start (pause)
@@ -155,8 +178,10 @@ Controllers > Manage controller bindings > Spec Ops: The Line)
 
 GESTURES
   Grenade: quick forward throw with the left hand.
-  Reload: left hand on the magazine (below the right hand), then pull down.
-  Cover: duck quickly next to cover.
+  Reload: grip the magazine under the gun with your left hand and pull it out,
+    grip at your belt to take a new one, push it into the gun.
+    ("reload simple" in specopsvr.ini: left hand on the magazine, pull down.)
+  Cover: duck quickly next to cover (not while already in cover).
   Weapon: right hand over your right shoulder + right grip = next weapon.
   Melee: punch forward with the left hand at chest height.
   Cover: lean out sideways (or stand up) to pop out and aim.
@@ -179,6 +204,11 @@ REPORTING BUGS
 
 
 def main():
+    # "python tools/package.py v0.9.7": the tag must match version.h, or the
+    # released dll would report an older version and update itself forever.
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].lstrip("v") != version():
+        raise SystemExit("tag %s does not match version.h %s" % (sys.argv[1], version()))
     if os.path.exists(DIST):
         shutil.rmtree(DIST)
     os.makedirs(DIST)

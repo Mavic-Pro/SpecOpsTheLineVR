@@ -289,6 +289,36 @@ Useful offsets (`ue3.py props`):
   far from its target for 150 ms is real (arm stretched past its reach) and
   those poses are kept. Measured walking: 0 gun jumps in 1800 frames (150-200
   before), 263 updates restored. `gunlog N` / `skellog N` print the data.
+  Since 0.9.7 the left hand is checked too while the mod drives it (with the
+  grip below, about one update in five put it 10-15 units off the handguard
+  for one frame); each hand has its own 150 ms "really out of reach" timer.
+- **Left hand on the gun** (0.9.7, `leftgrip on <cm>`): in the animation the
+  helper bones `IK_Hand_R` / `IK_Hand_L` sit where the game puts the hands on
+  the weapon (with `arms off` they coincide with `Hand_Right` / `Hand_Left`),
+  and the mod moves the `Hand_*` bones, not the `IK_*` ones. `IK_Hand_L` in
+  the frame of `IK_Hand_R` (from `SpaceBases`, previous update) is therefore
+  the support grip relative to the right hand, for the weapon in hand:
+  (16.2, -3.1, -5.6) for M4/AK/AA12/Barrett/Milkor, 17.8 Benelli, 21.8
+  sawed-off, 9.3 P90, 6.4 RPG; ~30 for pistols and the Micro Uzi, which are
+  one-handed (no grip past 26). When the left controller is within `leftgrip`
+  cm (default 20, release at 1.4x) of that point, the left hand blends in
+  120 ms to the grip pose composed with the wanted right-hand pose: fingers
+  stay closed on the handguard whatever the controller's rotation
+  (gunstocks). Before, the left hand stayed open where the controller was,
+  or (`leftgrip`, off by default) went back to the game animation, which does
+  not follow the gun moved by the mod. If the grip is out of the left arm's
+  reach (natural arm length from `LocalAtoms`, minimum seen on both arms
+  because stretching writes there, times `armstretch`), it slides along the
+  gun towards the right hand, up to 14 units (fast up, 0.8 s down: walking
+  sways the shoulders).
+- **Body under the head** (0.9.7): the camera is `fp` 15 units in front of
+  Walker's centre and ~10 above his eyes; with `bodyback 6` his shoulders
+  were ~18 units behind the eyes and a hand 45 cm in front of the head was
+  10 units out of reach (the left one 20+). Default `bodyback -10 10`: the
+  body moves forward along its own axis, the extra (looking down, head turned)
+  away from the gaze. Checked looking down to -85 degrees and turning the head
+  80-130 degrees: chest, legs and a shoulder, no open collar. Settings
+  version 3 migrates `bodyback 6 10`.
 - Directly loading a mission (`open TheLine_P?mission=SP_Gorge01_P`) leaves
   the Gorge01 intro stuck on a transition movie (`YSeqAct_FullscreenMoviePlayer`
   `03a_transition`) also **without** the mod: an artefact of the direct load,
@@ -349,7 +379,7 @@ Useful offsets (`ue3.py props`):
   barrel its grip does not throw a grenade.
 - Haptics: the game's motor speed is remembered and pulsed every frame on the
   gun hand (and the left hand when two-handed); gestures confirm with 70 ms.
-- Controllers are predicted `handpredict` ms (25) ahead; head roll and hand
+- Controllers are predicted `handpredict` ms ahead (default 0, `auto` = like the head); head roll and hand
   roll use atan2(right.y, up.y).
 - Scenes with bCinematicMode but the camera still on Walker stay in 3D unless
   `YPlayerController.IsPlayingFullscreenMovie` (`cinemawalker`).
@@ -452,6 +482,150 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   magazine; 12 s without finishing or the X button resets. While the left
   hand is at the magwell or the grip belongs to the reload, the grip is not
   sent to the game as LB (grenade).
+
+## VR audit fixes (0.9.7)
+
+On 19/10 five agents audited the mod (rendering, comfort, weapons, input/UX, an
+automated playtest). What changed, by area:
+
+**View and comfort**
+- The body is the PlayerController rotation (`+0x60/+0x64`), not the game
+  camera: camera shakes, CameraAnims and weapon recoil no longer rotate the
+  view. Body pitch is 0 unless `stickpitch on`; game roll is dropped.
+  Measured: a 3 s M4 burst kept the view at 0 degrees (10 degrees climb
+  before). `YWeapon.m_recoilDistortionRange[3]` (+0x7E0) is zeroed on the held
+  weapon while the arms are driven; a visual kick (2.5 degrees, x2.2 for heavy
+  weapons, 15 ms up, 60 ms decay) moves only the drawn gun.
+- Head and controller poses are sampled once per tick on the game thread at
+  the start of `FViewport::Draw` (`headsample draw`, default), not 2-3 times per
+  tick in `BeginScene` on the render thread. PlayerController writes
+  (turn with head, turret) are now on the game thread; `AddControllerYaw` also
+  adds the delta to this tick's body yaw.
+- The per-eye offset is removed before eye-height smoothing and head
+  collision and added back after: both eyes keep their own height under head
+  roll, and collision no longer shrinks the IPD. Collision `t` recovers in
+  0.1 s (stops at once). Wall pull grows at most 150 units/s.
+- Smooth turn is done by the mod (`turnspeed`, default 150 deg/s, quadratic
+  after a 0.15 dead zone) and counted as own yaw; stick and snap turns pivot
+  around the head (`posRef` moved so the eyes stay put). Near cover every
+  non-own yaw change above 0.5 degrees per tick is absorbed (was 7 degrees).
+- Left stick moves where you look (`movedir head`) outside cover.
+- `crouchview real`: the game's crouch (capsule 45 -> 25, pawn 20 units down)
+  is removed from the view and the mesh is raised by the same amount (less
+  when looking down past 30 degrees); a physical crouch lowers the mesh.
+  `height auto`: eye height = standing HMD height x posscale - 45 (25..55);
+  `seated on` uses `fp`.
+- Room-scale: past 15 cm the Pawn is moved with `Actor.Move` (collisions) and
+  `posRef` shifts by the distance actually moved.
+- Standing-height reference: spikes over 10 cm per sample ignored, decays
+  1 cm/s within 15 cm of standing. Coverpeek uses only the sideways (body
+  right) component. Turn-with-head catch-up limited to 180 deg/s.
+- `bodyback -10 26` (body under the head, settings version 3-4); `Neck` is
+  hidden with `head` (no neck stump looking down while crouched).
+- Compositor fades (`fades`): fade from black on cinema switches and view
+  jumps over 80 units; black while the camera leaves Walker before the cinema
+  screen; 0.12 s blink on snap turns (`snapfade`). Comfort vignette updated
+  once per pair and time-based, also driven by forced motion (vehicles,
+  non-own rotations).
+- Scripted 3D scenes (`bCinematicMode` with the camera on Walker): arms follow
+  the game animation; the view goes down with Walker's head bone (only
+  downwards, 0.3 s smoothing).
+- Head yaw from poses near +-90 degrees pitch blends in the up vector (stable
+  when looking straight down).
+
+**Rendering and output**
+- A new left image while a pair is still pending drops the whole old pair
+  (no left/right from different ticks). The worker waits for the D3D11 copy
+  (event query) before returning shared slots, and keeps `g_workerBusy` until
+  after `Submit` (eye textures could be freed during Submit).
+- Presents without stereo Draws for 200 ms outside cinema go to the cinema
+  screen (no flat image in both eyes during blocking loads).
+- HUD: per-draw tag (`PeekRenderingTag`) for off-center and screen percent;
+  the HUD is scaled by the dynamic-resolution percentage. Full-screen Canvas
+  draws (over 85% of the back buffer) use the game's matrix. Default
+  `hud 0.5 100` (settings version 5).
+- Cinema: crop held for 30 frames before changing, readback capped at 1600 px
+  wide, screen re-placed on recenter, dark grey background.
+- Scope: the zoomed view looks along the barrel (`g_muzzleAimYaw/Pitch`), is
+  mono and is masked to a circle (0.42 of the half height).
+- OpenVR events: dashboard / input focus -> one Start press and no input or
+  gestures; universe or zero-pose change -> recenter; IPD / HMD property change
+  -> projection recomputed; Quit -> `AcknowledgeQuit_Exiting`, session closed
+  and retried every 5 s (also when SteamVR is missing at start).
+- VS constant diagnostics only with `vsdiag on`; log flushed at most every
+  250 ms (errors at once).
+
+**Weapons and hands**
+- Left hand grip: relation fixed per weapon (accepted after 0.3 s stable,
+  then only small changes), blend out from the last relation, slerp. Without a
+  left controller the left hand holds the gun (or goes back to the game
+  animation with no gun). `KeepGoodBones` compares each hand with the
+  reachable point (target clamped to shoulder + arm reach), so reaching past
+  the arm no longer freezes the skeleton for 150 ms.
+- Shots and marker start at the muzzle bone (`YWeapon.m_muzzleBoneName`
+  +0x2E8 on the weapon mesh); if the shoulder -> muzzle line is blocked the
+  shot starts at the obstacle and the drawn gun moves back along the barrel
+  (up to 20 units).
+- Hand/weapon relation: a very different measurement must be confirmed by the
+  next one (no 90-degree wrist twist during weapon switches).
+- Two-handed aim keeps the offset between the right-hand direction and the
+  hands line captured when the grip engages (no jump, gunstock calibration
+  preserved). `aimpitch` is a rotation about the controller's right axis.
+- `marker off` only hides the marker. Turret marker uses body yaw only (body
+  pitch is 0). Milkor: no straight-line marker. RPG: LT held with the trigger.
+- Physical reload sends X at the eject; magwell offset per class (pistols in
+  the grip, P90 on top, shotguns further forward). Traces include pawns.
+
+**Input, UX, robustness**
+- The left grip's meaning (grenade or gun/reload) is decided at the press.
+  Gestures are off in cinema, locked scenes, pause and with the dashboard;
+  duck-to-cover only out of cover with the stick still; the weapon-swap
+  gesture needs the hand behind the face plane and to the side.
+- B+Y and the two stick clicks are held back 120 ms (short taps pass as
+  100 ms pulses), so combos no longer leak. Left menu held 0.6 s = Back.
+- Action state read with QPC. Bindings for Vive (trackpad dpad), Cosmos, HP
+  Reverb G2, Index grip as `grab`; legacy fallback after 5 s with no active
+  action (headset worn, no dashboard). Neutral connected pad when the VR
+  session is up but the controllers give no data. `hand left` swaps the
+  controllers.
+- Settings: values lower-cased, decimal commas, true/false/yes/no, trailing
+  comments; each migration step applies only to inis older than its version;
+  the shipped ini is embedded (`default_ini.h`) and its values are applied for
+  keys missing from the user's ini. Updater checks the release asset size and
+  SHA-256 (`digest`); rollback also restores `d3d9.dll.old`; install keeps a
+  foreign `d3d9.dll` as `d3d9.dll.other`; `package.py <tag>` checks
+  `version.h`. Threads wait for the ini instead of 15 s. Window deactivation
+  is ignored while the headset is in use (`keepfocus`). Crash filter chained
+  to the game's, vectored handler for always-fatal codes. bHaptics socket
+  read. Squad scan back-off fixed.
+
+**Found while testing 0.9.7 in the headset (19/10)**
+- Squad orders on the billboard sniper were refused: the game checks the
+  target's visibility from its camera, which `height auto` had lowered. The
+  game camera keeps `fp`; only the view adds the height difference.
+- Crash at death: the new body/room-scale code moved the Pawn, mesh and bones
+  of the ragdoll. Everything that moves Walker stops when `Health <= 0`.
+- Doubled world at checkpoint saves: Presents without stereo Draws go to the
+  cinema screen only after 1.5 s (short stalls skip the frame).
+- Doubled world after videos and scripted scenes: the eye recognition from the
+  view-origin register (c5) had been switched off with the `vsdiag`
+  diagnostics; it re-aligns the frame tags (7 re-alignments measured after the
+  prologue's cinema switches). Leftover mono tags are skipped and the queue is
+  cleared on cinema switches. Both eyes of a tick use the same head base and
+  body rotation.
+- Helicopter: on a mount (turret, driven vehicle, or a Base actor that moved
+  in the last second; the old "Base == WorldInfo" test failed on most
+  StaticMeshActor and Terrain floors) the view is rigid to the Pawn at the
+  filtered offset of Walker's head (Spine3 -> Neck + 12 units, ~1 s filter;
+  bone positions lag the moving helicopter), no `fp` forward offset, no body
+  following, no room-scale, no eye-height smoothing, head at most 6 units
+  above Walker's (the cabin does not block traces). Fades only on real jumps
+  outside scripted scenes; black hold only at death.
+
+Not changed (need the headset or more work): `submitpose` A/B now that the
+projection is fixed; the root cause of the bad compose ticks (still ~5-9% of
+updates restored in combat); world-anchored Canvas icons follow the HUD
+scaling; elbow pole target fixed in actor space; marker drawn over the gun.
 
 ## Developer commands
 

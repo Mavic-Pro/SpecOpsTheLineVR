@@ -93,9 +93,13 @@ void WriteHeader(const std::string& dir) {
 
 // Crash del gioco: riga nel log con codice, indirizzo e modulo, piu' un
 // minidump accanto al log (da allegare alle segnalazioni).
+// Filtro del gioco sostituito dal nostro: lo si chiama dopo il minidump, cosi'
+// anche il rapporto di crash del gioco viene scritto.
+LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
+
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
     static volatile LONG once = 0;
-    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedExchange(&once, 1)) return g_prevFilter ? g_prevFilter(info) : EXCEPTION_CONTINUE_SEARCH;
     DWORD code = info->ExceptionRecord->ExceptionCode;
     void* addr = info->ExceptionRecord->ExceptionAddress;
     HMODULE mod = nullptr;
@@ -124,7 +128,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
             Line("CRASH: minidump written to " + dump);
         CloseHandle(f);
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    return g_prevFilter ? g_prevFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
 
 }  // namespace
@@ -139,7 +143,44 @@ void Init() {
     g_file.flush();
 }
 
-void InstallCrashHandler() { SetUnhandledExceptionFilter(&CrashFilter); }
+// Codici sempre fatali, mai usati dalle prove di lettura protette (__try):
+// gestiti al primo passaggio, prima che i gestori di UE3 (che catturano le
+// eccezioni nel loro main guardato) chiudano il gioco senza passare dal
+// filtro (audit 19/10: i minidump mancavano dalle segnalazioni).
+LONG WINAPI FatalVectoredHandler(EXCEPTION_POINTERS* info) {
+    switch (info->ExceptionRecord->ExceptionCode) {
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case 0xC0000374:  // STATUS_HEAP_CORRUPTION
+        CrashFilter(info);
+        break;
+    default:
+        break;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+DWORD WINAPI KeepCrashFilter(LPVOID) {
+    // UE3 puo' sostituire il filtro all'avvio: lo si rimette per un minuto.
+    for (int i = 0; i < 60; ++i) {
+        Sleep(1000);
+        LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(&CrashFilter);
+        if (prev != &CrashFilter && prev != nullptr) {
+            g_prevFilter = prev;
+            Line("CRASH: the game installed its crash filter, chained after ours.");
+        }
+    }
+    return 0;
+}
+
+void InstallCrashHandler() {
+    LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(&CrashFilter);
+    if (prev != &CrashFilter) g_prevFilter = prev;
+    AddVectoredExceptionHandler(0, &FatalVectoredHandler);
+    HANDLE t = CreateThread(nullptr, 0, &KeepCrashFilter, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+}
 
 void Line(const std::string& message) {
     std::string entry = "[" + Timestamp() + "] " + message;
@@ -150,7 +191,15 @@ void Line(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file.is_open()) {
         g_file << entry << "\n";
-        g_file.flush();
+        // Scrittura su disco al massimo ogni 250 ms (prima a ogni riga, anche
+        // sul thread di rendering); subito per errori e crash.
+        static ULONGLONG lastFlush = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastFlush > 250 || message.find("ERROR") != std::string::npos ||
+            message.find("CRASH") != std::string::npos) {
+            g_file.flush();
+            lastFlush = now;
+        }
     }
 }
 

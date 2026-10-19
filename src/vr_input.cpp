@@ -3,6 +3,7 @@
 #include "control.h"
 #include "haptics_ext.h"
 #include "vr_session.h"
+#include "vr_output.h"
 
 #include <windows.h>
 #include <openvr.h>
@@ -110,15 +111,32 @@ const std::vector<Profile>& Profiles() {
           {1, "a", "button", "click", kPrimary}, {1, "b", "button", "click", kSecondary},
           {0, "x", "button", "click", kPrimary}, {0, "y", "button", "click", kSecondary},
           {0, "system", "button", "click", kMenu}}},
+        // Index: grip come presa vera ("grab": soglia con isteresi del
+        // sensore di forza), non come grilletto (audit 19/10).
         {"knuckles",
          {{-1, "thumbstick", "joystick", "position", kStick}, {-1, "thumbstick", "joystick", "click", kStickClick},
-          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "trigger", "click", kGrip},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "grab", "grab", kGrip},
           {-1, "a", "button", "click", kPrimary}, {-1, "b", "button", "click", kSecondary},
           {0, "trackpad", "button", "click", kMenu}}},
+        // Vive: trackpad diviso in zone col clic (sotto = A/X, sopra = B/Y,
+        // centro = clic dello stick): prima mancavano B, X e Y (audit 19/10).
         {"vive_controller",
-         {{-1, "trackpad", "trackpad", "position", kStick}, {-1, "trackpad", "trackpad", "click", kStickClick},
+         {{-1, "trackpad", "trackpad", "position", kStick}, {-1, "trackpad", "dpad", "center", kStickClick},
+          {-1, "trackpad", "dpad", "south", kPrimary}, {-1, "trackpad", "dpad", "north", kSecondary},
           {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "button", "click", kGrip},
           {0, "application_menu", "button", "click", kMenu}, {1, "application_menu", "button", "click", kPrimary}}},
+        {"vive_cosmos_controller",
+         {{-1, "joystick", "joystick", "position", kStick}, {-1, "joystick", "joystick", "click", kStickClick},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "button", "click", kGrip},
+          {1, "a", "button", "click", kPrimary}, {1, "b", "button", "click", kSecondary},
+          {0, "x", "button", "click", kPrimary}, {0, "y", "button", "click", kSecondary},
+          {0, "application_menu", "button", "click", kMenu}}},
+        {"hpmotioncontroller",
+         {{-1, "joystick", "joystick", "position", kStick}, {-1, "joystick", "joystick", "click", kStickClick},
+          {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "trigger", "click", kGrip},
+          {1, "a", "button", "click", kPrimary}, {1, "b", "button", "click", kSecondary},
+          {0, "x", "button", "click", kPrimary}, {0, "y", "button", "click", kSecondary},
+          {0, "application_menu", "button", "click", kMenu}}},
         {"holographic_controller",
          {{-1, "joystick", "joystick", "position", kStick}, {-1, "joystick", "joystick", "click", kStickClick},
           {-1, "trigger", "trigger", "pull", kTrigger}, {-1, "grip", "button", "click", kGrip},
@@ -158,8 +176,9 @@ std::string BindingJson(const Profile& p) {
                     "\"description\":\"Spec Ops: The Line VR default bindings\",\"bindings\":{\"/actions/main\":{\"sources\":[";
     for (size_t i = 0; i < src.size(); ++i) {
         if (i) j += ",";
+        std::string params = src[i].mode == "dpad" ? ",\"parameters\":{\"sub_mode\":\"click\"}" : "";
         j += std::string("{\"path\":\"/user/hand/") + kHand[src[i].hand] + "/input/" + src[i].input + "\",\"mode\":\"" +
-             src[i].mode + "\",\"inputs\":{" + src[i].inputs + "}}";
+             src[i].mode + "\"" + params + ",\"inputs\":{" + src[i].inputs + "}}";
     }
     j += "],\"haptics\":[{\"output\":\"/actions/main/out/haptic_left\",\"path\":\"/user/hand/left/output/haptic\"},"
          "{\"output\":\"/actions/main/out/haptic_right\",\"path\":\"/user/hand/right/output/haptic\"}]}}}";
@@ -409,17 +428,17 @@ void UpdateHaptics(vr::IVRSystem* sys) {
     WORD game = g_rumble[0] > g_rumble[1] ? g_rumble[0].load() : g_rumble[1].load();
     for (int h = 0; h < 2; ++h) {
         unsigned short us = 0;
-        bool gunHand = h == 1 || vr::control::g_twoHandEngaged;
+        bool gunHand = h == 1 || vr::control::g_twoHandEngaged || vr::control::g_leftOnGun;
         if (game && gunHand) us = static_cast<unsigned short>(600 + game / 20);
         if (now < g_hapticUntil[h]) us = 3500;
         if (!us) continue;
         if (act::g_ready) {
-            vr::VRInput()->TriggerHapticVibrationAction(act::g_haptic[h], 0.0f, 0.02f, 150.0f,
+            vr::VRInput()->TriggerHapticVibrationAction(act::g_haptic[vr::control::PhysicalHand(h)], 0.0f, 0.02f, 150.0f,
                                                         us > 3900 ? 1.0f : us / 3900.0f, vr::k_ulInvalidInputValueHandle);
             continue;
         }
         vr::TrackedDeviceIndex_t idx = sys->GetTrackedDeviceIndexForControllerRole(
-            h == 0 ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand);
+            h == 0 ? vr::control::SupportRole() : vr::control::GunRole());
         if (idx != vr::k_unTrackedDeviceIndexInvalid) sys->TriggerHapticPulse(idx, 0, us > 3900 ? 3900 : us);
     }
 }
@@ -435,17 +454,21 @@ float GripValue(const vr::VRControllerState_t& s) {
 // Legge i due Touch tramite l'API "legacy" di OpenVR (SteamVR applica i
 // binding legacy_bindings_rift: asse 0 = stick, asse 1 = grilletto,
 // asse 2 = grip; A/X = k_EButton_A, B/Y = k_EButton_ApplicationMenu).
+double NowSec();
+
 bool ReadTouchControllers(XGamepad* out) {
     vr::session::Shared vrLock(true);
     if (!vrLock.ok()) return false;
     vr::IVRSystem* sys = vr::VRSystem();
     if (!sys) return false;
-    vr::TrackedDeviceIndex_t left = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
-    vr::TrackedDeviceIndex_t right = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+    vr::TrackedDeviceIndex_t left = sys->GetTrackedDeviceIndexForControllerRole(vr::control::SupportRole());
+    vr::TrackedDeviceIndex_t right = sys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
     vr::VRControllerState_t ls = {}, rs = {};
     bool haveL = false, haveR = false;
     static double lastActionRead = 0.0;
-    double nowMs = static_cast<double>(GetTickCount64());
+    // QPC: GetTickCount64 avanza a passi di 10-16 ms e lo stato restava vecchio
+    // fino a un frame intero (audit 19/10).
+    double nowMs = NowSec() * 1000.0;
     if (act::Ensure() && nowMs - lastActionRead < 4.0) {
         // Il gioco interroga il pad piu' volte per frame: le azioni si leggono
         // al massimo ogni 4 ms, le altre volte vale l'ultimo stato.
@@ -462,8 +485,27 @@ bool ReadTouchControllers(XGamepad* out) {
         set.ulRestrictedToDevice = vr::k_ulInvalidInputValueHandle;
         set.ulSecondaryActionSet = vr::k_ulInvalidActionSetHandle;
         in->UpdateActionState(&set, sizeof(set), 1);
-        haveL = left != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, 0, &ls);
-        haveR = right != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, 1, &rs);
+        haveL = left != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, vr::control::PhysicalHand(0), &ls);
+        haveR = right != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, vr::control::PhysicalHand(1), &rs);
+        // Controller collegati ma nessuna azione attiva per 5 s (fuori dalla
+        // dashboard): tipo di controller senza binding predefinito. Si passa
+        // all'API legacy invece di restare senza comandi (audit 19/10).
+        static ULONGLONG noneSince = 0;
+        bool connected = left != vr::k_unTrackedDeviceIndexInvalid && right != vr::k_unTrackedDeviceIndexInvalid &&
+                         sys->IsTrackedDeviceConnected(left) && sys->IsTrackedDeviceConnected(right);
+        if (!haveL && !haveR && connected && !vr::control::g_vrDashboard && vr::session::HmdPresent()) {
+            if (!noneSince) noneSince = GetTickCount64();
+            if (GetTickCount64() - noneSince > 5000) {
+                char type[64] = {};
+                sys->GetStringTrackedDeviceProperty(right, vr::Prop_ControllerType_String, type, sizeof(type));
+                vr::log::Line(std::string("INPUT: no SteamVR Input bindings active for controller type '") + type +
+                              "', using the legacy input API.");
+                vr::control::g_actionInput = false;
+                noneSince = 0;
+            }
+        } else {
+            noneSince = 0;
+        }
     } else {
         haveL = left != vr::k_unTrackedDeviceIndexInvalid && sys->IsTrackedDeviceConnected(left) &&
                 sys->GetControllerState(left, &ls, sizeof(ls));
@@ -504,12 +546,37 @@ bool ReadTouchControllers(XGamepad* out) {
         out->sThumbLX = AxisToShort(ls.rAxis[0].x);
         out->sThumbLY = AxisToShort(ls.rAxis[0].y);
         out->bLeftTrigger = TriggerToByte(ls.rAxis[1].x);
-        // Grip sinistro = granata (LB), tranne quando la mano tiene la canna.
-        if (GripValue(ls) > 0.6f && !vr::control::g_twoHandEngaged) out->wButtons |= kLB;
+        // Grip sinistro = granata (LB). Se la pressione appartiene all'arma o
+        // alla ricarica lo decide il rilevatore dei gesti alla pressione
+        // (SuppressLeftGrip in ApplyGestures).
+        if (GripValue(ls) > 0.6f) out->wButtons |= kLB;
         if (ButtonPressed(ls, vr::k_EButton_A)) out->wButtons |= kX;
         if (ButtonPressed(ls, vr::k_EButton_ApplicationMenu)) out->wButtons |= kY;
         if (ButtonPressed(ls, vr::k_EButton_SteamVR_Touchpad)) out->wButtons |= kLThumb;
-        if (ButtonPressed(ls, vr::k_EButton_System)) out->wButtons |= kStart;  // tasto menu sinistro
+        // Tasto menu sinistro: tocco = Start (pausa), tenuto 0,6 s = Back
+        // (obiettivi), che prima non si poteva premere (audit 19/10).
+        {
+            static ULONGLONG since = 0, pulseUntil = 0;
+            static WORD pulse = 0;
+            static bool backSent = false;
+            ULONGLONG now = GetTickCount64();
+            if (ButtonPressed(ls, vr::k_EButton_System)) {
+                if (!since) since = now;
+                if (!backSent && now - since >= 600) {
+                    backSent = true;
+                    pulse = kBack;
+                    pulseUntil = now + 150;
+                }
+            } else {
+                if (since && !backSent) {
+                    pulse = kStart;
+                    pulseUntil = now + 120;
+                }
+                since = 0;
+                backSent = false;
+            }
+            if (now < pulseUntil) out->wButtons |= pulse;
+        }
     }
     // Calibrazione del calcio: B (destro) + Y (sinistro) tenuti insieme 1 s.
     // Mentre sono tenuti insieme non arrivano al gioco (niente corpo a corpo
@@ -593,7 +660,36 @@ public:
         m_lastT = s.t;
         // Mano sinistra sulla canna (e per 1 s dopo averla lasciata): muovendo
         // il fucile la mano corre in avanti, non e' un lancio (18/10).
-        if (vr::control::g_twoHandEngaged) m_twoHandT = s.t;
+        bool onGun = vr::control::g_twoHandEngaged || vr::control::g_leftOnGun;
+        if (onGun) m_twoHandT = s.t;
+        // Il significato del grip sinistro si decide alla pressione e resta
+        // fino al rilascio: granata (LB) solo se la mano non e' sull'arma (astina
+        // o caricatore, entro 15 cm dalla linea dell'arma fino a 45 cm davanti
+        // alla destra) e la ricarica non e' in corso. Prima la soppressione
+        // cambiava a meta' pressione e il gioco vedeva un rilascio: granata
+        // lanciata (audit 19/10).
+        if (s.leftGrip && !m_lbGripWas) {
+            bool nearGun = false;
+            if (s.leftValid && s.rightValid) {
+                float d[3] = {s.left[0] - s.right[0], s.left[1] - s.right[1], s.left[2] - s.right[2]};
+                float t = d[0] * s.rightFwd[0] + d[1] * s.rightFwd[1] + d[2] * s.rightFwd[2];
+                t = t < -0.05f ? -0.05f : (t > 0.45f ? 0.45f : t);
+                float p[3] = {d[0] - t * s.rightFwd[0], d[1] - t * s.rightFwd[1], d[2] - t * s.rightFwd[2]};
+                nearGun = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]) < 0.15f;
+            }
+            m_lbAllowed = !(onGun || nearGun || m_mag != Mag::In || m_magGrab || m_leftLatch || !Gameplay());
+            if (!m_lbAllowed) vr::log::Line(nearGun || onGun ? "GESTURE: left grip on the gun, not a grenade"
+                                                              : "GESTURE: left grip kept for the reload / menu");
+        }
+        if (!s.leftGrip) m_lbAllowed = false;
+        m_lbGripWas = s.leftGrip;
+        // Niente gesti in cinematiche, scene bloccate e menu di pausa: un pugno
+        // era B (indietro nel menu), abbassarsi A (conferma), un lancio LB.
+        if (!Gameplay()) {
+            m_gripWasDown = s.rightValid && s.rightGrip;
+            m_leftGripWas = s.leftGrip;
+            return;
+        }
         if (s.leftValid && vr::control::g_gestureGrenade && s.t > m_throwReady && s.t - m_twoHandT > 1.0) {
             float vf = s.leftVel[0] * s.fwd[0] + s.leftVel[2] * s.fwd[2];
             if (vf > 3.2f && s.left[1] > s.hmd[1] - 0.20f) {  // 2,5 m/s e -0,35 m: troppo sensibile (18/10)
@@ -624,7 +720,10 @@ public:
         if (s.rightValid && s.rightGrip && !m_gripWasDown && vr::control::g_gestureWeapon) {
             float rel[3] = {s.right[0] - s.hmd[0], s.right[1] - s.hmd[1], s.right[2] - s.hmd[2]};
             float ahead = rel[0] * s.fwd[0] + rel[2] * s.fwd[2];
-            if (rel[1] > -0.20f && ahead < 0.08f) {
+            float side = std::fabs(-rel[0] * s.fwd[2] + rel[2] * s.fwd[0]);
+            // Dietro il piano del viso e di lato alla testa: con 8 cm davanti
+            // una pistola alla guancia o la posizione di guardia cambiavano arma.
+            if (rel[1] > -0.15f && ahead < -0.02f && side > 0.08f) {
                 Press(kY, s.t, 0.12, "arma presa dalla spalla", 0.0f);
                 m_gripIsSwap = true;
                 m_hapticPending = true;
@@ -632,16 +731,24 @@ public:
         }
         if (!s.rightGrip) m_gripIsSwap = false;
         m_gripWasDown = s.rightValid && s.rightGrip;
+        // Abbassarsi = copertura solo fuori copertura e con lo stick fermo: in
+        // copertura A con lo stick scavalca il riparo, A con lo stick corre.
         if (vr::control::g_gestureCover && s.t > m_duckReady && s.hmdVelY < -1.0f &&
-            s.hmd[1] < m_standingY - 0.15f) {
+            s.hmd[1] < m_standingY - 0.15f && !vr::control::g_inCover && !m_stickMoving) {
             Press(kA, s.t, 0.12, "copertura (abbassato)", -s.hmdVelY);
             m_duckReady = s.t + 1.5;
         }
     }
 
     bool SuppressRightGrip() const { return m_gripIsSwap; }
-    // Grip sinistro usato dalla ricarica: non arriva al gioco come LB (granata).
-    bool SuppressLeftGrip() const { return m_leftBusy; }
+    // Grip sinistro dell'arma o della ricarica: non arriva al gioco come LB
+    // (granata). Deciso alla pressione (Update).
+    bool SuppressLeftGrip() const { return !m_lbAllowed; }
+    void SetStickMoving(bool moving) { m_stickMoving = moving; }
+    static bool Gameplay() {
+        return !vr::control::g_cinemaActive && !vr::control::g_gameLocked && !vr::control::g_gamePaused &&
+               !vr::control::g_vrDashboard;
+    }
     bool TakeHaptic() {
         bool h = m_hapticPending;
         m_hapticPending = false;
@@ -691,7 +798,7 @@ private:
             return;
         }
         float well[3];
-        float fwdM = vr::control::g_magwellCm[0] * 0.01f, downM = vr::control::g_magwellCm[1] * 0.01f;
+        float fwdM = (vr::control::g_magwellCm[0] + vr::control::g_magwellClassCm[0]) * 0.01f, downM = (vr::control::g_magwellCm[1] + vr::control::g_magwellClassCm[1]) * 0.01f;
         for (int k = 0; k < 3; ++k) well[k] = s.right[k] + s.rightFwd[k] * fwdM - s.rightUp[k] * downM;
         float dw = Dist(s.left, well);
         if (s.reloadButton && m_mag != Mag::In) {
@@ -718,6 +825,10 @@ private:
                     Pulse(0, 40);
                     Pulse(1, 40);
                     Log("GESTURE: magazine out (left hand %.0f cm from the magwell)", dw * 100.0f);
+                    // La ricarica del gioco (X) parte gia' qui e corre mentre si
+                    // prende e si inserisce il caricatore nuovo: prima partiva
+                    // all'inserimento e il tempo di ricarica raddoppiava (audit 19/10).
+                    Press(kX, s.t, 0.12, "ricarica (caricatore espulso)", 0.0f);
                 }
             }
             break;
@@ -757,7 +868,7 @@ private:
                 m_mag = Mag::In;
                 m_leftLatch = true;
                 m_reloadReady = s.t + 1.0;
-                Press(kX, s.t, 0.12, "ricarica (caricatore inserito)", 0.0f);
+                vr::log::Line("GESTURE: magazine inserted");
                 vr::haptics::Reload();
                 Pulse(0, 90);
                 Pulse(1, 90);
@@ -799,6 +910,7 @@ private:
     Mag m_mag = Mag::In;
     double m_magT = 0.0;
     bool m_magGrab = false, m_leftLatch = false, m_leftBusy = false, m_leftGripWas = false;
+    bool m_lbAllowed = false, m_lbGripWas = false, m_stickMoving = false;
 };
 
 GestureDetector g_gestures;
@@ -842,12 +954,12 @@ bool ReadGestureSample(GestureSample* s) {
         }
         return true;
     };
-    s->leftValid = hand(vr::TrackedControllerRole_LeftHand, s->left, s->leftVel);
-    s->rightValid = hand(vr::TrackedControllerRole_RightHand, s->right, nullptr);
+    s->leftValid = hand(vr::control::SupportRole(), s->left, s->leftVel);
+    s->rightValid = hand(vr::control::GunRole(), s->right, nullptr);
     if (s->rightValid) {
         // Assi dell'arma: avanti = -Z del controller e su = +Y, ruotati
         // dell'angolo del calcio (aimpitch) come la mira.
-        vr::TrackedDeviceIndex_t ri = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        vr::TrackedDeviceIndex_t ri = sys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
         const vr::HmdMatrix34_t& c = poses[ri].mDeviceToAbsoluteTracking;
         float a = vr::control::g_aimPitchOffsetDeg * 0.01745329252f;
         float ca = std::cos(a), sa = std::sin(a);
@@ -897,7 +1009,7 @@ void RunGestureSim(const std::string& which) {
             // ritorno al caricatore.
             s.rightFwd[2] = -1.0f;
             s.rightUp[1] = 1.0f;
-            float fw = vr::control::g_magwellCm[0] * 0.01f, dn = vr::control::g_magwellCm[1] * 0.01f;
+            float fw = (vr::control::g_magwellCm[0] + vr::control::g_magwellClassCm[0]) * 0.01f, dn = (vr::control::g_magwellCm[1] + vr::control::g_magwellClassCm[1]) * 0.01f;
             float well[3] = {s.right[0], s.right[1] - dn, s.right[2] - fw};
             float belt[3] = {-0.15f, 1.0f, -0.1f};
             const float* at = well;
@@ -931,7 +1043,11 @@ void RunGestureSim(const std::string& which) {
 void ApplyGestures(XGamepad* pad) {
     std::string sim;
     if (vr::control::TakeGestureSimRequest(&sim)) RunGestureSim(sim);
-    GestureSample s;
+    {
+        float lx = pad->sThumbLX / 32767.0f, ly = pad->sThumbLY / 32767.0f;
+        g_gestures.SetStickMoving(lx * lx + ly * ly > 0.3f * 0.3f);
+    }
+    GestureSample s = {};
     if (ReadGestureSample(&s)) g_gestures.Update(s);
     WORD g = g_gestures.Buttons(NowSec());
     static WORD lastLogged = 0;
@@ -941,7 +1057,9 @@ void ApplyGestures(XGamepad* pad) {
         vr::log::Line(b);
     }
     lastLogged = g;
-    if (g_gestures.SuppressLeftGrip()) pad->wButtons &= ~kLB;  // prima dei gesti: il lancio resta
+    // Prima dei gesti: il lancio col gesto resta. Senza controller sinistro
+    // (pad vero o input finto) il grip non c'e' e LB passa com'e'.
+    if (g_gestures.SuppressLeftGrip() && s.leftValid) pad->wButtons &= ~kLB;
     pad->wButtons |= g;
     if (g_gestures.SuppressRightGrip()) pad->wButtons &= ~kRB;
 }
@@ -993,8 +1111,38 @@ void ApplyDpadModifier(XGamepad* pad) {
     if (GetTickCount64() < pulseUntil) pad->wButtons |= kRThumb;
 }
 
-// Ricentramento: i due stick premuti insieme per 1 secondo (i due clic non
-// arrivano al gioco mentre si tengono entrambi).
+// Tasti che formano una combinazione (B+Y calibrazione del calcio, i due
+// stick = ricentramento): ognuno e' trattenuto 120 ms dalla pressione. Se
+// arriva l'altro, la pressione appartiene alla combinazione e nessuno dei due
+// va al gioco finche' non sono rilasciati entrambi; un tocco piu' breve
+// arriva al gioco come impulso di 100 ms. Prima il primo tasto premuto
+// passava (corpo a corpo o cambio d'arma calibrando, clic dello stick
+// ricentrando; audit 19/10).
+struct ComboGate {
+    ULONGLONG since[2] = {0, 0}, pulseUntil[2] = {0, 0};
+    bool combo = false;
+};
+void GateCombo(XGamepad* pad, WORD a, WORD b, ComboGate& g) {
+    const WORD keys[2] = {a, b};
+    ULONGLONG now = GetTickCount64();
+    bool down[2] = {(pad->wButtons & a) != 0, (pad->wButtons & b) != 0};
+    if (down[0] && down[1]) g.combo = true;
+    if (!down[0] && !down[1]) g.combo = false;
+    for (int k = 0; k < 2; ++k) {
+        if (!down[k]) {
+            if (g.since[k] && !g.combo && now - g.since[k] < 120) g.pulseUntil[k] = now + 100;  // tocco breve
+            g.since[k] = 0;
+        } else if (!g.since[k]) {
+            g.since[k] = now;
+        }
+        bool pass = down[k] && !g.combo && now - g.since[k] >= 120;
+        if (!pass) pad->wButtons &= ~keys[k];
+        if (!g.combo && now < g.pulseUntil[k]) pad->wButtons |= keys[k];
+    }
+}
+
+// Ricentramento: i due stick premuti insieme per 1 secondo (i clic non
+// arrivano al gioco: GateCombo).
 void ApplyRecenterCombo(XGamepad* pad) {
     static ULONGLONG since = 0;
     static bool fired = false;
@@ -1004,7 +1152,6 @@ void ApplyRecenterCombo(XGamepad* pad) {
         fired = false;
         return;
     }
-    pad->wButtons &= ~(kLThumb | kRThumb);
     ULONGLONG now = GetTickCount64();
     if (!since) since = now;
     if (!fired && now - since > 1000) {
@@ -1016,22 +1163,60 @@ void ApplyRecenterCombo(XGamepad* pad) {
 
 void ApplyVrStickRules(XGamepad* pad) {
     {
+        // Dashboard di SteamVR aperta: Start per 150 ms (pausa del gioco), se
+        // il gioco non e' gia' in pausa; poi nessun input finche' resta aperta.
+        static ULONGLONG pauseUntil = 0;
+        if (vr::control::g_vrPauseRequest.exchange(false) && !vr::control::g_gamePaused && !vr::control::g_cinemaActive)
+            pauseUntil = GetTickCount64() + 150;
+        if (GetTickCount64() < pauseUntil) {
+            *pad = {};
+            pad->wButtons = kStart;
+            return;
+        }
+        if (vr::control::g_vrDashboard) {
+            *pad = {};
+            return;
+        }
+    }
+    {
         static ULONGLONG lastTurn = 0;
         if (std::abs(static_cast<int>(pad->sThumbRX)) > 5000) lastTurn = GetTickCount64();
         vr::control::g_stickTurning = GetTickCount64() - lastTurn < 300;
     }
     // Sporgersi dal riparo col corpo: LT (Walker esce per mirare).
     if (vr::control::g_coverPeek && !vr::control::g_cinemaActive) pad->bLeftTrigger = 255;
+    // RPG: spara solo mirando, LT insieme al grilletto.
+    if (vr::control::g_weaponNeedsAim && pad->bRightTrigger > 30 && !vr::control::g_cinemaActive) pad->bLeftTrigger = 255;
     // Arma portata all'occhio (mira con le tacche): LT.
     if (vr::control::g_adsActive && !vr::control::g_cinemaActive) pad->bLeftTrigger = 255;
     ApplyGestures(pad);
     ApplyRecenterCombo(pad);
+    {
+        static ComboGate sticks, calib;
+        GateCombo(pad, kLThumb, kRThumb, sticks);
+        GateCombo(pad, kB, kY, calib);
+    }
     ApplyDpadModifier(pad);
     // Schermo virtuale (cinematiche, veicoli, menu): lo stick destro torna
     // quello del pad (anche su/giu'), senza rotazione a scatti.
     if (vr::control::g_cinemaActive) {
         vr::control::g_motionAmount = 0.0f;
         return;
+    }
+    // Stick sinistro verso dove si guarda: prima andava verso il corpo, fino
+    // a 45 gradi (turnwithhead) di lato rispetto allo sguardo (audit 19/10).
+    // In copertura no: li' lo stick muove lungo il riparo.
+    if (vr::control::g_moveWithHead && !vr::control::g_inCover && !vr::control::g_gameLocked) {
+        float a = vr::control::g_headYawUnits.load() * (6.28318530718f / 65536.0f);
+        float lx = pad->sThumbLX / 32767.0f, ly = pad->sThumbLY / 32767.0f;
+        float fwd = ly * std::cos(a) - lx * std::sin(a);
+        float rt = ly * std::sin(a) + lx * std::cos(a);
+        auto toShort = [](float v) {
+            v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+            return static_cast<SHORT>(v * 32767.0f);
+        };
+        pad->sThumbLX = toShort(rt);
+        pad->sThumbLY = toShort(fwd);
     }
     // Intensita' del movimento per la vignettatura: stick sinistro (camminata)
     // o rotazione continua con lo stick destro.
@@ -1044,7 +1229,35 @@ void ApplyVrStickRules(XGamepad* pad) {
     }
     if (!vr::control::g_stickPitch) pad->sThumbRY = 0;
     float snap = vr::control::g_snapTurnDeg;
-    if (snap <= 0.0f) return;
+    if (snap <= 0.0f) {
+        // Rotazione continua fatta dalla mod a velocita' costante (turnspeed,
+        // gradi/s, curva quadratica dopo la zona morta): quella del gioco ha
+        // accelerazione e cambia sensibilita' con LT tenuto (copertura, ADS).
+        // Essendo "nostra" (g_ownYawUnits) non viene presa per una rotazione
+        // imposta dal gioco. turnspeed 0 = rotazione del gioco.
+        float speed = vr::control::g_turnSpeedDeg;
+        if (speed <= 0.0f) return;
+        static double last = 0.0;
+        double now = NowSec();
+        float dt = last > 0.0 ? static_cast<float>(now - last) : 0.0f;
+        last = now;
+        if (dt > 0.05f) dt = 0.05f;
+        float x = pad->sThumbRX / 32767.0f;
+        pad->sThumbRX = 0;
+        float ax = std::fabs(x);
+        if (ax < 0.15f || dt <= 0.0f) return;
+        float k = (ax - 0.15f) / 0.85f;
+        static float carry = 0.0f;  // frazioni di unita' tra una lettura e l'altra
+        carry += (x > 0 ? 1.0f : -1.0f) * k * k * speed * dt / 360.0f * 65536.0f;
+        int32_t delta = static_cast<int32_t>(carry);
+        carry -= static_cast<float>(delta);
+        void* pc = vr::control::g_playerController;
+        if (delta && pc && SafeAddYaw(pc, delta)) {
+            vr::control::g_ownYawUnits.fetch_add(delta);
+            vr::control::g_stickYawUnits.fetch_add(delta);
+        }
+        return;
+    }
     static bool armed = true;
     float x = pad->sThumbRX / 32767.0f;
     pad->sThumbRX = 0;
@@ -1052,7 +1265,11 @@ void ApplyVrStickRules(XGamepad* pad) {
         armed = false;
         void* pc = vr::control::g_playerController;
         int32_t delta = static_cast<int32_t>((x > 0 ? snap : -snap) / 360.0f * 65536.0f);
-        if (pc && SafeAddYaw(pc, delta)) vr::control::g_ownYawUnits.fetch_add(delta);
+        if (pc && SafeAddYaw(pc, delta)) {
+            vr::control::g_ownYawUnits.fetch_add(delta);
+            vr::control::g_stickYawUnits.fetch_add(delta);
+            if (vr::control::g_snapFade) vr::output::Blink(0.12f);
+        }
     } else if (x > -0.3f && x < 0.3f) {
         armed = true;
     }
@@ -1091,7 +1308,18 @@ DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
         vr::control::g_rightTriggerHeld = false;
         vr::control::g_squadButtonHeld = false;
     }
-    return g_GetState_Real ? g_GetState_Real(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+    DWORD r = g_GetState_Real ? g_GetState_Real(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+    // Sessione VR attiva ma controller senza dati (dashboard di SteamVR,
+    // controller spenti un attimo): pad neutro ma collegato, invece del pad
+    // scollegato che il gioco vede se non c'e' un pad vero (audit 19/10).
+    if (user == 0 && state && r != ERROR_SUCCESS && vr::session::Ready()) {
+        XGamepad pad = {};
+        ApplyVrStickRules(&pad);  // anche la pausa per la dashboard
+        state->dwPacketNumber = g_packet.fetch_add(1);
+        state->Gamepad = pad;
+        return ERROR_SUCCESS;
+    }
+    return r;
 }
 
 DWORD WINAPI Hooked_XInputSetState(DWORD user, XVibration* vib) {
@@ -1154,6 +1382,11 @@ void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, un
     g_fake.bRightTrigger = TriggerToByte(rt);
     g_fake.wButtons = static_cast<WORD>(buttons);
     g_fakeUntil = GetTickCount64() + durationMs;
+}
+
+void PulseHand(int hand, unsigned ms) {
+    if (hand < 0 || hand > 1) return;
+    g_hapticUntil[hand] = GetTickCount64() + ms;
 }
 
 }  // namespace vr::input

@@ -52,4 +52,11 @@ void SetRenderScreenPercent(int eye, int percent);
 // Rettangolo (pixel del back buffer) della porzione di immagine dell'occhio.
 RECT EyeCropRect(int eye);
 
+// Dissolvenze del compositor (qualsiasi thread; eseguite dal thread di uscita).
+// Blink: nero subito, poi l'immagine torna in "seconds" (nasconde un taglio:
+// teletrasporto, cambio di schermo, snap turn). HoldBlack: nero finche' resta
+// vero (camera del gioco lontana da Walker prima dello schermo virtuale).
+void Blink(float seconds);
+void HoldBlack(bool hold);
+
 }  // namespace vr::output

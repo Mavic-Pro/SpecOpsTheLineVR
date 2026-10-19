@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <vector>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -111,6 +112,19 @@ void BHapticsThread() {
             g_bhConnected = true;
             loggedFail = false;
             vr::log::Line("HAPTICS: connected to the bHaptics Player.");
+            // Il Player manda messaggi di stato: vanno letti (e scartati),
+            // altrimenti il buffer di ricezione si riempie e la connessione
+            // cade (audit 19/10).
+            std::thread reader([ws] {
+                std::vector<char> buf(8192);
+                for (;;) {
+                    DWORD got = 0;
+                    WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
+                    if (WinHttpWebSocketReceive(ws, buf.data(), static_cast<DWORD>(buf.size()), &got, &type) != NO_ERROR ||
+                        type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
+                        break;
+                }
+            });
             for (;;) {
                 std::string msg;
                 {
@@ -131,6 +145,7 @@ void BHapticsThread() {
             g_bhConnected = false;
             vr::log::Line("HAPTICS: bHaptics Player disconnected.");
             WinHttpWebSocketClose(ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
+            reader.join();
             WinHttpCloseHandle(ws);
         } else if (!loggedFail) {
             loggedFail = true;
@@ -158,7 +173,7 @@ float WeaponStrength(const std::string& cls) {
 
 void Start() {
     std::thread([] {
-        Sleep(15000);  // dopo la lettura dell'ini (come l'aggiornamento) e fuori dal blocco del loader
+        vr::control::WaitForConfig(120000, 2000);  // dopo la lettura dell'ini e fuori dal blocco del loader
         StartProTube();
         if (vr::control::g_bhaptics) BHapticsThread();
     }).detach();

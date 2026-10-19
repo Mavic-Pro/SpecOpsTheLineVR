@@ -10,6 +10,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_subdirectory(vendor/minhook)
 
+# Ini predefinito incorporato nella dll (solo le righe attive): le voci che
+# mancano nell'ini dell'utente prendono il valore distribuito, cosi' i
+# predefiniti del codice e quelli dell'ini non divergono.
+file(STRINGS "${CMAKE_SOURCE_DIR}/deploy/specopsvr.ini" SPECOPSVR_INI_LINES ENCODING UTF-8)
+set(SPECOPSVR_DEFAULT_INI "")
+foreach(line IN LISTS SPECOPSVR_INI_LINES)
+    string(STRIP "${line}" line)
+    if(line AND NOT line MATCHES "^#")
+        string(APPEND SPECOPSVR_DEFAULT_INI "${line}\\n")
+    endif()
+endforeach()
+configure_file("${CMAKE_SOURCE_DIR}/src/default_ini.h.in" "${CMAKE_BINARY_DIR}/generated/default_ini.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/deploy/specopsvr.ini")
+
 add_library(d3d9proxy SHARED
     src/dllmain.cpp
     src/logger.cpp
@@ -45,9 +59,10 @@ set_target_properties(d3d9proxy PROPERTIES
 
 target_include_directories(d3d9proxy PRIVATE
     ${CMAKE_SOURCE_DIR}/vendor/openvr/headers
+    ${CMAKE_BINARY_DIR}/generated
 )
 
-target_link_libraries(d3d9proxy PRIVATE minhook d3d11 dxgi winhttp
+target_link_libraries(d3d9proxy PRIVATE minhook d3d11 dxgi winhttp bcrypt
     ${CMAKE_SOURCE_DIR}/vendor/openvr/lib/win32/openvr_api.lib)
 
 add_custom_command(TARGET d3d9proxy POST_BUILD

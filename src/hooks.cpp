@@ -306,7 +306,12 @@ HRESULT WINAPI Hooked_BeginScene(IDirect3DDevice9* self) {
     // prima di essere mai renderizzata. BeginScene arriva dopo il tick di
     // questo frame e prima che il disegno usi la rotazione: e' l'ultimo
     // punto utile per vincere.
-    UpdateHeadTracking();
+    // Dal 19/10 (audit) la posa si legge una volta per tick sul thread di
+    // gioco, all'inizio del Draw (ViewportDrawThunk): qui ne venivano 2-3 per
+    // tick sul thread di rendering, che scrivevano anche la rotazione del
+    // PlayerController mentre il gioco la aggiornava. "headsample render"
+    // rimette il comportamento vecchio.
+    if (!vr::control::g_headSampleOnDraw) UpdateHeadTracking();
     return g_BeginScene_Original(self);
 }
 
@@ -355,7 +360,7 @@ HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
     } else if (count % 300 == 0) {
         vr::log::Line("EndScene: " + std::to_string(count) + " frames rendered so far.");
     }
-    EndFrameVsConstAnalysis();
+    if (vr::control::g_vsDiag) EndFrameVsConstAnalysis();
     vr::control::Poll();
     ApplyPostFxSettings();
     return g_EndScene_Original(self);
@@ -536,6 +541,17 @@ void PushFrameTag(const FrameTag& t0) {
     g_frameTags.push_back(t);
 }
 
+// Etichetta del frame che il thread di rendering sta disegnando adesso (la
+// prima in coda, con lo stesso scarto delle vecchie di PopFrameTag): serve
+// a chi agisce durante il disegno, prima del Present (matrice dell'HUD).
+bool PeekRenderingTag(FrameTag* out) {
+    std::lock_guard<std::mutex> lock(g_frameTagMutex);
+    if (g_frameTags.empty()) return false;
+    size_t idx = g_frameTags.size() > 4 ? ((g_frameTags.size() - 3) & ~static_cast<size_t>(1)) : 0;
+    *out = g_frameTags[idx];
+    return true;
+}
+
 // Etichetta del Present in corso; c5Eye = occhio riconosciuto dall'origine
 // (-1 se nessuno). Se non coincidono e l'etichetta seguente coincide, la coda
 // era sfasata (un Present senza Draw o un Draw senza Present): si riallinea.
@@ -556,6 +572,13 @@ bool PopFrameTag(int c5Eye, FrameTag* out) {
         size_t drop = (g_frameTags.size() - 3) & ~static_cast<size_t>(1);
         for (size_t i = 0; i < drop; ++i) g_frameTags.pop_front();
         g_frameTagStale.fetch_add(static_cast<uint32_t>(drop), std::memory_order_relaxed);
+    }
+    // Etichette mono (schermo virtuale, eye -1) seguite da etichette stereo:
+    // avanzi di un filmato, si saltano, altrimenti ogni immagine prendeva
+    // l'etichetta del disegno precedente (occhi scambiati dopo i filmati, 19/10).
+    while (g_frameTags.size() > 1 && g_frameTags.front().eye < 0 && g_frameTags[1].eye >= 0) {
+        g_frameTags.pop_front();
+        g_frameTagStale.fetch_add(1, std::memory_order_relaxed);
     }
     *out = g_frameTags.front();
     g_frameTags.pop_front();
@@ -833,15 +856,35 @@ std::atomic<bool> g_scopeActive{false};
 // Cannocchiale: la maschera del gioco copre un'area 16:9 centrata; sopra e
 // sotto (back buffer quasi quadrato) si vedrebbe la scena ingrandita senza
 // maschera: si anneriscono le due strisce.
-void DrawScopeBars(IDirect3DDevice9* dev, IDirect3DSurface9* bb) {
+// Dal 19/10 (audit) il cannocchiale e' una lente: fuori da un cerchio al
+// centro dell'occhio (raggio 0,42 della mezza altezza del ritaglio, ~25 gradi)
+// tutto nero, come guardando nel cannocchiale; la vista ingrandita a tutto
+// campo, girando con la testa, dava nausea. Il cerchio e' fatto di strisce
+// orizzontali annerite fuori dalla corda (128 rettangoli in un Clear).
+void DrawScopeBars(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int eye = 0) {
     if (!g_scopeActive) return;
     D3DSURFACE_DESC d;
     bb->GetDesc(&d);
-    LONG hc = static_cast<LONG>(d.Width * 9 / 16);
-    if (hc >= static_cast<LONG>(d.Height)) return;
-    LONG top = (static_cast<LONG>(d.Height) - hc) / 2;
-    D3DRECT r[2] = {{0, 0, static_cast<LONG>(d.Width), top},
-                    {0, top + hc, static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)}};
+    RECT crop = vr::output::EyeCropRect(eye == 1 ? 1 : 0);
+    if (crop.right <= crop.left || crop.bottom <= crop.top)
+        crop = {0, 0, static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)};
+    float pk = g_presentPercent / 100.0f, mx = d.Width * 0.5f, my = d.Height * 0.5f;
+    float cx = mx + (0.5f * (crop.left + crop.right) - mx) * pk, cy = my + (0.5f * (crop.top + crop.bottom) - my) * pk;
+    float rad = 0.42f * 0.5f * (crop.bottom - crop.top) * pk;
+    const int kStrips = 62;
+    D3DRECT r[2 * kStrips + 4];
+    int n = 0;
+    LONG top = static_cast<LONG>(cy - rad), bottom = static_cast<LONG>(cy + rad);
+    r[n++] = {0, 0, static_cast<LONG>(d.Width), (std::max)(0L, top)};
+    r[n++] = {0, (std::min)(static_cast<LONG>(d.Height), bottom), static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)};
+    for (int i = 0; i < kStrips; ++i) {
+        float y0 = cy - rad + 2.0f * rad * i / kStrips, y1 = cy - rad + 2.0f * rad * (i + 1) / kStrips;
+        float ym = 0.5f * (y0 + y1) - cy;
+        float half = std::sqrt((std::max)(0.0f, rad * rad - ym * ym));
+        LONG a = static_cast<LONG>(y0), b = static_cast<LONG>(y1) + 1;
+        r[n++] = {0, a, static_cast<LONG>(cx - half), b};
+        r[n++] = {static_cast<LONG>(cx + half), a, static_cast<LONG>(d.Width), b};
+    }
     IDirect3DSurface9* oldRt = nullptr;
     dev->GetRenderTarget(0, &oldRt);
     D3DVIEWPORT9 oldVp;
@@ -852,7 +895,7 @@ void DrawScopeBars(IDirect3DDevice9* dev, IDirect3DSurface9* bb) {
     D3DVIEWPORT9 vp = {0, 0, d.Width, d.Height, 0.0f, 1.0f};
     dev->SetViewport(&vp);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-    dev->Clear(2, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
+    dev->Clear(n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, scissor);
     dev->SetViewport(&oldVp);
     if (oldRt) {
@@ -862,12 +905,23 @@ void DrawScopeBars(IDirect3DDevice9* dev, IDirect3DSurface9* bb) {
 }
 
 void DrawVignette(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int eye) {
-    DrawScopeBars(dev, bb);
+    DrawScopeBars(dev, bb, eye);
     float strength = vr::control::g_vignette;
     if (strength <= 0.0f) return;
+    // Livello aggiornato una volta per coppia (occhio sinistro o mono) e in
+    // base al tempo: prima ogni occhio lo cambiava e i due bordi differivano;
+    // conta anche il movimento non fatto dal giocatore (veicoli, rotazioni del
+    // gioco), non solo lo stick (audit 19/10).
     static float level = 0.0f;
-    float target = vr::control::g_motionAmount * strength;
-    level += (target - level) * 0.15f;
+    if (eye != 1) {
+        static double lastT = 0.0;
+        double now = ProfMs() * 0.001;
+        float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
+        lastT = now;
+        float m = (std::max)(vr::control::g_motionAmount.load(), vr::control::g_forcedMotion.load());
+        float target = m * strength;
+        if (dt > 0.0f && dt < 0.5f) level += (target - level) * (1.0f - std::exp(-dt / 0.1f));
+    }
     if (level < 0.01f) return;
     D3DSURFACE_DESC d;
     bb->GetDesc(&d);
@@ -1130,7 +1184,8 @@ void ScanVsConstantsForCameraLocation(UINT start, const float* data, UINT count)
     if (vr::control::g_stereoHalfIpd > 0 && start <= kViewOriginRegister && kViewOriginRegister < start + count) {
         IdentifyEyeFromViewOrigin(data + (kViewOriginRegister - start) * 4);
     }
-    if (!g_camLocValid) return;
+    // Il resto e' solo diagnostica (registri che contengono la camera).
+    if (!vr::control::g_vsDiag || !g_camLocValid) return;
     const float* c = g_camLocForVs;
     for (UINT i = 0; i < count && start + i < 256; ++i) {
         const float* v = data + i * 4;
@@ -1255,14 +1310,52 @@ HRESULT WINAPI Hooked_DrawIndexedPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE
     g_frameTris += pc;
     return g_DrawIndexedPrimitive_Original(d, t, bv, mi, nv, si, pc);
 }
+// Matrice del Canvas impostata per ultima: quella del gioco e quella
+// ridotta/spostata per l'HUD in VR (AdjustCanvasMatrix).
+struct CanvasMatrixState {
+    bool adjusted = false;
+    UINT reg = 0;
+    float orig[16], adj[16];
+};
+CanvasMatrixState g_canvasState;
+
+// Disegno del Canvas che copre quasi tutto lo schermo (sangue ai bordi quando
+// si e' feriti, lampi, dissolvenze): con la matrice originale, a tutta vista.
+// Ridotto come l'HUD diventava un riquadro coi bordi visibili davanti agli
+// occhi (playtest 19/10).
+bool IsFullScreenCanvasDraw(UINT nv, const void* v, UINT stride) {
+    if (!g_canvasState.adjusted || !v || stride < 8 || nv < 3 || nv > 4096 || !g_backBufferW || !g_backBufferH) return false;
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    const char* p = static_cast<const char*>(v);
+    for (UINT i = 0; i < nv; ++i) {
+        const float* xy = reinterpret_cast<const float*>(p + i * stride);
+        minX = (std::min)(minX, xy[0]);
+        maxX = (std::max)(maxX, xy[0]);
+        minY = (std::min)(minY, xy[1]);
+        maxY = (std::max)(maxY, xy[1]);
+    }
+    return maxX - minX > 0.85f * g_backBufferW && maxY - minY > 0.85f * g_backBufferH;
+}
+
+template <typename Draw>
+HRESULT DrawCanvasMaybeFullScreen(IDirect3DDevice9* d, UINT nv, const void* v, UINT stride, Draw draw) {
+    if (!IsFullScreenCanvasDraw(nv, v, stride)) return draw();
+    g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.orig, 4);
+    HRESULT hr = draw();
+    g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.adj, 4);
+    return hr;
+}
+
 HRESULT WINAPI Hooked_DrawPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT pc, const void* v, UINT stride) {
     LogHudDraw(d, "DPUP", pc, v, stride);
-    return g_DrawPrimitiveUP_Original(d, t, pc, v, stride);
+    UINT nv = t == D3DPT_TRIANGLELIST ? pc * 3 : (t == D3DPT_TRIANGLESTRIP || t == D3DPT_TRIANGLEFAN ? pc + 2 : 0);
+    return DrawCanvasMaybeFullScreen(d, nv, v, stride, [&] { return g_DrawPrimitiveUP_Original(d, t, pc, v, stride); });
 }
 HRESULT WINAPI Hooked_DrawIndexedPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT mi, UINT nv, UINT pc, const void* idx,
                                              D3DFORMAT f, const void* v, UINT stride) {
     LogHudDraw(d, "DIPUP", pc, v, stride);
-    return g_DrawIndexedPrimitiveUP_Original(d, t, mi, nv, pc, idx, f, v, stride);
+    return DrawCanvasMaybeFullScreen(d, mi + nv, v, stride,
+                                     [&] { return g_DrawIndexedPrimitiveUP_Original(d, t, mi, nv, pc, idx, f, v, stride); });
 }
 
 // --- HUD in VR ------------------------------------------------------------
@@ -1300,18 +1393,36 @@ bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
         for (int i = 0; i < 4; ++i) out[4 * i + 1] += shiftNdc * out[4 * i + 3];
         return true;
     }
+    // Frame in disegno: proiezione decentrata e percentuale della risoluzione
+    // dinamica di questo disegno (prima si usavano quelle del Present
+    // precedente). Con la scena ristretta al centro (ScreenPercentage) l'HUD,
+    // disegnato su tutto il viewport, va ristretto allo stesso modo: prima
+    // con la risoluzione al 65% risultava ingrandito, tagliato ai bordi e
+    // diviso tra gli occhi (audit 19/10).
+    FrameTag cur;
+    bool haveTag = PeekRenderingTag(&cur);
+    bool offCenter = haveTag ? cur.offCenter : g_presentOffCenter.load();
+    float pk = (haveTag ? cur.screenPercent : g_presentPercent.load()) / 100.0f;
+    if (!(pk > 0.2f && pk <= 1.0f)) pk = 1.0f;
     float scale = vr::control::g_hudScale, depth = vr::control::g_hudDepth;
-    if (scale == 1.0f && depth <= 0.0f) return false;
+    if (scale == 1.0f && depth <= 0.0f && pk >= 1.0f) return false;
     std::memcpy(out, data, sizeof(float) * 16);
     for (int i = 0; i < 4; ++i) {
         out[4 * i + 0] *= scale;
         out[4 * i + 1] *= scale;
     }
+    auto applyPercent = [&] {
+        for (int i = 0; i < 4; ++i) {
+            out[4 * i + 0] *= pk;
+            out[4 * i + 1] *= pk;
+        }
+    };
     int eye = vr::control::g_presentEye;  // occhio del Draw in corso (thread di rendering)
+    if (haveTag && cur.eye >= 0) eye = cur.eye;
     float half = vr::control::g_stereoHalfIpd;
     float th = std::tan(vr::control::g_fovOverride * 0.5f / 57.2957795f);
     vr::output::EyeProjection pj;
-    if (eye >= 0 && th > 0.0f && g_presentOffCenter && vr::output::OffCenterProjection(eye, &pj)) {
+    if (eye >= 0 && th > 0.0f && offCenter && vr::output::OffCenterProjection(eye, &pj)) {
         // Immagine decentrata: l'HUD (disposto come nella vista simmetrica,
         // tangente = NDC * th) va riportato nella proiezione dell'occhio, piu'
         // la parallasse della distanza apparente.
@@ -1328,6 +1439,7 @@ bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
             out[4 * i + 0] = out[4 * i + 0] * th * pj.m00 + (par * pj.m00 + pj.m20) * out[4 * i + 3];
             out[4 * i + 1] = out[4 * i + 1] * tv * pj.m11 + (parY * pj.m11 + pj.m21) * out[4 * i + 3];
         }
+        applyPercent();
         return true;
     }
     if (depth > 0.0f && half > 0.0f && eye >= 0 && th > 0.0f) {
@@ -1335,23 +1447,34 @@ bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
         float shiftNdc = (eye == 0 ? 1.0f : -1.0f) * (half / depth) / th;
         for (int i = 0; i < 4; ++i) out[4 * i + 0] += shiftNdc * out[4 * i + 3];
     }
+    applyPercent();
     return true;
 }
 
 HRESULT WINAPI Hooked_SetVertexShaderConstantF(
     IDirect3DDevice9* self, UINT StartRegister, const float* pConstantData, UINT Vector4fCount) {
+    // Riconoscimento dell'occhio dall'origine della vista (c5): sempre, serve
+    // a riallineare le etichette dei frame. La diagnostica dei registri dentro
+    // la funzione solo con "vsdiag on". (19/10: spegnere tutto aveva tolto il
+    // riallineamento e dopo le scene scriptate gli occhi restavano scambiati.)
     ScanVsConstantsForCameraLocation(StartRegister, pConstantData, Vector4fCount);
     if (StartRegister == 0 && Vector4fCount >= 4) g_canvasMatrixActive = IsCanvasMatrix(pConstantData);
     if (StartRegister == 0 && Vector4fCount >= 2) std::memcpy(g_lastC0, pConstantData, sizeof(g_lastC0));
     for (UINT i = 0; i < Vector4fCount && StartRegister + i < 16; ++i) std::memcpy(g_vsShadow[StartRegister + i], pConstantData + 4 * i, 16);
     float hud[16];
     if (AdjustCanvasMatrix(StartRegister, pConstantData, Vector4fCount, hud)) {
+        g_canvasState.adjusted = true;
+        g_canvasState.reg = StartRegister;
+        std::memcpy(g_canvasState.orig, pConstantData, sizeof(g_canvasState.orig));
+        std::memcpy(g_canvasState.adj, hud, sizeof(g_canvasState.adj));
         return g_SetVertexShaderConstantF_Original(self, StartRegister, hud, Vector4fCount);
     }
+    if (StartRegister <= g_canvasState.reg + 3 && StartRegister + Vector4fCount > g_canvasState.reg)
+        g_canvasState.adjusted = false;  // matrice sovrascritta da altro
     // Ci interessano solo le chiamate che caricano esattamente una matrice
     // 4x4 (4 vettori); gli array di matrici (es. bone per lo skinning) non
     // sono candidati camera e vengono ignorati.
-    if (Vector4fCount == 4) {
+    if (Vector4fCount == 4 && vr::control::g_vsDiag) {
         AnalyzeVsConstCandidate(StartRegister, pConstantData);
         AnalyzeProjectionSignature(StartRegister, pConstantData);
     }
@@ -1654,6 +1777,15 @@ bool InitOpenVR() {
 float YawFromOpenVrPose(const vr::HmdMatrix34_t& m) {
     float forwardX = -m.m[0][2];
     float forwardZ = -m.m[2][2];
+    // Guardando quasi dritto in basso (o in alto) la proiezione orizzontale
+    // dell'avanti e' corta e rumorosa: si aggiunge quella dell'asse "su" della
+    // testa, che in quel caso punta avanti (in basso) o indietro (in alto).
+    // Prima lo yaw saltava e poteva far girare il corpo (audit 19/10).
+    float forwardY = -m.m[1][2];
+    float k = forwardY < 0.0f ? -forwardY : forwardY;
+    float sgn = forwardY < 0.0f ? 1.0f : -1.0f;
+    forwardX += sgn * k * m.m[0][1];
+    forwardZ += sgn * k * m.m[2][1];
     return std::atan2(forwardX, -forwardZ);
 }
 
@@ -1865,6 +1997,8 @@ std::atomic<float> g_handOffset[3];
 std::atomic<int32_t> g_handRoll{0};
 std::atomic<bool> g_handValid{false};
 std::atomic<bool> g_twoHandActive{false};  // per DUMPCAM
+std::atomic<bool> g_leftOnGun{false};      // mano sinistra agganciata all'arma (UpdateArms)
+std::atomic<bool> g_leftDriven{false};     // mano sinistra guidata dalla mod (KeepGoodBones)
 // Controller sinistro: posizione come g_handOffset, direzione relativa come
 // g_aimDelta* (yaw rispetto al riferimento, pitch assoluto) e rollio.
 std::atomic<float> g_leftOffset[3];
@@ -1922,11 +2056,21 @@ void ApplyTwoHandAim(const float* right, const float* left) {
         applyBlend(false);
         return;
     }
-    if (!wasActive) vr::log::Line("AIM: two-handed grip.");
-    wasActive = true;
     float horiz = std::sqrt(d[0] * d[0] + d[1] * d[1]);
-    twoYaw = std::atan2(d[1], d[0]);
-    twoPitch = std::atan2(d[2], horiz);
+    float lineYaw = std::atan2(d[1], d[0]), linePitch = std::atan2(d[2], horiz);
+    // All'aggancio si ricorda lo scarto tra la direzione della mano destra
+    // (con aimpitch del calcio) e la linea tra le mani, e lo si mantiene:
+    // l'arma non salta verso la sinistra (fino a ~15 gradi con la tolleranza
+    // di 8 cm) e la calibrazione del calcio resta valida (audit 19/10).
+    static float offYaw = 0.0f, offPitch = 0.0f;
+    if (!wasActive) {
+        offYaw = std::remainder(yawR - lineYaw, 6.28318530718f);
+        offPitch = pitchR - linePitch;
+        vr::log::Line("AIM: two-handed grip.");
+    }
+    wasActive = true;
+    twoYaw = lineYaw + offYaw;
+    twoPitch = linePitch + offPitch;
     applyBlend(true);
     g_twoHandActive = true;
     vr::control::g_twoHandEngaged = true;
@@ -2039,6 +2183,8 @@ void ApplyNearPlane(char* cam) {
 // Prima persona (esperimento): sostituisce la posizione appena copiata nella
 // camera con quella del Pawn (+0x54, confermata in Fase 2) + altezza occhi,
 // spostata in avanti lungo lo yaw della camera.
+bool PawnOnFirmGround(void* pawn);
+
 void ApplyFirstPerson(char* cam) {
     if (!vr::control::g_firstPerson) return;
     // Pawn del giocatore: PlayerController.Pawn (+0x1F8); la camera e' a
@@ -2062,9 +2208,21 @@ void ApplyFirstPerson(char* cam) {
     float yaw = TrySafeReadUint32(static_cast<char*>(pawn) + 0x64, reinterpret_cast<uint32_t*>(&pawnYaw))
                     ? pawnYaw * (6.28318530718f / 65536.0f)
                     : *reinterpret_cast<int32_t*>(cam + kCameraOffsetYaw) * (6.28318530718f / 65536.0f);
-    float fwd = vr::control::g_fpForward;
+    // Su un mezzo (elicottero, camion, torretta a bordo) niente spostamento in
+    // avanti: con 15 unita' davanti al Pawn la vista finiva fuori dalla porta
+    // dell'elicottero (19/10, nel visore, anche nella 0.9.6).
+    float fwd = PawnOnFirmGround(pawn) ? vr::control::g_fpForward.load() : 0.0f;
     loc[0] = p[0] + fwd * std::cos(yaw);
     loc[1] = p[1] + fwd * std::sin(yaw);
+    // "height auto": occhi all'altezza della testa vera (in piedi, misurata da
+    // SteamVR sul pavimento) sopra i piedi di Walker; prima sempre 40 unita'
+    // sopra il centro del Pawn, ~20 cm sopra gli occhi di Walker e uguale per
+    // giocatori alti e bassi (audit 19/10). Seduti: altezza fissa (fp).
+    // La camera logica del gioco (visibilita' degli ordini alla squadra,
+    // bersagli) resta all'altezza fissa fp: con "height auto" piu' bassa il
+    // cecchino dietro il parapetto non risultava visibile e l'ordine veniva
+    // rifiutato (19/10, nel visore). La differenza la aggiunge solo la vista
+    // (GetPlayerViewPoint, ViewHeightExtra).
     loc[2] = p[2] + vr::control::g_fpEyeHeight;
 }
 
@@ -2124,6 +2282,64 @@ void RecordEyeOrigin(const float* loc, int eye) {
 }
 
 // Sposta loc (gia' nella camera) di +-meta' IPD lungo il vettore "right".
+// Altezza della vista rispetto alla camera logica del gioco: "height auto"
+// (testa vera) meno l'altezza fissa fp.
+float ViewHeightExtra() {
+    if (vr::control::g_heightAuto && !vr::control::g_seated && vr::control::g_eyeHeightAuto >= 0.0f)
+        return vr::control::g_eyeHeightAuto - vr::control::g_fpEyeHeight;
+    return 0.0f;
+}
+
+// Walker vivo (Pawn.Health +0x304 > 0). Morto il corpo diventa un ragdoll
+// fisico: spostare il Pawn, la mesh o le ossa a quel punto ha preceduto un
+// crash del thread di rendering e di PhysX alla morte (19/10, nel visore).
+// Walker a piedi su terreno fermo (non su un mezzo): Physics == PHYS_Walking
+// (+0x94 = 1), nessun veicolo guidato (+0x3B8), non alla torretta, e l'attore
+// su cui poggia (Base, +0xAC) non si muove. Prima si controllava solo che la
+// Base fosse il livello, ma nei livelli quasi tutti i pavimenti sono
+// StaticMeshActor: a piedi risultava spesso "su un mezzo" (19/10). Sui mezzi
+// la vista e il corpo restano dove li mette il gioco (elicottero: fuori dalla
+// porta, dal tetto, sopra o sotto la cabina).
+extern std::atomic<bool> g_onTurret;
+bool PawnOnFirmGround(void* pawn) {
+    if (!pawn) return false;
+    char* p = static_cast<char*>(pawn);
+    uint32_t phys = 0, base = 0, veh = 0;
+    if (g_onTurret) return false;
+    if (!TrySafeReadUint32(p + 0x94, &phys) || (phys & 0xFF) != 1) return false;
+    if (TrySafeReadUint32(p + 0x3B8, &veh) && veh) return false;
+    if (!TrySafeReadUint32(p + 0xAC, &base)) return false;
+    // Base in movimento nell'ultimo secondo = mezzo.
+    static uint32_t lastBase = 0;
+    static float lastLoc[3] = {0, 0, 0};
+    static ULONGLONG lastMove = 0;
+    float loc[3];
+    ULONGLONG now = GetTickCount64();
+    if (base && SafeCopy(loc, reinterpret_cast<char*>(base) + 0x54, 12)) {
+        if (base == lastBase) {
+            float d = std::fabs(loc[0] - lastLoc[0]) + std::fabs(loc[1] - lastLoc[1]) + std::fabs(loc[2] - lastLoc[2]);
+            if (d > 0.5f) lastMove = now;
+        } else {
+            lastMove = 0;
+        }
+        lastBase = base;
+        std::memcpy(lastLoc, loc, sizeof(loc));
+    } else {
+        lastBase = 0;
+        lastMove = 0;
+    }
+    return !(lastMove && now - lastMove < 1000);
+}
+
+bool PawnAlive(void* pawn) {
+    uint32_t hp = 0;
+    return pawn && TrySafeReadUint32(static_cast<char*>(pawn) + 0x304, &hp) && static_cast<int32_t>(hp) > 0;
+}
+
+// Ultimo spostamento d'occhio applicato (mondo), per togliere/rimettere
+// l'occhio intorno allo smorzamento dell'altezza e alla collisione della testa.
+float g_eyeOffsetApplied[2][3] = {};
+
 void OffsetLocationForEye(char* cam, int eye, float half) {
     float* loc = reinterpret_cast<float*>(cam + 0x10);
     // UE3: X avanti, Y destra, Z su; yaw in unita' Rotator. Gli occhi stanno
@@ -2146,9 +2362,9 @@ void OffsetLocationForEye(char* cam, int eye, float half) {
     float sign = eye == 0 ? -1.0f : 1.0f;
     // Asse Y (destra) di FRotationMatrix(pitch, yaw, roll) di UE3: con testa
     // inclinata e sguardo in alto/basso gli occhi restano sull'asse giusto.
-    loc[0] += sign * half * (sr * sp * cy - cr * sy);
-    loc[1] += sign * half * (sr * sp * sy + cr * cy);
-    loc[2] += sign * half * (-sr * cp);
+    float off[3] = {sign * half * (sr * sp * cy - cr * sy), sign * half * (sr * sp * sy + cr * cy), sign * half * (-sr * cp)};
+    for (int i = 0; i < 3; ++i) loc[i] += off[i];
+    if (eye == 0 || eye == 1) std::memcpy(g_eyeOffsetApplied[eye], off, sizeof(off));
     RecordEyeOrigin(loc, eye);
 }
 
@@ -2447,6 +2663,7 @@ class ViewportDrawThunk {
 public:
     void Detour(int bShouldPresent) {
         void* self = this;
+        if (vr::control::g_headSampleOnDraw) UpdateHeadTracking();
         char* cam = static_cast<char*>(g_cameraPtr.load());
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
@@ -2513,7 +2730,28 @@ public:
         }
         bool lockedScene = cinematicMode && (noWalker || !vr::control::g_cinemaWalker3D || movie);
         g_gameLockedScene = cinematicMode;
+        vr::control::g_gameLocked = cinematicMode;
+        {
+            // WorldInfo.Pauser (+0x46C) != None: menu di pausa (niente gesti).
+            uint32_t wi = 0, pauser = 0;
+            bool paused = HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xEC, &wi) && wi &&
+                          TrySafeReadUint32(reinterpret_cast<char*>(wi) + 0x46C, &pauser) && pauser;
+            vr::control::g_gamePaused = paused;
+        }
         bool wanted = vr::control::g_cinemaEnabled && (vr::control::g_cinemaForce || lockedScene || noWalker);
+        // Camera del gioco lontana da Walker (morte, inquadrature): nero subito,
+        // non 0,6 s di camera del gioco in 3D con la testa sopra; se torna su
+        // Walker l'immagine riappare, se diventa schermo virtuale anche
+        // (audit 19/10).
+        // Solo alla morte (Walker senza vita): le inquadrature brevi delle scene
+        // scriptate davano lampi neri continui (19/10).
+        {
+            uint32_t pawnPtr = 0;
+            bool dead = HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0x1F8, &pawnPtr) && pawnPtr &&
+                        !PawnAlive(reinterpret_cast<void*>(pawnPtr));
+            vr::output::HoldBlack(vr::control::g_fades && vr::control::g_cinemaEnabled && noWalker && dead &&
+                                  !vr::control::g_cinemaActive && !vr::control::g_cinemaForce);
+        }
         // Isteresi: momenti brevi di modalita' cinematica durante il gioco
         // (porte, eventi scriptati) restano in VR. Passare allo schermo
         // virtuale per mezzo secondo e tornare indietro, nel visore, e' un
@@ -2535,9 +2773,20 @@ public:
         }
         if (cinema != vr::control::g_cinemaActive.load()) {
             InvalidateEyeRing();
+            // Coda delle etichette svuotata al cambio: durante i filmati il
+            // gioco disegna senza presentare e restavano etichette vecchie
+            // (1912 scartate in un filmato, 19/10). Un'etichetta in piu' rimasta
+            // in coda (meno di 5: mai scartata) faceva prendere a ogni immagine
+            // l'etichetta del disegno prima, occhi scambiati: mondo doppio
+            // dopo i filmati.
+            {
+                std::lock_guard<std::mutex> lock(g_frameTagMutex);
+                g_frameTags.clear();
+            }
             g_cinemaSwitches.fetch_add(1, std::memory_order_relaxed);
             vr::log::Line(cinema ? "CINEMA: virtual screen (outside gameplay)" : "CINEMA: end, back to VR");
             vr::control::g_cinemaActive = cinema;
+            if (vr::control::g_fades) vr::output::Blink(0.3f);
         }
         UpdateDynamicResolution(cam, cinema || half <= 0 || !vr::control::g_syncStereo);
         if (cinema || half <= 0 || !vr::control::g_syncStereo || !HasCameraSignature(cam)) {
@@ -2767,8 +3016,30 @@ inline bool MaybeApplyCameraOverride(void* dst, size_t n) {
     // Rotazione del corpo come l'ha scritta il gioco (mouse/stick).
     int32_t* camYaw = reinterpret_cast<int32_t*>(cam + kCameraOffsetYaw);
     int32_t* camPitch = reinterpret_cast<int32_t*>(cam + kCameraOffsetPitch);
-    g_bodyYaw = *camYaw;
-    g_bodyPitch = *camPitch;
+    // Corpo VR = rotazione del PlayerController (+0x60 Pitch, +0x64 Yaw), non
+    // quella della camera del gioco: la camera aggiunge scosse (esplosioni,
+    // colpi, rinculo dell'arma) e animazioni di camera che nel visore
+    // ruotavano tutta la vista (audit 19/10: raffica = vista su di 10 gradi).
+    // Il beccheggio del corpo vale 0 senza "stickpitch on": l'inclinazione
+    // della vista e' solo quella della testa (anche per mani, occhi e mirino).
+    {
+        int32_t pcRot[2] = {0, 0};
+        bool pcOk = SafeCopy(pcRot, cam - 0x77C + 0x60, 8);
+        int32_t yaw = pcOk ? pcRot[1] : *camYaw;
+        int32_t pitch = pcOk ? pcRot[0] : *camPitch;
+        if (pitch > 32768) pitch -= 65536;
+        g_bodyYaw = yaw;
+        g_bodyPitch = vr::control::g_stickPitch ? pitch : 0;
+        static ULONGLONG lastDiag = 0;
+        int32_t dYaw = static_cast<int16_t>(static_cast<uint16_t>(*camYaw - yaw));
+        if (pcOk && std::abs(dYaw) > 182 && GetTickCount64() - lastDiag > 2000) {
+            lastDiag = GetTickCount64();
+            char b[160];
+            snprintf(b, sizeof(b), "BODY: game camera yaw differs from the controller by %.1f deg (shake/animation filtered)",
+                     dYaw * (360.0f / 65536.0f));
+            vr::log::Line(b);
+        }
+    }
     // "aim hand": la camera usata dalla logica di gioco (mira) punta dove
     // punta il controller destro; la vista viene ricostruita in
     // GetPlayerViewPoint come corpo + testa.
@@ -2977,6 +3248,10 @@ bool AddControllerYaw(void* pc, int32_t delta) {
     __try {
         *reinterpret_cast<int32_t*>(static_cast<char*>(pc) + 0x64) += delta;
         vr::control::g_ownYawUnits.fetch_add(delta);
+        // La vista di questo tick e' gia' costruita sul corpo letto prima: il
+        // riferimento della testa si sposta adesso, quindi anche il corpo
+        // (altrimenti un tick con la vista girata di delta).
+        g_bodyYaw.fetch_add(delta);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -3052,7 +3327,11 @@ void UpdateHeadTracking() {
     vr::session::Shared vrLock(true);  // durante un cambio di tipo: questo tick senza testa
     vr::IVRSystem* const vrsys = vrLock.ok() ? vr::VRSystem() : nullptr;
     if (!vr::session::Ready() || !vrsys) {
-        if (shouldLog) vr::log::Line("UpdateHeadTracking: OpenVR not ready.");
+        static ULONGLONG lastNotReady = 0;
+        if (GetTickCount64() - lastNotReady > 60000) {
+            lastNotReady = GetTickCount64();
+            vr::log::Line("UpdateHeadTracking: OpenVR not ready (logged once a minute).");
+        }
         return;
     }
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
@@ -3064,7 +3343,7 @@ void UpdateHeadTracking() {
     // riproiezione del visore, le mani no, quindi il fucile mostrava tutta la
     // latenza del sistema ("weapons felt stiff", 18/10).
     vr::TrackedDevicePose_t handPoses[vr::k_unMaxTrackedDeviceCount];
-    float handSec = vr::control::g_handPredictMs * 0.001f;
+    float handSec = vr::control::g_handPredictAuto ? predict : vr::control::g_handPredictMs * 0.001f;
     // Con la testa predetta e handpredict 0 le mani vanno lette senza
     // predizione: prima prendevano quella della testa e il fucile si
     // sdoppiava (19/10, predict 1).
@@ -3109,13 +3388,55 @@ void UpdateHeadTracking() {
         g_hmdYawReference = hmdYaw;
         g_hmdPitchReference = 0.0f;
         for (int i = 0; i < 3; ++i) posRef[i] = pos[i];
+        vr::control::g_cinemaRecenter = true;
         vr::log::Line("Recentered: hmdYaw=" + std::to_string(hmdYaw) + " hmdPitch=" + std::to_string(hmdPitch) +
                       " pos=(" + std::to_string(pos[0]) + ", " + std::to_string(pos[1]) + ", " + std::to_string(pos[2]) + ")");
+    }
+    // Rotazione con lo stick (continua o a scatti) attorno alla testa: il corpo
+    // gira attorno al centro di Walker e gli occhi, fp unita' davanti piu' lo
+    // spostamento della testa, giravano con lui (fino a 1 m di scivolata dopo
+    // un passo dal punto di ricentramento, audit 19/10). Si sposta il
+    // riferimento della posizione perche' gli occhi restino dove sono.
+    {
+        int32_t d = vr::control::g_stickYawUnits.exchange(0);
+        float scale = vr::control::g_posScale;
+        if (d && vr::control::g_sixDof && scale > 0.0f) {
+            float a = d * (6.28318530718f / 65536.0f);
+            float fwd = vr::control::g_fpForward.load();
+            float vf = fwd + g_headOffset[0].load(), vrr = g_headOffset[1].load();
+            float nf = vf * std::cos(a) + vrr * std::sin(a), nr = -vf * std::sin(a) + vrr * std::cos(a);
+            float df = (nf - fwd) - g_headOffset[0].load(), dr = nr - g_headOffset[1].load();
+            float sy = std::sin(g_hmdYawReference), cy = std::cos(g_hmdYawReference);
+            posRef[0] -= (df * sy + dr * cy) / scale;
+            posRef[2] -= (-df * cy + dr * sy) / scale;
+        }
+    }
+    // Altezza degli occhi per "height auto": testa in piedi (riferimento, metri
+    // sul pavimento) meno il centro del Pawn in piedi (45 unita' sopra i
+    // piedi), entro 25..55 unita'.
+    if (posRef[1] > 0.5f) {
+        float h = posRef[1] * vr::control::g_posScale - 45.0f;
+        vr::control::g_eyeHeightAuto = h < 25.0f ? 25.0f : (h > 55.0f ? 55.0f : h);
     }
     // Altezza di riferimento = altezza della testa in piedi (la massima vista
     // dall'ultimo ricentramento): abbassarsi davvero abbassa la vista, ma un
     // ricentramento fatto da chinati non solleva tutto quando ci si alza.
-    if (pos[1] > posRef[1]) posRef[1] = pos[1];
+    // Picchi del tracciamento (oltre 10 cm in un campione) non alzano il
+    // riferimento; vicino all'altezza in piedi (entro 15 cm) il riferimento
+    // scende di 1 cm/s, cosi' dopo essersi alzati in punta di piedi la vista
+    // non resta piu' bassa fino al ricentramento. Accucciati non scende.
+    {
+        static float lastY = 0.0f;
+        static double lastRefT = 0.0;
+        double nowR = ProfMs() * 0.001;
+        float dtR = lastRefT > 0.0 ? static_cast<float>(nowR - lastRefT) : 0.0f;
+        lastRefT = nowR;
+        bool spike = lastY != 0.0f && pos[1] - lastY > 0.10f;
+        lastY = pos[1];
+        if (pos[1] > posRef[1] && !spike) posRef[1] = pos[1];
+        else if (pos[1] < posRef[1] && posRef[1] - pos[1] < 0.15f && dtR > 0.0f && dtR < 0.5f)
+            posRef[1] = (std::max)(pos[1], posRef[1] - 0.01f * dtR);
+    }
     // Il corpo segue la testa: l'eccesso oltre la soglia passa dalla testa al
     // corpo (rotazione del PlayerController) e il riferimento si sposta della
     // stessa quantita', cosi' la vista non cambia.
@@ -3134,6 +3455,7 @@ void UpdateHeadTracking() {
         // 20 uscendo; anche scavalcamenti e corpo a corpo.
         specialMove = pawnT && TrySafeReadUint32(static_cast<char*>(pawnT) + 0x490, &special) &&
                       ((special >> 8) & 0xFF) != 0;
+        vr::control::g_inCover = inCover || specialMove;
     }
     // Rotazione del corpo decisa dal gioco (entrando in copertura Walker viene
     // girato di ~50 gradi verso il riparo in pochi frame): la si toglie dalla
@@ -3187,10 +3509,17 @@ void UpdateHeadTracking() {
             compensate(pendingD);
             pendingD = 0;
         }
+        bool gameStickTurn = vr::control::g_stickTurning && vr::control::g_turnSpeedDeg <= 0.0f &&
+                             vr::control::g_snapTurnDeg <= 0.0f;
         if (haveBody && !vr::control::g_cinemaActive && vr::control::g_coverSnapCompensate &&
-            !vr::control::g_stickTurning && !TurretAimActive() && !g_gameLockedScene && !afterCinema) {
+            !gameStickTurn && !TurretAimActive() && !g_gameLockedScene && !afterCinema) {
             int16_t d = static_cast<int16_t>(bodyYawNow - lastBodyYaw - own);
-            const int kMin = 7 * 65536 / 360, kMax = 75 * 65536 / 360;
+            // Vicino alla copertura si toglie ogni rotazione non nostra sopra
+            // mezzo grado per tick: con 7 gradi una rotazione graduale del
+            // gioco (sotto 630 gradi/s a 90 Hz) sfuggiva e il mondo girava
+            // (audit 19/10). Lo stick ora gira tramite la mod (turnspeed,
+            // g_ownYawUnits), quindi non viene scambiato per il gioco.
+            const int kMin = (nearCover ? 65536 / 720 : 7 * 65536 / 360), kMax = 75 * 65536 / 360;
             if (std::abs(d) > kMin && std::abs(d) < kMax) {
                 if (nearCover) {
                     compensate(d);
@@ -3215,7 +3544,11 @@ void UpdateHeadTracking() {
         }
         if (inCover && vr::control::g_coverPeekEnabled) {
             float up = pos[1] - entry[1];
-            float lat = std::sqrt((pos[0] - entry[0]) * (pos[0] - entry[0]) + (pos[2] - entry[2]) * (pos[2] - entry[2]));
+            // Solo di lato rispetto al corpo (destra del riferimento): chinarsi
+            // in avanti (guardare la cintura nella ricarica, guardare giu' dal
+            // riparo) faceva uscire Walker sotto il fuoco (audit 19/10).
+            float sy = std::sin(g_hmdYawReference), cy = std::cos(g_hmdYawReference);
+            float lat = std::fabs((pos[0] - entry[0]) * cy + (pos[2] - entry[2]) * sy);
             if (!peeking && (up > 0.12f || lat > 0.18f)) {
                 peeking = true;
                 vr::log::Line("COVER: leaning out (head up " + std::to_string(up) + " m, sideways " + std::to_string(lat) + " m)");
@@ -3230,13 +3563,22 @@ void UpdateHeadTracking() {
     }
     if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover && !g_gameLockedScene) {
         float ex = std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f);
+        static double lastTurnT = 0.0;
+        double nowTurn = ProfMs() * 0.001;
+        float dtTurn = lastTurnT > 0.0 ? static_cast<float>(nowTurn - lastTurnT) : 0.0f;
+        lastTurnT = nowTurn;
         if (std::fabs(ex) > turnThr) {
             float shift = ex - std::copysign(turnThr, ex);
+            // Al massimo 180 gradi/s: uscendo dalla copertura o da una scena
+            // con la testa girata il corpo scattava tutto in un frame.
+            float maxStep = 3.14159265f * (dtTurn > 0.0f && dtTurn < 0.1f ? dtTurn : 0.011f);
+            if (std::fabs(shift) > maxStep) shift = std::copysign(maxStep, shift);
             if (AddControllerYaw(pcForTurn, vr::control::g_yawSign * RadiansToUnreal(shift)))
                 g_hmdYawReference += shift;
         }
     }
     g_deltaYaw = vr::control::g_yawSign * RadiansToUnreal(std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f));
+    vr::control::g_headYawUnits = g_deltaYaw.load();
     g_deltaPitch = vr::control::g_pitchSign * RadiansToUnreal(hmdPitch - g_hmdPitchReference);
     if (vr::control::g_sixDof) {
         // Rollio: inclinazione del vettore "right" del visore (colonna 0).
@@ -3255,6 +3597,44 @@ void UpdateHeadTracking() {
         g_headOffset[0] = forward * scale;
         g_headOffset[1] = right * scale;
         g_headOffset[2] = dy * scale;
+        // Room-scale: oltre 15 cm di passo il Pawn si sposta (Actor.Move, con
+        // le collisioni) fino a 5 cm dalla testa e il riferimento della
+        // posizione si sposta di quanto si e' mosso davvero: la vista non
+        // cambia, ma collisioni, bersaglio dei nemici e copertura seguono il
+        // giocatore. Prima oltre 1,2 m il corpo restava indietro (audit 19/10).
+        float horiz = std::sqrt(forward * forward + right * right);
+        if (vr::control::g_roomScale && horiz > 0.15f && !vr::control::g_cinemaActive && !g_gameLockedScene &&
+            PawnAlive(PlayerPawnIfViewTarget(static_cast<char*>(g_cameraPtr.load()))) &&
+            PawnOnFirmGround(PlayerPawnIfViewTarget(static_cast<char*>(g_cameraPtr.load()))) && !g_onTurret &&
+            !vr::control::g_inCover && scale > 0.0f) {
+            char* camR = static_cast<char*>(g_cameraPtr.load());
+            void* pawnR = HasCameraSignature(camR) ? PlayerPawnIfViewTarget(camR) : nullptr;
+            float before[3];
+            if (pawnR && SafeCopy(before, static_cast<char*>(pawnR) + 0x54, 12)) {
+                float k = (horiz - 0.05f) / horiz;  // si lasciano 5 cm
+                float mf = forward * k * scale, mr = right * k * scale;
+                float b = g_bodyYaw.load() * (6.28318530718f / 65536.0f);
+                struct {
+                    float delta[3];
+                    uint32_t ret;
+                } mv = {{mf * std::cos(b) - mr * std::sin(b), mf * std::sin(b) + mr * std::cos(b), 0.0f}, 0};
+                float after[3];
+                if (vr::script::CallFunction(pawnR, "Move", &mv) && SafeCopy(after, static_cast<char*>(pawnR) + 0x54, 12)) {
+                    float wx = after[0] - before[0], wy = after[1] - before[1];
+                    // Mondo -> riferimento del corpo (avanti, destra), poi -> metri.
+                    float mfw = (wx * std::cos(b) + wy * std::sin(b)) / scale;
+                    float mrw = (-wx * std::sin(b) + wy * std::cos(b)) / scale;
+                    if (mfw * mfw + mrw * mrw > 1e-6f) {
+                        // offset = M * (pos - posRef): togliere (mfw, mrw) dall'offset.
+                        posRef[0] += mfw * sy + mrw * cy;
+                        posRef[2] += -mfw * cy + mrw * sy;
+                        float ndx = pos[0] - posRef[0], ndz = pos[2] - posRef[2];
+                        g_headOffset[0] = (ndx * sy - ndz * cy) * scale;
+                        g_headOffset[1] = (ndx * cy + ndz * sy) * scale;
+                    }
+                }
+            }
+        }
     } else {
         g_deltaRoll = 0;
         for (auto& v : g_headOffset) v = 0.0f;
@@ -3263,7 +3643,7 @@ void UpdateHeadTracking() {
     // Controller destro: direzione di puntamento (-Z del controller), yaw
     // relativo alla direzione di ricentramento, pitch rispetto all'orizzonte.
     {
-        vr::TrackedDeviceIndex_t ri = vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        vr::TrackedDeviceIndex_t ri = vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
         if (ri != vr::k_unTrackedDeviceIndexInvalid && ri < vr::k_unMaxTrackedDeviceCount && handPoses[ri].bPoseIsValid) {
             const vr::HmdMatrix34_t& c = handPoses[ri].mDeviceToAbsoluteTracking;
             if (vr::control::g_stockCalibRequest.exchange(false)) {
@@ -3290,14 +3670,30 @@ void UpdateHeadTracking() {
                     char val[32];
                     snprintf(val, sizeof(val), "%.1f", offset);
                     vr::control::SaveIniValue("aimpitch", val);
-                    vr::TrackedDeviceIndex_t ri2 = vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
-                    if (ri2 != vr::k_unTrackedDeviceIndexInvalid) vrsys->TriggerHapticPulse(ri2, 0, 3900);
+                    vr::TrackedDeviceIndex_t ri2 = vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
+                    (void)ri2;
+                    vr::input::PulseHand(1, 150);
                 } else {
                     vr::log::Line("STOCK: calibration ignored, controller too close to the headset.");
                 }
             }
-            float cYaw = YawFromOpenVrPose(c);
-            float cPitch = PitchFromOpenVrPose(c) + vr::control::g_aimPitchOffsetDeg * 0.01745329252f;
+            // aimpitch (calcio) come rotazione attorno all'asse destro del
+            // controller, poi yaw/beccheggio/rollio dalla matrice ruotata.
+            // Prima si sommava al beccheggio assoluto: col fucile inclinato la
+            // canna prendeva un errore di lato di aimpitch*sin(rollio) (7,5
+            // gradi a 30 gradi di rollio con -15, audit 19/10).
+            vr::HmdMatrix34_t ca = c;
+            {
+                float a = vr::control::g_aimPitchOffsetDeg * 0.01745329252f;
+                float co = std::cos(a), si = std::sin(a);
+                for (int k = 0; k < 3; ++k) {
+                    float y = c.m[k][1], z = c.m[k][2];
+                    ca.m[k][1] = co * y + si * z;
+                    ca.m[k][2] = co * z - si * y;
+                }
+            }
+            float cYaw = YawFromOpenVrPose(ca);
+            float cPitch = PitchFromOpenVrPose(ca);
             g_aimDeltaYaw = vr::control::g_yawSign * RadiansToUnreal(cYaw - g_hmdYawReference);
             g_aimDeltaPitch = vr::control::g_pitchSign * RadiansToUnreal(cPitch);
             g_aimValid = true;
@@ -3312,11 +3708,11 @@ void UpdateHeadTracking() {
             float rightY = c.m[1][0];
             if (rightY > 1.0f) rightY = 1.0f;
             if (rightY < -1.0f) rightY = -1.0f;
-            g_handRoll = vr::control::g_rollSign * RadiansToUnreal(std::atan2(-c.m[1][0], c.m[1][1]));
+            g_handRoll = vr::control::g_rollSign * RadiansToUnreal(std::atan2(-ca.m[1][0], ca.m[1][1]));
             g_handValid = true;
             // Controller sinistro, stesso riferimento: mira a due mani.
             vr::TrackedDeviceIndex_t li =
-                vrsys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+                vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::SupportRole());
             g_twoHandActive = false;
             if (li != vr::k_unTrackedDeviceIndexInvalid && li < vr::k_unMaxTrackedDeviceCount && handPoses[li].bPoseIsValid) {
                 const vr::HmdMatrix34_t& lm = handPoses[li].mDeviceToAbsoluteTracking;
@@ -3405,7 +3801,10 @@ bool g_inCalcSceneView = false;  // solo thread di gioco
 // risultato: Actor a +4, Location a +8 (il tempo si ricava dalla posizione).
 constexpr uintptr_t kSingleLineCheckAddr = 0x009BDE30;
 constexpr uintptr_t kGWorldAddr = 0x014DF734;
-constexpr DWORD kTraceFlags = 0x2286;
+// + TRACE_Pawns (0x1): la testa non entra piu' nei compagni di squadra e il
+// mirino si ferma sul nemico invece che sul muro dietro di lui (playtest
+// 19/10). Il Pawn di Walker e' la sorgente, quindi escluso.
+constexpr DWORD kTraceFlags = 0x2286 | 0x1 | 0x10;  // + TRACE_Others: attori mossi (cabina dell'elicottero)
 typedef int(__thiscall* SingleLineCheck_t)(void* world, void* hit, void* source, const float* end, const float* start,
                                            DWORD flags, const float* extent, void* light);
 
@@ -3629,6 +4028,28 @@ const WeaponInfo& CurrentWeaponInfo(void* weapon) {
         g_weaponInfo.cls = weapon ? vr::script::ClassName(weapon) : std::string();
         g_weaponInfo.stationary = weapon && vr::script::IsA(weapon, "YWeapon_Stationary");
         g_weaponInfo.launcher = weapon && vr::script::IsA(weapon, "YWeapon_Launcher");
+        // L'RPG spara solo mirando (LT): col controller LT si tiene da solo
+        // mentre si preme il grilletto (audit 19/10).
+        vr::control::g_weaponNeedsAim = g_weaponInfo.cls.find("RPG") != std::string::npos;
+        // Caricatore per tipo d'arma (rispetto a magwell, tarato sui fucili):
+        // pistole e Uzi nell'impugnatura sotto la mano, P90 sopra la canna,
+        // fucili a tamburo/pompa piu' avanti.
+        const std::string& c = g_weaponInfo.cls;
+        float mf = 0.0f, md = 0.0f;
+        if (c.find("DesertEagle") != std::string::npos || c.find("M9A1") != std::string::npos ||
+            c.find("Python") != std::string::npos || c.find("MicroUzi") != std::string::npos ||
+            c.find("Pistol") != std::string::npos) {
+            mf = -4.0f;
+            md = 2.0f;
+        } else if (c.find("P90") != std::string::npos) {
+            mf = 0.0f;
+            md = -16.0f;
+        } else if (c.find("AA12") != std::string::npos || c.find("Shotgun") != std::string::npos ||
+                   c.find("Benelli") != std::string::npos) {
+            mf = 8.0f;
+        }
+        vr::control::g_magwellClassCm[0] = mf;
+        vr::control::g_magwellClassCm[1] = md;
         if (weapon)
             vr::log::Line("WEAPON: " + g_weaponInfo.cls + (g_weaponInfo.stationary ? " (mounted weapon: left in place)" : ""));
     }
@@ -3732,6 +4153,10 @@ constexpr uintptr_t kOffSingleFlags = 0xBC, kOffSingleRotSpace = 0xCD, kOffSingl
 constexpr uint32_t kSingleApplyTranslation = 0x1, kSingleApplyRotation = 0x2, kSingleAddRotation = 0x8;
 constexpr uint8_t kBcsActorSpace = 1;
 constexpr size_t kCtrlSaveFrom = 0x68, kCtrlSaveLen = 0x90;  // campi modificati, ripristinati al rilascio
+// SkeletalMeshComponent.SpaceBases / LocalAtoms: TArray di FBoneAtom (32 byte:
+// quaternione, traslazione, scala), uno per osso.
+constexpr uintptr_t kOffMeshSpaceBases = 0x274, kOffMeshLocalAtoms = 0x280;
+constexpr size_t kBoneAtomSize = 32;
 
 struct ArmRig {
     void* mesh = nullptr;
@@ -3781,6 +4206,7 @@ void ReleaseArms() {
     g_rig.mesh = nullptr;
     g_handInWeaponValid[0] = g_handInWeaponValid[1] = false;
     g_armsActive = false;
+    g_leftDriven = false;
 }
 
 bool AcquireArms(void* mesh) {
@@ -3860,19 +4286,42 @@ bool WriteHandControls(void* limb, void* rotc, const float* eff, const float* jo
     }
 }
 
-// Mano (0 destra, 1 sinistra): posa nel mondo -> controlli IK.
-void DriveHand(int side, const float* center, int32_t bodyYaw, const float* off, int32_t pitch, int32_t yaw, int32_t roll,
-               const float* actorLoc, const float* af, const float* ar, const float* au, float scale, bool debug) {
-    void* limb = g_rig.ctrl[side];
-    void* rotc = g_rig.ctrl[2 + side];
-    if (!limb) return;
+void GunKickNow(float* pitchDeg, float* back);
+// Quanto la volata e' dentro un ostacolo (unita', lungo la linea spalla ->
+// volata, da MuzzleStart): l'arma disegnata arretra di tanto (HandTarget).
+std::atomic<float> g_muzzlePenetration{0.0f};
+std::atomic<float> g_gunPushApplied{0.0f};  // arretramento gia' applicato (per misurare senza)
+
+// Mano (0 destra, 1 sinistra): posa voluta nel mondo dal controller.
+// axes: righe X, Y, Z dell'osso della mano, come BoneAxes.
+void HandTarget(int side, const float* center, int32_t bodyYaw, const float* off, int32_t pitch, int32_t yaw, int32_t roll,
+                float* pos, float axes[3][3]) {
     float b = bodyYaw * (6.28318530718f / 65536.0f);
-    float pos[3] = {center[0] + off[0] * std::cos(b) - off[1] * std::sin(b),
-                    center[1] + off[0] * std::sin(b) + off[1] * std::cos(b), center[2] + off[2]};
+    pos[0] = center[0] + off[0] * std::cos(b) - off[1] * std::sin(b);
+    pos[1] = center[1] + off[0] * std::sin(b) + off[1] * std::cos(b);
+    pos[2] = center[2] + off[2];
     // Assi del controller, poi rotazione della mano rispetto al controller
     // (specchiata per la sinistra) e posizione del polso.
+    float kickDeg = 0.0f, kickBack = 0.0f;
+    if (side == 0) GunKickNow(&kickDeg, &kickBack);
+    // Arma contro un muro: arretra lungo la canna quanto la volata e' dentro
+    // l'ostacolo (al massimo 20 unita', in ~60 ms), invece di attraversarlo
+    // come nei giochi VR nativi (audit 19/10: il fucile entrava nella fusoliera).
+    if (side == 0) {
+        static float push = 0.0f;
+        static double lastPushT = 0.0;
+        double nowP = ProfMs();
+        float dtP = lastPushT > 0.0 ? static_cast<float>((nowP - lastPushT) * 0.001) : 0.0f;
+        lastPushT = nowP;
+        float want = (std::min)(g_muzzlePenetration.load(), 20.0f);
+        push += (want - push) * (dtP > 0.0f ? (std::min)(1.0f, dtP / 0.06f) : 1.0f);
+        g_gunPushApplied = push;
+        kickBack += push;
+    }
+    pitch += static_cast<int32_t>(kickDeg * (65536.0f / 360.0f));
     float cf[3], cr[3], cu[3];
     RotatorToAxes(pitch, yaw, roll, cf, cr, cu);
+    for (int i = 0; i < 3; ++i) pos[i] -= cf[i] * kickBack;
     float mirror = side == 0 ? 1.0f : -1.0f;
     float k = 0.01f * vr::control::g_posScale;
     float wo[3] = {vr::control::g_armOffsetCm[0] * k, vr::control::g_armOffsetCm[1] * k * mirror,
@@ -3891,7 +4340,9 @@ void DriveHand(int side, const float* center, int32_t bodyYaw, const float* off,
         wu[i] = cf[i] * ou[0] + cr[i] * ou[1] + cu[i] * ou[2];
     }
     // Mano = riferimento dell'arma composto con la relazione mano/arma.
-    float hf[3], hr[3], hu[3];
+    float* hf = axes[0];
+    float* hr = axes[1];
+    float* hu = axes[2];
     if (g_handInWeaponValid[side]) {
         const float(*m)[3] = g_handInWeapon[side];
         for (int i = 0; i < 3; ++i) {
@@ -3904,6 +4355,18 @@ void DriveHand(int side, const float* center, int32_t bodyYaw, const float* off,
         std::memcpy(hr, wr, 12);
         std::memcpy(hu, wu, 12);
     }
+}
+
+// Posa della mano nel mondo -> controlli IK (spazio dell'attore).
+void WriteHand(int side, const float* pos, const float axes[3][3], const float* actorLoc, const float* af,
+               const float* ar, const float* au, float scale, bool debug) {
+    void* limb = g_rig.ctrl[side];
+    void* rotc = g_rig.ctrl[2 + side];
+    if (!limb) return;
+    float mirror = side == 0 ? 1.0f : -1.0f;
+    const float* hf = axes[0];
+    const float* hr = axes[1];
+    const float* hu = axes[2];
     // Spazio dell'attore.
     float rel[3] = {pos[0] - actorLoc[0], pos[1] - actorLoc[1], pos[2] - actorLoc[2]};
     float eff[3], lf[3], lr[3], lu[3];
@@ -3931,6 +4394,160 @@ void DriveHand(int side, const float* center, int32_t bodyYaw, const float* off,
                  lrot[2]);
         vr::log::Line(buf);
     }
+}
+
+// Presa della mano sinistra sull'arma, come la fa il gioco: nell'animazione le
+// ossa IK_Hand_R / IK_Hand_L stanno dove il gioco mette le mani sull'arma (con
+// "arms off" coincidono con Hand_Right / Hand_Left) e i controlli IKBone_*
+// portano le mani li'. La mod muove le ossa Hand_*, non le IK_*: la posa di
+// IK_Hand_L rispetto a IK_Hand_R (dalle SpaceBases dell'ultimo aggiornamento)
+// e' quindi la presa sull'astina rispetto alla mano destra, per l'arma in mano
+// e con le dita dell'animazione chiuse sull'arma.
+bool SupportGripRelation(void* mesh, float pos[3], float rot[3][3]) {
+    static void* cachedMesh = nullptr;
+    static int idxR = -1, idxL = -1;
+    if (mesh != cachedMesh) {
+        cachedMesh = mesh;
+        idxR = idxL = -1;
+        for (int i = 0; i < 256 && (idxR < 0 || idxL < 0); ++i) {
+            struct {
+                int32_t index;
+                int32_t ret[2];
+            } parms = {i, {0, 0}};
+            if (!vr::script::CallFunction(mesh, "GetBoneName", &parms) || parms.ret[0] <= 0) break;
+            std::string n = vr::script::NameFromIndex(parms.ret[0]);
+            if (n == "IK_Hand_R") idxR = i;
+            if (n == "IK_Hand_L") idxL = i;
+        }
+        vr::log::Line("ARMS: grip bones IK_Hand_R=" + std::to_string(idxR) + " IK_Hand_L=" + std::to_string(idxL));
+    }
+    if (idxR < 0 || idxL < 0) return false;
+    uint32_t data = 0, num = 0;
+    char* m = static_cast<char*>(mesh);
+    if (!TrySafeReadUint32(m + kOffMeshSpaceBases, &data) || !TrySafeReadUint32(m + kOffMeshSpaceBases + 4, &num) ||
+        !data || num <= static_cast<uint32_t>(idxR > idxL ? idxR : idxL) || num > 1024)
+        return false;
+    float atom[2][8];
+    if (!SafeCopy(atom[0], reinterpret_cast<char*>(data) + idxR * kBoneAtomSize, 32) ||
+        !SafeCopy(atom[1], reinterpret_cast<char*>(data) + idxL * kBoneAtomSize, 32))
+        return false;
+    float ax[2][3][3];
+    for (int k = 0; k < 2; ++k) {
+        float x = atom[k][0], y = atom[k][1], z = atom[k][2], w = atom[k][3];
+        float n = x * x + y * y + z * z + w * w;
+        if (!(n > 0.5f && n < 1.5f)) return false;
+        ax[k][0][0] = 1 - 2 * (y * y + z * z); ax[k][0][1] = 2 * (x * y + w * z); ax[k][0][2] = 2 * (x * z - w * y);
+        ax[k][1][0] = 2 * (x * y - w * z); ax[k][1][1] = 1 - 2 * (x * x + z * z); ax[k][1][2] = 2 * (y * z + w * x);
+        ax[k][2][0] = 2 * (x * z + w * y); ax[k][2][1] = 2 * (y * z - w * x); ax[k][2][2] = 1 - 2 * (x * x + y * y);
+    }
+    float d[3] = {atom[1][4] - atom[0][4], atom[1][5] - atom[0][5], atom[1][6] - atom[0][6]};
+    for (int r = 0; r < 3; ++r) {
+        pos[r] = d[0] * ax[0][r][0] + d[1] * ax[0][r][1] + d[2] * ax[0][r][2];
+        for (int c = 0; c < 3; ++c)
+            rot[r][c] = ax[1][r][0] * ax[0][c][0] + ax[1][r][1] * ax[0][c][1] + ax[1][r][2] * ax[0][c][2];
+    }
+    // Pistole e Micro Uzi (a una mano: IK_Hand_L a ~30 unita') e animazioni
+    // senza la sinistra sull'arma (corsa, lancio): nessuna presa. Fucili,
+    // fucili a pompa, P90, RPG: 9-23 unita'.
+    return pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2] < 26.0f * 26.0f;
+}
+
+// Spalla (osso Arm_Left / Arm_Right) nel mondo e portata massima del braccio
+// (lunghezza dell'animazione per armstretch). Lunghezze
+// di braccio e avambraccio dalle LocalAtoms; l'allungamento dell'IK le scrive
+// li' (braccio teso: 18,1 + 16,4 invece di 14,5 + 13,1), quindi si tiene la
+// minima vista sui due bracci, che e' quella dell'animazione.
+bool ArmReach(void* mesh, int side, float shoulder[3], float* reach) {
+    static void* cachedMesh = nullptr;
+    static int idx[2][2] = {{-1, -1}, {-1, -1}};  // [sinistro, destro][gomito, mano]
+    static float minLen = 0.0f;
+    if (mesh != cachedMesh) {
+        cachedMesh = mesh;
+        minLen = 0.0f;
+        static const char* kNames[2][2] = {{"Ellbow_Left", "Hand_Left"}, {"Ellbow_Right", "Hand_Right"}};
+        for (auto& a : idx) a[0] = a[1] = -1;
+        for (int i = 0; i < 256; ++i) {
+            struct {
+                int32_t index;
+                int32_t ret[2];
+            } parms = {i, {0, 0}};
+            if (!vr::script::CallFunction(mesh, "GetBoneName", &parms) || parms.ret[0] <= 0) break;
+            std::string n = vr::script::NameFromIndex(parms.ret[0]);
+            for (int a = 0; a < 2; ++a)
+                for (int b = 0; b < 2; ++b)
+                    if (n == kNames[a][b] && idx[a][b] < 0) idx[a][b] = i;
+        }
+    }
+    uint32_t data = 0, num = 0;
+    char* m = static_cast<char*>(mesh);
+    if (!TrySafeReadUint32(m + kOffMeshLocalAtoms, &data) || !TrySafeReadUint32(m + kOffMeshLocalAtoms + 4, &num) ||
+        !data || num > 1024)
+        return false;
+    for (const auto& a : idx) {
+        if (a[0] < 0 || a[1] < 0 || num <= static_cast<uint32_t>(a[0] > a[1] ? a[0] : a[1])) continue;
+        float te[3], th[3];
+        if (!SafeCopy(te, reinterpret_cast<char*>(data) + a[0] * kBoneAtomSize + 16, 12) ||
+            !SafeCopy(th, reinterpret_cast<char*>(data) + a[1] * kBoneAtomSize + 16, 12))
+            continue;
+        float len = std::sqrt(te[0] * te[0] + te[1] * te[1] + te[2] * te[2]) +
+                    std::sqrt(th[0] * th[0] + th[1] * th[1] + th[2] * th[2]);
+        if (len > 10.0f && len < 80.0f && (minLen == 0.0f || len < minLen)) minLen = len;
+    }
+    if (minLen == 0.0f) return false;
+    struct {
+        int32_t name[2];
+        int32_t space;
+        float ret[3];
+    } hp = {{vr::script::NameIndex(side == 0 ? "Arm_Right" : "Arm_Left"), 0}, 0, {0, 0, 0}};
+    if (hp.name[0] < 0 || !vr::script::CallFunction(mesh, "GetBoneLocation", &hp)) return false;
+    std::memcpy(shoulder, hp.ret, 12);
+    *reach = minLen * vr::control::g_armStretch;
+    return true;
+}
+
+// Assi (righe X, Y, Z, convenzione di BoneAxes) <-> quaternione (x, y, z, w).
+void AxesToQuat(const float m[3][3], float q[4]) {
+    float tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0.0f) {
+        float w = std::sqrt(1.0f + tr) * 0.5f, k = 0.25f / w;
+        q[0] = (m[1][2] - m[2][1]) * k; q[1] = (m[2][0] - m[0][2]) * k; q[2] = (m[0][1] - m[1][0]) * k; q[3] = w;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        float x = std::sqrt(1.0f + m[0][0] - m[1][1] - m[2][2]) * 0.5f, k = 0.25f / x;
+        q[0] = x; q[1] = (m[0][1] + m[1][0]) * k; q[2] = (m[0][2] + m[2][0]) * k; q[3] = (m[1][2] - m[2][1]) * k;
+    } else if (m[1][1] > m[2][2]) {
+        float y = std::sqrt(1.0f + m[1][1] - m[0][0] - m[2][2]) * 0.5f, k = 0.25f / y;
+        q[0] = (m[0][1] + m[1][0]) * k; q[1] = y; q[2] = (m[1][2] + m[2][1]) * k; q[3] = (m[2][0] - m[0][2]) * k;
+    } else {
+        float z = std::sqrt(1.0f + m[2][2] - m[0][0] - m[1][1]) * 0.5f, k = 0.25f / z;
+        q[0] = (m[0][2] + m[2][0]) * k; q[1] = (m[1][2] + m[2][1]) * k; q[2] = z; q[3] = (m[0][1] - m[1][0]) * k;
+    }
+}
+void QuatToAxes(const float q[4], float m[3][3]) {
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    float n = std::sqrt(x * x + y * y + z * z + w * w);
+    if (n > 1e-6f) { x /= n; y /= n; z /= n; w /= n; }
+    m[0][0] = 1 - 2 * (y * y + z * z); m[0][1] = 2 * (x * y + w * z); m[0][2] = 2 * (x * z - w * y);
+    m[1][0] = 2 * (x * y - w * z); m[1][1] = 1 - 2 * (x * x + z * z); m[1][2] = 2 * (y * z + w * x);
+    m[2][0] = 2 * (x * z + w * y); m[2][1] = 2 * (y * z - w * x); m[2][2] = 1 - 2 * (x * x + y * y);
+}
+// Interpolazione sferica tra due orientamenti (assi), t in [0,1].
+void SlerpAxes(const float a[3][3], const float b[3][3], float t, float out[3][3]) {
+    float qa[4], qb[4], q[4];
+    AxesToQuat(a, qa);
+    AxesToQuat(b, qb);
+    float d = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+    if (d < 0.0f) {
+        for (float& v : qb) v = -v;
+        d = -d;
+    }
+    float wa = 1.0f - t, wb = t;
+    if (d < 0.9995f) {
+        float th = std::acos(d), sn = std::sin(th);
+        wa = std::sin((1.0f - t) * th) / sn;
+        wb = std::sin(t * th) / sn;
+    }
+    for (int i = 0; i < 4; ++i) q[i] = qa[i] * wa + qb[i] * wb;
+    QuatToAxes(q, out);
 }
 
 // Assi (righe X, Y, Z) di un osso nel mondo da GetBoneQuaternion.
@@ -3976,13 +4593,29 @@ void MeasureHandInWeapon(void* mesh, int side, void* gunComp) {
     const char* hand = side == 0 ? "Hand_Right" : "Hand_Left";
     const char* weap = side == 0 ? (gunComp ? "weapon mesh" : "Weapon_Right") : "Weapon_Left";
     if (!BoneAxes(mesh, hand, h) || !WeaponAxes(mesh, side, gunComp, w)) return;
-    float change = 0.0f;
+    float v[3][3];
     for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b) {
-            float v = h[a][0] * w[b][0] + h[a][1] * w[b][1] + h[a][2] * w[b][2];
-            change += std::fabs(v - g_handInWeapon[side][a][b]);
-            g_handInWeapon[side][a][b] = v;
+        for (int b = 0; b < 3; ++b) v[a][b] = h[a][0] * w[b][0] + h[a][1] * w[b][1] + h[a][2] * w[b][2];
+    auto diff = [](const float x[3][3], const float y[3][3]) {
+        float d = 0.0f;
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b) d += std::fabs(x[a][b] - y[a][b]);
+        return d;
+    };
+    // Una misura molto diversa (animazione di cambio arma, mira del gioco)
+    // vale solo se la seguente la conferma; le piccole correzioni subito.
+    static float cand[2][3][3];
+    static bool haveCand[2] = {false, false};
+    float change = g_handInWeaponValid[side] ? diff(v, g_handInWeapon[side]) : 99.0f;
+    if (g_handInWeaponValid[side] && change > 0.15f) {
+        if (!haveCand[side] || diff(v, cand[side]) > 0.1f) {
+            std::memcpy(cand[side], v, sizeof(v));
+            haveCand[side] = true;
+            return;
         }
+    }
+    haveCand[side] = false;
+    std::memcpy(g_handInWeapon[side], v, sizeof(v));
     g_handInWeaponValid[side] = true;
     if (change < 0.05f && !vr::control::g_armDebugFrames.load()) return;  // nel log solo i cambiamenti
     char buf[200];
@@ -4075,30 +4708,55 @@ void* g_fpPawn = nullptr;
 void* g_fpHeadMesh = nullptr;
 uint32_t g_fpPawnCls = 0, g_fpHeadMeshCls = 0;
 float g_fpSavedCylinders[8];
-float g_fpSavedMeshX = 0.0f, g_fpSavedMeshY = 0.0f;
+float g_fpSavedMeshX = 0.0f, g_fpSavedMeshY = 0.0f, g_fpSavedMeshZ = 0.0f;
 
 bool SetCylinders(void* pawn, const float* v) { return SafeCopy(static_cast<char*>(pawn) + kOffPawnInvisCylinders, v, 32); }
 
+// Testa e collo nascosti (il collo comprende la testa): con la sola testa,
+// accucciati in copertura e guardando in basso si vedeva il moncone del collo
+// con la nuca insanguinata (playtest 19/10, Gorge02). Spalle e braccia sono
+// figlie della colonna, restano visibili.
+// Abbassamento del Pawn dovuto all'accucciata del gioco (unita'): capsula di
+// collisione (Pawn.CylinderComponent +0x3AC, CollisionHeight +0x200) rispetto
+// all'altezza in piedi (la massima vista per questo Pawn).
+float GameCrouchDrop(void* pawn) {
+    static float standingH = 0.0f;
+    static void* standingPawn = nullptr;
+    uint32_t cyl = 0;
+    float h = 0.0f;
+    if (!pawn || !TrySafeReadUint32(static_cast<char*>(pawn) + 0x3AC, &cyl) || !cyl ||
+        !SafeCopy(&h, reinterpret_cast<char*>(cyl) + 0x200, 4) || !(h > 5.0f && h < 200.0f))
+        return 0.0f;
+    if (pawn != standingPawn) {
+        standingPawn = pawn;
+        standingH = h;
+    }
+    if (h > standingH) standingH = h;
+    return standingH - h;
+}
+
 void SetHeadHidden(void* mesh, bool hide) {
-    struct {
-        int32_t name[2];
-        uint8_t physBodyOption;
-        uint8_t pad[3];
-    } parms = {{vr::script::NameIndex("head"), 0}, 0, {0, 0, 0}};
-    if (parms.name[0] < 0) return;
-    vr::script::CallFunction(mesh, hide ? "HideBoneByName" : "UnHideBoneByName", &parms);
+    for (const char* bone : {"Neck", "head"}) {
+        struct {
+            int32_t name[2];
+            uint8_t physBodyOption;
+            uint8_t pad[3];
+        } parms = {{vr::script::NameIndex(bone), 0}, 0, {0, 0, 0}};
+        if (parms.name[0] < 0) continue;
+        vr::script::CallFunction(mesh, hide ? "HideBoneByName" : "UnHideBoneByName", &parms);
+    }
 }
 
 void UpdateFirstPersonBody(void* pawn) {
-    bool want = pawn && vr::control::g_firstPerson && !vr::control::g_cinemaActive;
+    bool want = pawn && vr::control::g_firstPerson && !vr::control::g_cinemaActive && PawnAlive(pawn);
     uint32_t mesh = 0;
     if (want && !TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnMesh, &mesh)) want = false;
     if (g_fpPawn && (!want || pawn != g_fpPawn)) {
         if (StillAlive(g_fpPawn, g_fpPawnCls)) SetCylinders(g_fpPawn, g_fpSavedCylinders);
         if (g_fpHeadMesh && StillAlive(g_fpHeadMesh, g_fpHeadMeshCls)) {
             SetHeadHidden(g_fpHeadMesh, false);
-            float xy[2] = {g_fpSavedMeshX, g_fpSavedMeshY};
-            SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xy, 8);
+            float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
+            SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xyz, 12);
         }
         g_fpPawn = nullptr;
         g_fpHeadMesh = nullptr;
@@ -4115,11 +4773,12 @@ void UpdateFirstPersonBody(void* pawn) {
     if (g_fpHeadMesh && !StillAlive(g_fpHeadMesh, g_fpHeadMeshCls)) g_fpHeadMesh = nullptr;
     if (mesh && reinterpret_cast<void*>(mesh) != g_fpHeadMesh) {
         if (g_fpHeadMesh) {
-            float xy[2] = {g_fpSavedMeshX, g_fpSavedMeshY};
-            SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xy, 8);
+            float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
+            SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xyz, 12);
         }
         SafeCopy(&g_fpSavedMeshX, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX, 4);
         SafeCopy(&g_fpSavedMeshY, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX + 4, 4);
+        SafeCopy(&g_fpSavedMeshZ, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX + 8, 4);
         SetHeadHidden(reinterpret_cast<void*>(mesh), true);
         g_fpHeadMesh = reinterpret_cast<void*>(mesh);
         g_fpHeadMeshCls = ObjClass(g_fpHeadMesh);
@@ -4137,8 +4796,10 @@ void UpdateFirstPersonBody(void* pawn) {
         int32_t actorYaw = 0;
         SafeCopy(&actorYaw, static_cast<char*>(pawn) + kOffActorRotation + 4, 4);
         float a = (g_bodyYaw.load() - actorYaw) * (6.28318530718f / 65536.0f);
-        // Indietro di bodyback (le braccia devono arrivare ai controller) e di
-        // altre bodybacklook unita' guardando in basso oltre 30 gradi (fino a 60),
+        // Indietro di bodyback (negativo = avanti: la camera e' fp forward
+        // unita' davanti a Walker e con le spalle 18 unita' dietro gli occhi
+        // le braccia non arrivavano ai controller, 19/10) e di altre
+        // bodybacklook unita' guardando in basso oltre 30 gradi (fino a 60),
         // cosi' si vedono petto e gambe e non l'interno del colletto.
         float pitchDeg = static_cast<float>(g_bodyPitch.load() + g_deltaPitch.load()) * (360.0f / 65536.0f);
         if (pitchDeg > 180.0f) pitchDeg -= 360.0f;
@@ -4153,15 +4814,47 @@ void UpdateFirstPersonBody(void* pawn) {
         float turned = (std::fabs(std::remainder(g_deltaYaw.load() * (6.28318530718f / 65536.0f), 6.28318530718f)) *
                             57.2957795f - 60.0f) / 60.0f;
         turned = turned < 0.0f ? 0.0f : (turned > 1.0f ? 1.0f : turned);
-        float back = vr::control::g_bodyBack + vr::control::g_bodyBackLook * (std::max)(look, turned);
-        float bx = -back * std::cos(headRel), by = -back * std::sin(headRel);
+        // bodyback si applica lungo il corpo, l'extra lontano dallo sguardo:
+        // con bodyback negativo (corpo avanti, sotto la testa del giocatore,
+        // perche' le braccia arrivino ai controller) girando la testa il corpo
+        // non va verso lo sguardo.
+        float away = vr::control::g_bodyBackLook * (std::max)(look, turned);
+        float back = vr::control::g_bodyBack;
+        // Vista tirata indietro dal muro davanti (wall pull): il corpo, portato
+        // avanti da bodyback negativo, torna indietro con lei fino alla posa
+        // del gioco, altrimenti gli occhi finivano dentro le spalle e il petto
+        // nel riparo (audit 19/10).
+        if (back < 0.0f) back += (std::min)(g_wallPull.load(), -back);
+        float bx = -back * std::cos(a) - away * std::cos(headRel), by = -back * std::sin(a) - away * std::sin(headRel);
         float xy[2] = {g_fpSavedMeshX + bx + f * std::cos(a) - r * std::sin(a),
                        g_fpSavedMeshY + by + f * std::sin(a) + r * std::cos(a)};
         if (!vr::control::g_bodyFollowsHead) {
             xy[0] = g_fpSavedMeshX + bx;
             xy[1] = g_fpSavedMeshY + by;
         }
+        // Su un mezzo il corpo resta dove lo mette il gioco (niente corpo che
+        // segue la testa ne' spostamento avanti/indietro): sull'elicottero
+        // finiva fuori dalla porta.
+        bool onMount = !PawnOnFirmGround(pawn);
+        if (onMount) {
+            xy[0] = g_fpSavedMeshX;
+            xy[1] = g_fpSavedMeshY;
+        }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xy, 8);
+        // In altezza il busto segue la testa vera: con "crouchview real" e
+        // Walker accucciato dal gioco sale della stessa differenza della vista
+        // (altrimenti spalle e braccia restavano 20 unita' sotto e l'arma
+        // fluttuava senza mano, playtest 19/10); accucciandosi davvero scende
+        // con la testa (prima gli occhi finivano dentro il petto, audit 19/10).
+        float z = g_fpSavedMeshZ;
+        // Guardando in basso (oltre 30 gradi) il rialzo si toglie: sotto di se'
+        // si vede il corpo accucciato a terra, non l'interno del colletto.
+        if (!onMount) {
+            if (vr::control::g_crouchViewReal) z += GameCrouchDrop(pawn) * (1.0f - look);
+            float headDrop = g_headOffset[2].load();
+            if (headDrop < 0.0f) z += headDrop;
+        }
+        SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX + 8, &z, 4);
     }
 }
 
@@ -4173,7 +4866,47 @@ constexpr uint32_t kWeaponAssistBits = 0x1000 | 0x2000 | 0x20000;
 constexpr uintptr_t kOffPcAimSnapByUser = 0x734;    // YPlayerController.m_aimSnapOnActiveByUser
 bool GunBarrel(void* pawn, float* origin, float* axis);
 
+// Rinculo del gioco: YWeapon.m_recoilDistortionRange[3] (+0x7E0, 3 x 8 byte)
+// fa salire e deviare la mira (e con lei la vista e l'arma: raffica = 10 gradi
+// in su, 2,4 di lato, audit 19/10). Con la mira dalla mano il rinculo lo da'
+// il contraccolpo visivo dell'arma (GunKick), quindi qui si azzera.
+constexpr uintptr_t kOffWeaponRecoilRange = 0x7E0;
+void DisableGameRecoil(void* weapon) {
+    if (!weapon) return;
+    static const uint8_t zero[24] = {};
+    SafeCopy(static_cast<char*>(weapon) + kOffWeaponRecoilRange, zero, sizeof(zero));
+}
+
+// Contraccolpo visivo dell'arma a ogni colpo: la canna sale e l'arma arretra,
+// poi torna in ~80 ms. Solo sull'arma disegnata (la vista resta ferma); i colpi
+// vanno comunque lungo la canna.
+std::atomic<double> g_gunKickMs{0.0};
+std::atomic<float> g_gunKickStrength{1.0f};
+void GunKick(const std::string& cls) {
+    static const char* kHeavy[] = {"Barrett", "Steyr", "Shotgun", "Benelli", "AA12", "SawedOff", "RPG", "Milkor",
+                                   "Python", "DesertEagle", "Mk47"};
+    float k = 1.0f;
+    for (const char* h : kHeavy)
+        if (cls.find(h) != std::string::npos) k = 2.2f;
+    g_gunKickStrength = k;
+    g_gunKickMs = ProfMs();
+}
+// Gradi di salita della canna e unita' di arretramento in questo istante.
+void GunKickNow(float* pitchDeg, float* back) {
+    double dt = ProfMs() - g_gunKickMs.load();
+    if (dt < 0.0 || dt > 300.0) {
+        *pitchDeg = *back = 0.0f;
+        return;
+    }
+    // Sale in 15 ms, scende con costante 60 ms.
+    float a = dt < 15.0 ? static_cast<float>(dt / 15.0) : static_cast<float>(std::exp(-(dt - 15.0) / 60.0));
+    float k = g_gunKickStrength.load();
+    *pitchDeg = 2.5f * k * a;
+    *back = 0.8f * k * a;
+}
+
 void DisableAimAssist(char* cam, void* weapon) {
+    if (g_armsActive) DisableGameRecoil(weapon);
     if (!vr::control::g_noAimAssist) return;
     __try {
         if (weapon) *reinterpret_cast<uint32_t*>(static_cast<char*>(weapon) + kOffWeaponAssistFlags) &= ~kWeaponAssistBits;
@@ -4370,6 +5103,7 @@ void RedirectNewProjectiles(void* pawn) {
         int32_t rot[3] = {RadiansToUnreal(std::atan2(nv[2], nh)), RadiansToUnreal(std::atan2(nv[1], nv[0])), 0};
         SafeCopy(static_cast<char*>(obj) + kOffActorRotation, rot, 12);
         vr::haptics::Shot(g_weaponInfo.cls, g_twoHandActive);
+        GunKick(g_weaponInfo.cls);
         g_projRedirected.push_back(obj);
         if (g_projRedirected.size() > 64) g_projRedirected.erase(g_projRedirected.begin());
         if (vr::control::g_fireLog) {
@@ -4393,7 +5127,11 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     char* cam = static_cast<char*>(g_cameraPtr.load());
     bool hand = vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid && g_handValid;
     void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
-    bool want = vr::control::g_arms && hand && vr::control::g_firstPerson && pawn && !vr::control::g_cinemaActive;
+    // Scene guidate dal gioco (bCinematicMode: giocatore bloccato, porte,
+    // arrampicate, prese): le mani seguono l'animazione del gioco, non i
+    // controller che le staccavano dalle maniglie (audit 19/10).
+    bool want = vr::control::g_arms && hand && vr::control::g_firstPerson && pawn && !vr::control::g_cinemaActive &&
+                !g_gameLockedScene && PawnAlive(pawn);
     uint32_t weapon = 0, mesh = 0;
     {
         uint32_t w = 0;
@@ -4443,12 +5181,16 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     // Relazione mano/arma: rimisurata a ogni cambio d'arma e ogni ~30 frame,
     // solo con il modello davvero nella mano (durante il cambio d'arma il
     // fucile puo' stare sulla schiena o nella fondina).
+    // La relazione valida resta in uso finche' una nuova non e' confermata
+    // (MeasureHandInWeapon): prima la si buttava al cambio d'arma e durante
+    // l'animazione la mano usava l'identita', ruotata di 90 gradi (audit 19/10).
     void* gunComp = CurrentGunComponent(pawn);
     static void* lastGunComp = nullptr;
     static int remeasure = 0;
+    static bool measureDue[2] = {true, true};
     if (gunComp != lastGunComp) {
         lastGunComp = gunComp;
-        g_handInWeaponValid[0] = false;
+        measureDue[0] = true;
     }
     bool gunInHand = false;
     if (gunComp) {
@@ -4466,11 +5208,13 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     }
     if (++remeasure >= 30) {
         remeasure = 0;
-        if (gunInHand) g_handInWeaponValid[0] = false;
+        if (gunInHand) measureDue[0] = true;
     }
     for (int side = 0; side < 2; ++side)
-        if ((!g_handInWeaponValid[side] || debugNow) && (side == 1 || gunInHand || !gunComp))
+        if ((measureDue[side] || !g_handInWeaponValid[side] || debugNow) && (side == 1 || gunInHand || !gunComp)) {
             MeasureHandInWeapon(g_rig.mesh, side, side == 0 ? gunComp : nullptr);
+            measureDue[side] = false;
+        }
     // Punto medio tra gli occhi, come per l'arma.
     float center[3] = {base[0], base[1], base[2]};
     if (g_drawEye == 0) {
@@ -4493,25 +5237,163 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     RotatorToAxes(actorRot[0], actorRot[1], actorRot[2], af, ar, au);
     bool debug = vr::control::g_armDebugFrames.exchange(0) > 0;
     float rOff[3] = {g_handOffset[0], g_handOffset[1], g_handOffset[2]};
-    DriveHand(0, center, bodyYaw, rOff, g_bodyPitch.load() + g_aimDeltaPitch.load(), g_bodyYaw.load() + g_aimDeltaYaw.load(),
-              g_handRoll.load(), actorLoc, af, ar, au, scale, debug);
-    // Mano sinistra: segue il controller; quando e' sull'astina (mira a due
-    // mani attiva) torna al gioco, che la tiene chiusa sull'arma con la sua
-    // animazione e il suo IK, cosi' le dita impugnano davvero il fucile.
-    static bool leftOnGun = false;
-    bool onGun = vr::control::g_leftGrip && g_twoHandActive;
-    if (onGun && !leftOnGun) {
-        for (int i : {1, 3})
-            if (g_rig.ctrl[i] && StillAlive(g_rig.ctrl[i], g_rig.ctrlCls[i]))
-                SafeCopy(static_cast<char*>(g_rig.ctrl[i]) + kCtrlSaveFrom, g_rig.saved[i], kCtrlSaveLen);
-        vr::log::Line("ARMS: left hand on the weapon (game animation).");
-    }
-    leftOnGun = onGun;
-    if (g_leftValid && g_rig.ctrl[1] && !onGun) {
+    float rPos[3], rAxes[3][3];
+    HandTarget(0, center, bodyYaw, rOff, g_bodyPitch.load() + g_aimDeltaPitch.load(), g_bodyYaw.load() + g_aimDeltaYaw.load(),
+               g_handRoll.load(), rPos, rAxes);
+    WriteHand(0, rPos, rAxes, actorLoc, af, ar, au, scale, debug);
+    // Mano sinistra: segue il controller; vicina all'astina si aggancia alla
+    // presa del gioco rispetto alla mano destra (SupportGripRelation), con le
+    // dita chiuse sull'arma, qualunque sia la rotazione del controller (calcio
+    // da gunstock). Prima restava aperta dov'era il controller, o tornava
+    // all'animazione del gioco, che non segue l'arma mossa dalla mod (19/10).
+    static float gripBlend = 0.0f;
+    static bool gripOn = false;
+    static double gripLastMs = 0.0;
+    double gripNow = ProfMs();
+    float gripDt = gripLastMs > 0.0 ? static_cast<float>((gripNow - gripLastMs) * 0.001) : 0.0f;
+    gripLastMs = gripNow;
+    if (gripDt > 0.1f) gripDt = 0.1f;
+    // Senza controller sinistro (spento, fuori vista) la sinistra impugna
+    // l'arma; senza arma torna all'animazione del gioco. Prima restava
+    // l'ultima posa scritta o l'animazione, che nel camion e uscendo dalla
+    // copertura portava il pugno davanti alla vista (playtest 19/10).
+    bool leftCtrl = g_leftValid.load();
+    static bool leftReleased = false;
+    if (g_rig.ctrl[1]) {
         float lOff[3] = {g_leftOffset[0], g_leftOffset[1], g_leftOffset[2]};
-        DriveHand(1, center, bodyYaw, lOff, g_bodyPitch.load() + g_leftPitch.load(), g_bodyYaw.load() + g_leftYaw.load(),
-                  g_leftRoll.load(), actorLoc, af, ar, au, scale, debug);
+        float lPos[3] = {rPos[0], rPos[1], rPos[2]}, lAxes[3][3];
+        std::memcpy(lAxes, rAxes, sizeof(lAxes));
+        if (leftCtrl)
+            HandTarget(1, center, bodyYaw, lOff, g_bodyPitch.load() + g_leftPitch.load(), g_bodyYaw.load() + g_leftYaw.load(),
+                       g_leftRoll.load(), lPos, lAxes);
+        // Relazione della presa fissata per arma: si accetta quando resta
+        // ferma 0,3 s e poi segue solo variazioni piccole (3 unita'). Le
+        // animazioni del gioco che spostano IK_Hand_L (ricarica, corsa, lancio)
+        // non trascinano piu' via la mano dall'astina; per uscire dalla presa
+        // si usa l'ultima relazione valida, senza scatti (audit 19/10).
+        static void* relGun = nullptr;
+        static bool relValid = false, haveLastRel = false;
+        static float cPos[3], cRot[3][3], candPos[3];
+        static double candSince = 0.0;
+        float relPos[3], relRot[3][3], gPos[3], gAxes[3][3];
+        if (gunComp != relGun) {
+            relGun = gunComp;
+            relValid = false;
+            candSince = 0.0;
+        }
+        bool fresh = gunInHand && SupportGripRelation(g_rig.mesh, relPos, relRot);
+        if (fresh) {
+            auto near3 = [](const float* a, const float* b, float lim) {
+                float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+                return x * x + y * y + z * z < lim * lim;
+            };
+            if (relValid) {
+                if (near3(relPos, cPos, 3.0f)) {
+                    std::memcpy(cPos, relPos, sizeof(cPos));
+                    std::memcpy(cRot, relRot, sizeof(cRot));
+                }
+            } else if (candSince > 0.0 && near3(relPos, candPos, 1.5f)) {
+                if (gripNow - candSince > 300.0) {
+                    relValid = true;
+                    std::memcpy(cPos, relPos, sizeof(cPos));
+                    std::memcpy(cRot, relRot, sizeof(cRot));
+                }
+            } else {
+                candSince = gripNow;
+                std::memcpy(candPos, relPos, sizeof(candPos));
+            }
+        }
+        if (relValid) haveLastRel = true;
+        bool canGrip = vr::control::g_leftGrip && gunInHand && relValid;
+        bool canPose = canGrip || (gripBlend > 0.0f && haveLastRel);
+        if (canPose) {
+            std::memcpy(relPos, cPos, sizeof(relPos));
+            std::memcpy(relRot, cRot, sizeof(relRot));
+        }
+        float dist = 1e9f;
+        if (canPose) {
+            for (int i = 0; i < 3; ++i) {
+                gPos[i] = rPos[i] + scale * (relPos[0] * rAxes[0][i] + relPos[1] * rAxes[1][i] + relPos[2] * rAxes[2][i]);
+                for (int r = 0; r < 3; ++r)
+                    gAxes[r][i] = relRot[r][0] * rAxes[0][i] + relRot[r][1] * rAxes[1][i] + relRot[r][2] * rAxes[2][i];
+            }
+            if (!leftCtrl) {
+                std::memcpy(lPos, gPos, sizeof(lPos));
+                std::memcpy(lAxes, gAxes, sizeof(lAxes));
+            }
+            float dx = lPos[0] - gPos[0], dy = lPos[1] - gPos[1], dz = lPos[2] - gPos[2];
+            dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        // Presa fuori portata (fucile teso in avanti o verso destra; la
+        // camera e' piu' alta e avanti delle spalle di Walker): la presa
+        // scorre lungo l'arma verso la mano destra quanto basta, al massimo
+        // 14 unita', invece di lasciare la mano a mezz'aria.
+        static float slide = 0.0f;
+        float slideWant = 0.0f;
+        float shoulder[3], reach = 0.0f;
+        if (canGrip && ArmReach(g_rig.mesh, 1, shoulder, &reach)) {
+            reach *= 0.97f;
+            const float* f = rAxes[0];
+            float D[3] = {gPos[0] - shoulder[0], gPos[1] - shoulder[1], gPos[2] - shoulder[2]};
+            float dd = D[0] * D[0] + D[1] * D[1] + D[2] * D[2];
+            if (dd > reach * reach) {
+                float df = D[0] * f[0] + D[1] * f[1] + D[2] * f[2];
+                float disc = df * df - (dd - reach * reach);
+                slideWant = disc >= 0.0f ? df - std::sqrt(disc) : df;
+                slideWant = slideWant < 0.0f ? 0.0f : (slideWant > 14.0f ? 14.0f : slideWant);
+            }
+        }
+        // Sale in fretta (la mano deve arrivarci) e scende lenta: camminando le
+        // spalle ondeggiano e la presa scorreva avanti e indietro di 8 unita'.
+        slide += (slideWant - slide) * (std::min)(1.0f, gripDt / (slideWant > slide ? 0.08f : 0.8f));
+        if (debug && canGrip) {
+            char b[260];
+            snprintf(b, sizeof(b),
+                     "ARMS grip: rel=(%.1f %.1f %.1f) dist=%.1f shoulder=(%.1f, %.1f, %.1f) reach=%.1f slide=%.1f/%.1f",
+                     relPos[0], relPos[1], relPos[2], dist, shoulder[0], shoulder[1], shoulder[2], reach, slide, slideWant);
+            vr::log::Line(b);
+        }
+        if (canPose)
+            for (int i = 0; i < 3; ++i) gPos[i] -= slide * rAxes[0][i];
+        // Isteresi: presa entro leftgrip <cm>, rilascio oltre 1,4 volte.
+        float engage = vr::control::g_leftGripCm * 0.01f * vr::control::g_posScale;
+        bool on = canGrip && (!leftCtrl || dist < (gripOn ? engage * 1.4f : engage));
+        if (on != gripOn) {
+            char b[120];
+            snprintf(b, sizeof(b), "ARMS: left hand %s the weapon (%.0f units from the grip).", on ? "on" : "off", dist);
+            vr::log::Line(b);
+        }
+        gripOn = on;
+        gripBlend += (on ? 1.0f : -1.0f) * gripDt / 0.12f;
+        gripBlend = gripBlend < 0.0f ? 0.0f : (gripBlend > 1.0f ? 1.0f : gripBlend);
+        if (gripBlend > 0.0f && canPose) {
+            float t = gripBlend * gripBlend * (3.0f - 2.0f * gripBlend);
+            for (int i = 0; i < 3; ++i) lPos[i] += (gPos[i] - lPos[i]) * t;
+            float mixed[3][3];
+            SlerpAxes(lAxes, gAxes, t, mixed);
+            std::memcpy(lAxes, mixed, sizeof(mixed));
+        }
+        if (!leftCtrl && !canPose) {
+            // Niente controller ne' arma: la sinistra torna al gioco.
+            if (!leftReleased) {
+                for (int i : {1, 3})
+                    if (g_rig.ctrl[i] && StillAlive(g_rig.ctrl[i], g_rig.ctrlCls[i]))
+                        SafeCopy(static_cast<char*>(g_rig.ctrl[i]) + kCtrlSaveFrom, g_rig.saved[i], kCtrlSaveLen);
+                leftReleased = true;
+            }
+            g_leftDriven = false;
+        } else {
+            WriteHand(1, lPos, lAxes, actorLoc, af, ar, au, scale, debug);
+            leftReleased = false;
+            g_leftDriven = true;
+        }
+    } else {
+        gripOn = false;
+        gripBlend = 0.0f;
+        g_leftDriven = false;
     }
+    g_leftOnGun = gripOn;
+    vr::control::g_leftOnGun = gripOn;
     g_armsActive = true;
     DisableAimAssist(cam, reinterpret_cast<void*>(weapon));
     if (debug) {
@@ -4565,12 +5447,29 @@ public:
         // Direzione del corpo (senza la testa): serve a ruotare lo
         // spostamento della testa nel mondo.
         bool hand = vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid;
-        int32_t bodyYaw = hand ? g_bodyYaw.load()
+        // Rotazione del corpo letta una volta per tick (occhio sinistro) e
+        // riusata per il destro: su una torretta in volo cambiava tra i due
+        // disegni e gli occhi guardavano in direzioni diverse.
+        static int32_t tickBody[2] = {0, 0};
+        if (g_drawEye != 1) {
+            tickBody[0] = g_bodyYaw.load();
+            tickBody[1] = g_bodyPitch.load();
+        }
+        int32_t bodyYawT = tickBody[0], bodyPitchT = tickBody[1];
+        int32_t bodyYaw = hand ? bodyYawT
                                : outRot[1] - (vr::control::g_aimFollowsBody ? 0 : HeadYaw());
         if (hand) {
             // La camera del gioco punta col controller: la vista e' corpo + testa.
-            outRot[0] = (TurretAimActive() ? 0 : g_bodyPitch.load()) + HeadPitch();
-            outRot[1] = g_bodyYaw.load() + HeadYaw();
+            // Il rollio del gioco (scosse) resta fuori: solo quello della testa.
+            outRot[0] = (TurretAimActive() ? 0 : bodyPitchT) + HeadPitch();
+            outRot[1] = bodyYawT + HeadYaw();
+            outRot[2] = 0;
+            // Cannocchiale: la lente guarda lungo la canna (il reticolo e' dove
+            // vanno i colpi), non dove guarda la testa.
+            if (g_scopeActive && g_muzzleAimValid) {
+                outRot[0] = g_muzzleAimPitch.load();
+                outRot[1] = g_muzzleAimYaw.load();
+            }
         } else if (vr::control::g_aimFollowsBody) {
             outRot[0] += HeadPitch();  // FRotator: Pitch, Yaw, Roll
             outRot[1] += HeadYaw();
@@ -4597,17 +5496,168 @@ public:
             float ho[3];
             HeadOffset(ho);
             float f = ho[0], r = ho[1], u = ho[2];
-            float base[3] = {outLoc[0], outLoc[1], outLoc[2]};
+            // Su un mezzo la cabina non blocca i trace (collisione della testa
+            // cieca): la testa sale al massimo 6 unita' sopra quella di Walker,
+            // altrimenti alzandosi si usciva dal tetto dell'elicottero (19/10).
+            {
+                char* camU = static_cast<char*>(g_cameraPtr.load());
+                void* pawnU = HasCameraSignature(camU) ? PlayerPawnIfViewTarget(camU) : nullptr;
+                if (pawnU && !PawnOnFirmGround(pawnU) && u > 6.0f) u = 6.0f;
+            }
+            // Spostamento dell'occhio di questo Draw: tolto qui e rimesso alla
+            // fine, cosi' smorzamento dell'altezza e collisione lavorano sul
+            // centro della testa. Prima l'occhio destro prendeva l'altezza
+            // smorzata dell'occhio sinistro (testa inclinata: occhi alla
+            // stessa altezza, disparita' verticale) e la collisione accorciava
+            // la distanza tra gli occhi vicino ai muri (audit 19/10).
+            float eyeOff[3] = {0.0f, 0.0f, 0.0f};
+            if (g_drawEye == 0 || g_drawEye == 1) std::memcpy(eyeOff, g_eyeOffsetApplied[g_drawEye.load()], sizeof(eyeOff));
+            float rawLoc[3] = {outLoc[0], outLoc[1], outLoc[2]};  // dal gioco (diagnostica camlog)
+            float base[3] = {outLoc[0] - eyeOff[0], outLoc[1] - eyeOff[1], outLoc[2] - eyeOff[2] + ViewHeightExtra()};
+            // Su un mezzo (elicottero, camion) Walker e' seduto o inginocchiato:
+            // l'altezza fissa sopra il Pawn metteva la vista nel tetto
+            // dell'elicottero o sopra (19/10, nel visore). Si usa l'altezza della
+            // sua testa: base del collo + 12 unita' (testa e collo sono nascosti
+            // con scala 0, quindi "head" coincide con l'attacco del collo).
+            {
+                char* camM = static_cast<char*>(g_cameraPtr.load());
+                void* pawnM = HasCameraSignature(camM) ? PlayerPawnIfViewTarget(camM) : nullptr;
+                uint32_t meshM = 0;
+                if (pawnM && !PawnOnFirmGround(pawnM) && TrySafeReadUint32(static_cast<char*>(pawnM) + kOffPawnMesh, &meshM) &&
+                    meshM) {
+                    struct {
+                        int32_t name[2];
+                        int32_t space;
+                        float ret[3];
+                    } hp = {{vr::script::NameIndex("Neck"), 0}, 0, {0, 0, 0}}, sp = {{vr::script::NameIndex("Spine3"), 0}, 0, {0, 0, 0}};
+                    // Posizione completa dalla testa di Walker: collo + 12 unita'
+                    // lungo la colonna (Spine3 -> Neck). Con l'elicottero
+                    // inclinato nelle virate e nello schianto, la posizione del
+                    // Pawn con l'altezza "verso l'alto del mondo" finiva sopra o
+                    // sotto la cabina (19/10, nel visore).
+                    if (hp.name[0] >= 0 && sp.name[0] >= 0 &&
+                        vr::script::CallFunction(reinterpret_cast<void*>(meshM), "GetBoneLocation", &hp) &&
+                        vr::script::CallFunction(reinterpret_cast<void*>(meshM), "GetBoneLocation", &sp)) {
+                        float up[3] = {hp.ret[0] - sp.ret[0], hp.ret[1] - sp.ret[1], hp.ret[2] - sp.ret[2]};
+                        float ul = std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+                        float pl[3];
+                        int32_t pyaw = 0;
+                        if (ul > 1.0f && up[2] / ul > 0.2f && SafeCopy(pl, static_cast<char*>(pawnM) + 0x54, 12) &&
+                            SafeCopy(&pyaw, static_cast<char*>(pawnM) + 0x64, 4)) {
+                            float eye[3];
+                            for (int i = 0; i < 3; ++i) eye[i] = hp.ret[i] + up[i] / ul * 12.0f;
+                            // Le ossa e il Pawn non sono aggiornati nello stesso
+                            // momento rispetto all'elicottero che si muove: la testa
+                            // dalle ossa oscillava di decine di unita' rispetto alla
+                            // cabina (sopra o sotto l'elicottero, 19/10). Si tiene
+                            // solo la sua posizione media rispetto al Pawn (che si
+                            // muove rigido col mezzo), nel riferimento del Pawn,
+                            // filtrata su ~1 s.
+                            static float relF[3] = {0, 0, 0};
+                            static bool haveRel = false;
+                            static double lastRelT = 0.0;
+                            float yr = pyaw * (6.28318530718f / 65536.0f), cy = std::cos(yr), sy = std::sin(yr);
+                            float d[3] = {eye[0] - pl[0], eye[1] - pl[1], eye[2] - pl[2]};
+                            float rel[3] = {d[0] * cy + d[1] * sy, -d[0] * sy + d[1] * cy, d[2]};
+                            double nowR = ProfMs() * 0.001;
+                            float dtR = lastRelT > 0.0 ? static_cast<float>(nowR - lastRelT) : 0.0f;
+                            lastRelT = nowR;
+                            bool sane = rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2] < 90.0f * 90.0f;
+                            if (sane) {
+                                if (!haveRel || dtR > 0.5f) {
+                                    std::memcpy(relF, rel, sizeof(relF));
+                                    haveRel = true;
+                                } else {
+                                    float k = 1.0f - std::exp(-dtR / 1.0f);
+                                    for (int i = 0; i < 3; ++i) relF[i] += (rel[i] - relF[i]) * k;
+                                }
+                            }
+                            if (haveRel) {
+                                base[0] = pl[0] + relF[0] * cy - relF[1] * sy;
+                                base[1] = pl[1] + relF[0] * sy + relF[1] * cy;
+                                base[2] = pl[2] + relF[2];
+                            }
+                        }
+                    }
+                }
+            }
+            // Stessa posizione della testa per i due occhi del tick: ogni Draw
+            // rilegge la camera del gioco, che su un mezzo in movimento
+            // (elicottero) o in una scena scriptata cambia tra il disegno
+            // dell'occhio sinistro e quello del destro: i due occhi vedevano il
+            // mondo da punti diversi, immagine doppia (19/10, nel visore).
+            {
+                static float tickBaseXY[2] = {0.0f, 0.0f};
+                static bool haveTickBase = false;
+                if (g_drawEye == 1 && haveTickBase) {
+                    base[0] = tickBaseXY[0];
+                    base[1] = tickBaseXY[1];
+                    haveTickBase = false;
+                } else if (g_drawEye == 0) {
+                    tickBaseXY[0] = base[0];
+                    tickBaseXY[1] = base[1];
+                    haveTickBase = true;
+                }
+            }
+            // "crouchview real": accucciandosi (copertura) il gioco abbassa il
+            // Pawn di 20 unita' (40 cm, capsula da 45 a 25, piedi fermi) e con
+            // lui la vista, senza che il giocatore si muova. Si toglie quella
+            // differenza: l'altezza della vista resta quella della testa vera
+            // sul pavimento (audit 19/10). "crouchview game": come il gioco.
+            if (vr::control::g_crouchViewReal) {
+                char* camC = static_cast<char*>(g_cameraPtr.load());
+                void* pawnC = HasCameraSignature(camC) ? PlayerPawnIfViewTarget(camC) : nullptr;
+                if (PawnOnFirmGround(pawnC)) base[2] += GameCrouchDrop(pawnC);  // sui mezzi come il gioco
+            }
+            // Scene guidate dal gioco in 3D (bCinematicMode con la camera su
+            // Walker: si inginocchia, viene afferrato, si arrampica): la vista
+            // scende con la testa di Walker invece di restare sospesa all'altezza
+            // in piedi (audit 19/10). Solo in basso e smorzato (0,3 s): le
+            // camminate guidate non fanno oscillare la vista.
+            {
+                static float drop = 0.0f;
+                static double lastT = 0.0;
+                float want = 0.0f;
+                char* camK = static_cast<char*>(g_cameraPtr.load());
+                void* pawnK = g_gameLockedScene && HasCameraSignature(camK) ? PlayerPawnIfViewTarget(camK) : nullptr;
+                uint32_t meshK = 0;
+                if (pawnK && g_drawEye != 1 && TrySafeReadUint32(static_cast<char*>(pawnK) + kOffPawnMesh, &meshK) && meshK) {
+                    struct {
+                        int32_t name[2];
+                        int32_t space;
+                        float ret[3];
+                    } hp = {{vr::script::NameIndex("Neck"), 0}, 0, {0, 0, 0}};
+                    if (hp.name[0] >= 0 && vr::script::CallFunction(reinterpret_cast<void*>(meshK), "GetBoneLocation", &hp)) {
+                        float d = base[2] - (hp.ret[2] + 12.0f);  // occhi ~12 unita' sopra l'attacco del collo
+                        want = d > 15.0f ? (d < 80.0f ? d - 15.0f : 65.0f) : 0.0f;
+                    }
+                }
+                if (g_drawEye != 1) {
+                    double now = ProfMs() * 0.001;
+                    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
+                    lastT = now;
+                    if (dt > 0.0f && dt < 0.5f) drop += (want - drop) * (1.0f - std::exp(-dt / 0.3f));
+                    else drop = want;
+                }
+                base[2] -= drop;
+            }
             // Altezza della vista ammorbidita (solo la vista: la mira resta
             // quella del gioco). Salti oltre 80 unita' (teletrasporti,
             // checkpoint) passano subito.
             static float smoothZ = 0.0f;
             if (g_drawEye == 1) {
-                base[2] = smoothZ;  // stesso valore dell'occhio sinistro di questo tick
+                base[2] = smoothZ;  // stesso centro dell'occhio sinistro di questo tick
             } else {
                 static double lastT = 0.0;
                 double now = ProfMs() * 0.001;
                 float tau = vr::control::g_eyeHeightSmooth;
+                // Su un mezzo niente smorzamento: l'elicottero sale e scende
+                // veloce e la vista restava indietro, sopra o sotto la cabina.
+                {
+                    char* camS = static_cast<char*>(g_cameraPtr.load());
+                    void* pawnS = HasCameraSignature(camS) ? PlayerPawnIfViewTarget(camS) : nullptr;
+                    if (pawnS && !PawnOnFirmGround(pawnS)) tau = 0.0f;
+                }
                 if (lastT == 0.0 || tau <= 0.0f || std::fabs(base[2] - smoothZ) > 80.0f || now - lastT > 0.5) {
                     smoothZ = base[2];
                 } else {
@@ -4671,13 +5721,19 @@ public:
                         }
                         if (want < 0.0f) want = 0.0f;
                     }
-                    // Avvicinandosi al muro la vista arretra subito; allontanandosi
-                    // torna avanti in ~0,2 s.
+                    // Allontanandosi dal muro la vista torna avanti in ~0,2 s;
+                    // avvicinandosi arretra al massimo a 150 unita'/s (prima di
+                    // colpo: girandosi vicino a un angolo la vista saltava
+                    // indietro di 25 unita' in un frame). La collisione della
+                    // testa resta a proteggere dal muro.
                     static double lastPullT = 0.0;
                     double nowT = ProfMs() * 0.001;
                     float dt = static_cast<float>(nowT - lastPullT);
                     lastPullT = nowT;
-                    if (want < wallPull && dt > 0.0f && dt < 0.5f) want = wallPull + (want - wallPull) * (1.0f - std::exp(-dt / 0.2f));
+                    if (dt > 0.0f && dt < 0.5f) {
+                        if (want < wallPull) want = wallPull + (want - wallPull) * (1.0f - std::exp(-dt / 0.2f));
+                        else if (want > wallPull + 150.0f * dt) want = wallPull + 150.0f * dt;
+                    }
                     base[0] -= fx * want;
                     base[1] -= fy * want;
                 }
@@ -4698,6 +5754,8 @@ public:
             float len = std::sqrt(dx * dx + dy * dy + dz * dz);
             static float tickT = 1.0f;  // calcolato sull'occhio sinistro, riusato dal destro
             float t = 1.0f;
+            static float smoothT = 1.0f;
+            static double lastTT = 0.0;
             if (g_drawEye == 1) {
                 t = tickT;
             } else if (vr::control::g_headCollision && len > 0.5f) {
@@ -4713,7 +5771,18 @@ public:
                     g_headBlocked.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            if (g_drawEye != 1) tickT = t;
+            if (g_drawEye != 1) {
+                // Uscendo dall'ostacolo la testa torna libera in ~0,1 s
+                // (prima saltava avanti e indietro su ringhiere e spigoli);
+                // entrando si ferma subito, per non vedere attraverso.
+                double nowTT = ProfMs() * 0.001;
+                float dtt = lastTT > 0.0 ? static_cast<float>(nowTT - lastTT) : 1.0f;
+                lastTT = nowTT;
+                if (t < smoothT || dtt > 0.5f) smoothT = t;
+                else smoothT += (t - smoothT) * (1.0f - std::exp(-dtt / 0.1f));
+                t = smoothT;
+                tickT = t;
+            }
             if (g_drawEye == 0) {
                 for (int i = 0; i < 3; ++i) {
                     g_lastViewLoc[i] = outLoc[i];
@@ -4725,18 +5794,66 @@ public:
                                      (outLoc[1] - lastView[1]) * (outLoc[1] - lastView[1]) +
                                      (outLoc[2] - lastView[2]) * (outLoc[2] - lastView[2]));
                 if (dj < 500.0f && dj > g_maxViewJump) g_maxViewJump = dj;  // >500: teletrasporto/checkpoint
+                // Salto della vista oltre 80 unita' in un tick (checkpoint,
+                // ripartenza, teletrasporto scriptato): dissolvenza dal nero.
+                // Solo salti veri (il movimento del tick molto piu' grande dei
+                // precedenti), fuori dalle scene scriptate: in elicottero o nelle
+                // scene di schianto la vista si muove veloce in continuo e ogni
+                // tick diventava una dissolvenza (19/10, nel visore: lag e
+                // problemi nelle scene degli elicotteri).
+                static float prevDj = 0.0f;
+                if (dj > 80.0f && dj > 3.0f * prevDj + 40.0f && vr::control::g_fades && !g_gameLockedScene)
+                    vr::output::Blink(0.3f);
+                prevDj = dj;
+                // Movimento forzato per la vignettatura: base della vista (senza
+                // testa) che si muove senza lo stick (veicoli, spinte del gioco)
+                // e rotazioni del corpo non fatte dal giocatore.
+                {
+                    static float lastBase[3] = {0, 0, 0};
+                    static int32_t lastYaw = 0;
+                    static double lastT = 0.0;
+                    double now = ProfMs() * 0.001;
+                    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
+                    lastT = now;
+                    float bd = std::sqrt((base[0] - lastBase[0]) * (base[0] - lastBase[0]) +
+                                         (base[1] - lastBase[1]) * (base[1] - lastBase[1]));
+                    int32_t yawNow = g_bodyYaw.load();
+                    float dyaw = std::fabs(static_cast<float>(static_cast<int16_t>(yawNow - lastYaw))) * (360.0f / 65536.0f);
+                    float forced = 0.0f;
+                    if (dt > 0.0f && dt < 0.2f && bd < 200.0f) {
+                        float speed = bd / dt;  // unita'/s
+                        if (vr::control::g_motionAmount < 0.1f) forced = (std::max)(forced, (speed - 40.0f) / 250.0f);
+                        if (!vr::control::g_stickTurning) forced = (std::max)(forced, (dyaw / dt - 20.0f) / 120.0f);
+                    }
+                    vr::control::g_forcedMotion = forced < 0.0f ? 0.0f : (forced > 1.0f ? 1.0f : forced);
+                    for (int i = 0; i < 3; ++i) lastBase[i] = base[i];
+                    lastYaw = yawNow;
+                }
                 for (int i = 0; i < 3; ++i) lastView[i] = outLoc[i];
             }
-            outLoc[0] = origin[0] + dx * t;
-            outLoc[1] = origin[1] + dy * t;
-            outLoc[2] = origin[2] + dz * t;
-            if (vr::control::g_camLogFrames.load() > 0 && g_drawEye != 1) {
-                vr::control::g_camLogFrames.fetch_sub(1);
-                char b[260];
+            // Nel cannocchiale entrambi gli occhi vedono la stessa immagine
+            // (niente disparita' ingrandita 5-6 volte).
+            float eyeK = g_scopeActive ? 0.0f : 1.0f;
+            outLoc[0] = origin[0] + dx * t + eyeOff[0] * eyeK;
+            outLoc[1] = origin[1] + dy * t + eyeOff[1] * eyeK;
+            outLoc[2] = origin[2] + dz * t + eyeOff[2] * eyeK;
+            if (vr::control::g_camLogFrames.load() > 0) {
+                if (g_drawEye != 1) vr::control::g_camLogFrames.fetch_sub(1);
+                float pl[3] = {0, 0, 0};
+                char* camL = static_cast<char*>(g_cameraPtr.load());
+                void* pawnL = HasCameraSignature(camL) ? PlayerPawnIfViewTarget(camL) : nullptr;
+                if (pawnL) SafeCopy(pl, static_cast<char*>(pawnL) + 0x54, 12);
+                float wl[3] = {0, 0, 0};
+                uint32_t wpn = 0;
+                if (pawnL && TrySafeReadUint32(static_cast<char*>(pawnL) + kOffPawnCurrentWeapon, &wpn) && wpn)
+                    SafeCopy(wl, reinterpret_cast<char*>(wpn) + 0x54, 12);
+                char b[400];
                 snprintf(b, sizeof(b),
-                         "CAMLOG: base (%.2f, %.2f, %.2f) view (%.2f, %.2f, %.2f) head t=%.2f wall pull %.1f rot (%d, %d, %d)",
-                         base[0], base[1], base[2], outLoc[0], outLoc[1], outLoc[2], t, wallPull, outRot[0], outRot[1],
-                         outRot[2]);
+                         "CAMLOG: t=%.1f eye %d base (%.2f, %.2f, %.2f) view (%.2f, %.2f, %.2f) head t=%.2f wall pull %.1f rot (%d, %d, %d) "
+                         "pawn (%.1f, %.1f, %.1f) firm %d raw (%.1f, %.1f, %.1f) weapon (%.1f, %.1f, %.1f)",
+                         ProfMs(), g_drawEye.load(), base[0], base[1], base[2], outLoc[0], outLoc[1], outLoc[2], t, wallPull,
+                         outRot[0], outRot[1], outRot[2], pl[0], pl[1], pl[2], (int)PawnOnFirmGround(pawnL), rawLoc[0],
+                         rawLoc[1], rawLoc[2], wl[0], wl[1], wl[2]);
                 vr::log::Line(b);
             }
             // Il rendering usa questa origine (testa 6DOF compresa): va nella
@@ -4756,7 +5873,7 @@ public:
                 float mo[3], md[3], al[3] = {0, 0, 0};
                 if (pawnG && GunBarrel(pawnG, mo, md)) {
                     SafeCopy(al, static_cast<char*>(pawnG) + 0x54, 12);
-                    char b[260];
+                    char b[400];
                     uint32_t gunFlags = 0;
                     void* gcomp = CurrentGunComponent(pawnG);
                     if (gcomp) TrySafeReadUint32(static_cast<char*>(gcomp) + kOffCompFlags, &gunFlags);
@@ -4772,16 +5889,24 @@ public:
                     if (g_rig.mesh && hp.name[0] >= 0) vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &hp);
                     st[4] = hp.ret[0] - outLoc[0];
                     st[5] = hp.ret[1] - outLoc[1];
+                    // Mano sinistra rispetto alla destra (presa sull'astina).
+                    struct {
+                        int32_t name[2];
+                        int32_t space;
+                        float ret[3];
+                    } lp = {{vr::script::NameIndex("Hand_Left"), 0}, 0, {0, 0, 0}};
+                    if (g_rig.mesh && lp.name[0] >= 0) vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &lp);
                     int32_t pawnYaw = 0;
                     SafeCopy(&pawnYaw, static_cast<char*>(pawnG) + 0x64, 4);
                     st[1] = static_cast<float>(pawnYaw & 0xFFFF) * (360.0f / 65536.0f);
                     st[3] = static_cast<float>(g_bodyYaw.load() & 0xFFFF) * (360.0f / 65536.0f);
                     snprintf(b, sizeof(b),
                              "GUNLOG: t=%.1f eye %d view (%.2f, %.2f, %.2f) barrel-view (%.2f, %.2f, %.2f) pawn (%.2f, %.2f, %.2f) "
-                             "arms=%d flags=%08X strength %.2f %.2f %.2f %.2f %.2f %.2f",
+                             "arms=%d flags=%08X strength %.2f %.2f %.2f %.2f %.2f %.2f lh (%.2f, %.2f, %.2f)",
                              ProfMs(), g_drawEye.load(), outLoc[0], outLoc[1], outLoc[2], mo[0] - outLoc[0],
                              mo[1] - outLoc[1], mo[2] - outLoc[2], al[0], al[1], al[2], (int)g_armsActive.load(), gunFlags,
-                             st[0], st[1], st[2], st[3], st[4], st[5]);
+                             st[0], st[1], st[2], st[3], st[4], st[5], lp.ret[0] - hp.ret[0], lp.ret[1] - hp.ret[1],
+                             lp.ret[2] - hp.ret[2]);
                     vr::log::Line(b);
                 }
             }
@@ -4803,6 +5928,63 @@ bool GunBarrel(void* pawn, float* origin, float* axis) {
         origin[i] = m[12 + i];
     }
     return true;
+}
+
+// Punto di partenza di colpi e mirino lungo la canna: la volata (osso
+// YWeapon.m_muzzleBoneName, +0x2E8, del modello dell'arma) proiettata
+// sull'asse; prima si partiva 10 unita' davanti all'impugnatura (mirino) o
+// dove il gioco proiettava la sua origine (colpi: 13-37 unita'), quindi
+// oggetti vicini alla volata venivano attraversati. Se tra la spalla destra e
+// la volata c'e' un ostacolo (arma infilata nel riparo o nel muro) si parte
+// dall'ostacolo: il colpo lo colpisce invece di passarci attraverso.
+constexpr uintptr_t kOffWeaponMuzzleBone = 0x2E8;
+void MuzzleStart(void* pawn, const float* bo, const float* bd, float* start) {
+    static void* cachedComp = nullptr;
+    static float cachedT = 10.0f;
+    static int age = 0;
+    void* comp = CurrentGunComponent(pawn);
+    if (comp != cachedComp || ++age > 60) {
+        age = 0;
+        cachedComp = comp;
+        cachedT = 10.0f;
+        uint32_t weapon = 0;
+        int32_t name[2] = {0, 0};
+        if (comp && TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) && weapon &&
+            SafeCopy(name, reinterpret_cast<char*>(weapon) + kOffWeaponMuzzleBone, 8) && name[0] > 0) {
+            struct {
+                int32_t name[2];
+                int32_t space;
+                float ret[3];
+            } hp = {{name[0], name[1]}, 0, {0, 0, 0}};
+            if (vr::script::CallFunction(comp, "GetBoneLocation", &hp)) {
+                float d = (hp.ret[0] - bo[0]) * bd[0] + (hp.ret[1] - bo[1]) * bd[1] + (hp.ret[2] - bo[2]) * bd[2];
+                if (d > 2.0f && d < 150.0f) cachedT = d;
+            }
+        }
+    }
+    for (int i = 0; i < 3; ++i) start[i] = bo[i] + bd[i] * cachedT;
+    g_muzzlePenetration = 0.0f;
+    if (!g_rig.mesh) return;
+    struct {
+        int32_t name[2];
+        int32_t space;
+        float ret[3];
+    } sp = {{vr::script::NameIndex("Arm_Right"), 0}, 0, {0, 0, 0}};
+    float hit = 1.0f;
+    // La penetrazione si misura sulla volata senza l'arretramento gia'
+    // applicato all'arma, altrimenti l'arma andrebbe avanti e indietro.
+    float push = g_gunPushApplied.load();
+    float unpushed[3] = {start[0] + bd[0] * push, start[1] + bd[1] * push, start[2] + bd[2] * push};
+    if (sp.name[0] >= 0 && vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &sp) &&
+        TraceLine(pawn, sp.ret, unpushed, &hit) && hit < 1.0f) {
+        float back = 1.0f - 2.0f / ((std::max)(1.0f, cachedT));  // 2 unita' prima dell'ostacolo
+        float h = hit * (back > 0.0f ? back : 0.0f);
+        float len = std::sqrt((unpushed[0] - sp.ret[0]) * (unpushed[0] - sp.ret[0]) +
+                              (unpushed[1] - sp.ret[1]) * (unpushed[1] - sp.ret[1]) +
+                              (unpushed[2] - sp.ret[2]) * (unpushed[2] - sp.ret[2]));
+        g_muzzlePenetration = (1.0f - hit) * len;
+        for (int i = 0; i < 3; ++i) start[i] = sp.ret[i] + (unpushed[i] - sp.ret[i]) * h;
+    }
 }
 
 void UpdateAimMarkerImpl(const float* aimOrigin, const float* eyeLoc, const int32_t* viewRot);
@@ -4836,7 +6018,9 @@ void UpdateAimMarkerImpl(const float* aimOrigin, const float* eyeLoc, const int3
     if (eye < 0 || eye > 1) eye = 0;
     bool hand = vr::control::g_aimHand && vr::control::g_aimFollowsBody && g_aimValid;
     char* cam = static_cast<char*>(g_cameraPtr.load());
-    if (!vr::control::g_aimMarker || !hand || !HasCameraSignature(cam) || !PlayerPawnIfViewTarget(cam)) {
+    // "marker off" nasconde solo il mirino: mira dalla canna e ADS restano
+    // (prima si spegnevano anche loro, audit 19/10).
+    if (!hand || !HasCameraSignature(cam) || !PlayerPawnIfViewTarget(cam)) {
         g_markerVisible[eye] = false;
         g_targetVisible[eye] = false;
         if (eye == 0) vr::control::g_adsActive = false;
@@ -4882,10 +6066,8 @@ void UpdateAimMarkerImpl(const float* aimOrigin, const float* eyeLoc, const int3
         }
         // Raggio dalla canna del fucile visibile: il mirino va dove arriva.
         float start[3], end[3];
-        for (int i = 0; i < 3; ++i) {
-            start[i] = muzzle[i] + barrel[i] * 10.0f;
-            end[i] = muzzle[i] + barrel[i] * range;
-        }
+        MuzzleStart(pawn, muzzle, barrel, start);
+        for (int i = 0; i < 3; ++i) end[i] = start[i] + barrel[i] * range;
         float hitTime = 1.0f;
         TraceLine(pawn, start, end, &hitTime);
         for (int i = 0; i < 3; ++i) p[i] = start[i] + (end[i] - start[i]) * hitTime;
@@ -4954,7 +6136,10 @@ void UpdateAimMarkerImpl(const float* aimOrigin, const float* eyeLoc, const int3
     TanToNdc(eye, g_drawOffCenter, x / z, y / z, th, tv, &nx, &ny);
     g_markerNdc[eye][0] = nx;
     g_markerNdc[eye][1] = ny;
-    g_markerVisible[eye] = !vr::control::g_adsActive;
+    // Milkor: le granate fanno una parabola, un mirino in linea retta
+    // indicherebbe un punto sbagliato: niente mirino (audit 19/10).
+    bool lob = g_weaponInfo.cls.find("Milkor") != std::string::npos;
+    g_markerVisible[eye] = !vr::control::g_adsActive && vr::control::g_aimMarker && !lob;
 }
 
 
@@ -5036,9 +6221,12 @@ constexpr uint32_t kOffCheapShooterHealth = 0x264;  // YCheapShooter.m_health (f
 std::vector<void*> CheapShooters() {
     static uint32_t cls = 0;
     static std::vector<void*> cache;
-    static ULONGLONG last = 0;
-    if (GetTickCount64() - last < 2000) return cache;
-    last = GetTickCount64();
+    // Prossima scansione (tempo assoluto). Prima "last = ora + 60000" con il
+    // test senza segno "ora - last < 2000" non attendeva mai: senza la classe
+    // GObjects era scandito per nome a ogni frame col tasto tenuto (audit 19/10).
+    static ULONGLONG nextScan = 0;
+    if (GetTickCount64() < nextScan) return cache;
+    nextScan = GetTickCount64() + 2000;
     cache.clear();
     uint32_t data = 0, num = 0;
     if (!TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data) ||
@@ -5053,7 +6241,7 @@ std::vector<void*> CheapShooters() {
                 cls = o;
         }
         if (!cls) {
-            last = GetTickCount64() + 60000;  // classe non trovata: si riprova tra un minuto
+            nextScan = GetTickCount64() + 60000;  // classe non trovata: si riprova tra un minuto
             return cache;
         }
     }
@@ -5252,10 +6440,10 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
         // punto dell'asse della canna piu' vicino all'origine del gioco.
         float range = std::sqrt((end.x - start.x) * (end.x - start.x) + (end.y - start.y) * (end.y - start.y) +
                                 (end.z - start.z) * (end.z - start.z));
-        float t = (start.x - bo[0]) * bd[0] + (start.y - bo[1]) * bd[1] + (start.z - bo[2]) * bd[2];
-        if (t < 10.0f) t = 10.0f;
         if (range > 1.0f) {
-            start = {bo[0] + bd[0] * t, bo[1] + bd[1] * t, bo[2] + bd[2] * t};
+            float ms[3];
+            MuzzleStart(pawn, bo, bd, ms);
+            start = {ms[0], ms[1], ms[2]};
             end = {start.x + bd[0] * range, start.y + bd[1] * range, start.z + bd[2] * range};
         }
     }
@@ -5276,7 +6464,10 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
     }
     g_CalcWeaponFire_Original(self, start, end, impact);
     if (zeroSpread) SafeCopy(arsenal + kOffArsenalAccuracy, savedAcc, 8);
-    if (mine) vr::haptics::Shot(CurrentWeaponInfo(self).cls, g_twoHandActive);
+    if (mine) {
+        vr::haptics::Shot(CurrentWeaponInfo(self).cls, g_twoHandActive);
+        if (g_armsActive) GunKick(CurrentWeaponInfo(self).cls);
+    }
     if (mine && vr::control::g_fireLog) {
         // FImpactInfo: HitActor +0, HitLocation +4.
         float hit[3] = {0, 0, 0};
@@ -5311,11 +6502,12 @@ void* GetPlayerViewPointThunkAddress() {
 // Distanza tra l'osso Hand_Right e il bersaglio dell'IK della mano destra
 // (scritto da DriveHand nello spazio dell'attore), nel mondo.
 float g_lastShoulderToTarget = 0.0f;  // diagnostica: spalla destra -> bersaglio IK
-float HandToEffectorDistance(void* mesh) {
+float HandToEffectorDistance(void* mesh, int side = 0) {
     float eff[3], loc[3], scale = 1.0f;
     int32_t rot[3];
     char* p = static_cast<char*>(g_fpPawn);
-    if (!SafeCopy(eff, static_cast<char*>(g_rig.ctrl[0]) + kOffLimbEffector, 12) || !SafeCopy(loc, p + 0x54, 12) ||
+    if (!g_rig.ctrl[side]) return 0.0f;
+    if (!SafeCopy(eff, static_cast<char*>(g_rig.ctrl[side]) + kOffLimbEffector, 12) || !SafeCopy(loc, p + 0x54, 12) ||
         !SafeCopy(rot, p + kOffActorRotation, 12) || !SafeCopy(&scale, p + kOffActorDrawScale, 4))
         return 0.0f;
     if (!(scale > 0.01f)) scale = 1.0f;
@@ -5323,14 +6515,15 @@ float HandToEffectorDistance(void* mesh) {
     RotatorToAxes(rot[0], rot[1], rot[2], af, ar, au);
     float target[3];
     for (int i = 0; i < 3; ++i) target[i] = loc[i] + (af[i] * eff[0] + ar[i] * eff[1] + au[i] * eff[2]) * scale;
-    static const int32_t handName = vr::script::NameIndex("Hand_Right");
+    static const int32_t handNames[2] = {vr::script::NameIndex("Hand_Right"), vr::script::NameIndex("Hand_Left")};
+    const int32_t handName = handNames[side];
     struct {
         int32_t name[2];
         int32_t space;
         float ret[3];
     } hp = {{handName, 0}, 0, {0, 0, 0}};
     if (handName < 0 || !vr::script::CallFunction(mesh, "GetBoneLocation", &hp)) return 0.0f;
-    if (vr::control::g_skelLogCalls.load() > 0) {
+    if (side == 0 && vr::control::g_skelLogCalls.load() > 0) {
         static const int32_t shName = vr::script::NameIndex("Shoulder_Right");
         struct {
             int32_t name[2];
@@ -5342,21 +6535,29 @@ float HandToEffectorDistance(void* mesh) {
             g_lastShoulderToTarget = std::sqrt(sx * sx + sy * sy + sz * sz);
         }
     }
+    // Bersaglio oltre la portata del braccio (granata, pugno, braccio teso):
+    // la mano buona sta sul punto raggiungibile verso il bersaglio, non sul
+    // bersaglio. Senza questo ogni allungamento oltre la portata sembrava un
+    // tick cattivo e congelava lo scheletro per 150 ms (audit 19/10).
+    float shoulder[3], reach = 0.0f;
+    if (ArmReach(mesh, side, shoulder, &reach)) {
+        float v[3] = {target[0] - shoulder[0], target[1] - shoulder[1], target[2] - shoulder[2]};
+        float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (len > reach && len > 1e-3f)
+            for (int i = 0; i < 3; ++i) target[i] = shoulder[i] + v[i] * (reach / len);
+    }
     float dx = hp.ret[0] - target[0], dy = hp.ret[1] - target[1], dz = hp.ret[2] - target[2];
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// SkeletalMeshComponent.SpaceBases / LocalAtoms: TArray di FBoneAtom (32 byte:
-// quaternione, traslazione, scala), uno per osso.
-constexpr uintptr_t kOffMeshSpaceBases = 0x274, kOffMeshLocalAtoms = 0x280;
-constexpr size_t kBoneAtomSize = 32;
-
 void KeepGoodBones(void* mesh, bool log) {
+    if (!PawnAlive(g_fpPawn)) return;  // ragdoll: le ossa le muove la fisica
     static std::vector<uint8_t> good[2];
     static void* goodMesh = nullptr;
     static uint32_t restored = 0, checks = 0;
-    static double farSince = 0.0;   // da quando la mano e' lontana (ms)
-    static bool sustained = false;  // mano lontana davvero: pose accettate finche' non torna
+    // Per mano (0 destra, 1 sinistra, controllata solo se la guida la mod).
+    static double farSince[2] = {0.0, 0.0};   // da quando la mano e' lontana (ms)
+    static bool sustained[2] = {false, false};  // lontana davvero: pose accettate finche' non torna
     char* m = static_cast<char*>(mesh);
     uint32_t data[2] = {0, 0}, num[2] = {0, 0};
     for (int a = 0; a < 2; ++a) {
@@ -5365,21 +6566,32 @@ void KeepGoodBones(void* mesh, bool log) {
             num[a] == 0 || num[a] > 1024)
             return;
     }
-    float d = HandToEffectorDistance(mesh);
+    // Anche la mano sinistra: con la presa sull'astina, in un aggiornamento
+    // su cinque circa (camminando o fermi) la sinistra finiva 10-15 unita'
+    // lontana dalla presa per un frame (19/10, GUNLOG "lh").
+    float dist[2] = {HandToEffectorDistance(mesh, 0), g_leftDriven ? HandToEffectorDistance(mesh, 1) : 0.0f};
+    float d = dist[0];
     ++checks;
     // I tick cattivi durano al massimo ~12 ms di fila (misurato a 300 fps):
     // lontana per 150 ms la mano lo e' davvero (braccio teso oltre la portata)
     // e si accettano le pose finche' non torna vicina al bersaglio.
     double nowMs = ProfMs();
-    if (d <= vr::control::g_armSkelFixDist) {
-        sustained = false;
-        farSince = 0.0;
-    } else if (farSince == 0.0) {
-        farSince = nowMs;
-    } else if (nowMs - farSince > 150.0) {
-        sustained = true;
+    bool bad = false;
+    for (int h = 0; h < 2; ++h) {
+        if (dist[h] <= vr::control::g_armSkelFixDist) {
+            sustained[h] = false;
+            farSince[h] = 0.0;
+        } else if (farSince[h] == 0.0) {
+            farSince[h] = nowMs;
+        } else if (nowMs - farSince[h] > 150.0) {
+            sustained[h] = true;
+        }
+        if (dist[h] > vr::control::g_armSkelFixDist && !sustained[h]) {
+            bad = true;
+            d = dist[h];
+        }
     }
-    if (d <= vr::control::g_armSkelFixDist || sustained) {
+    if (!bad) {
         for (int a = 0; a < 2; ++a) {
             good[a].resize(num[a] * kBoneAtomSize);
             if (!SafeCopy(good[a].data(), reinterpret_cast<void*>(data[a]), good[a].size())) good[a].clear();

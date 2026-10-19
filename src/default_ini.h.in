@@ -1,0 +1,3 @@
+#pragma once
+// Generato da CMake da deploy/specopsvr.ini (solo le righe attive).
+static const char kDefaultIni[] = "@SPECOPSVR_DEFAULT_INI@";

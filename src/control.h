@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <openvr.h>
 #include <cstdint>
 #include <string>
 
@@ -167,8 +168,10 @@ extern std::atomic<bool> g_updateBeta;
 std::string UpdateRepo();
 // Prima persona: Walker opaco (niente dissolvenza vicino alla camera) e testa nascosta.
 extern std::atomic<bool> g_fpBody;
-// Mano sinistra sull'astina con la mira a due mani: la tiene il gioco (dita chiuse sull'arma).
+// Mano sinistra entro g_leftGripCm dalla presa sull'astina: agganciata
+// all'arma nella posa del gioco (dita chiuse sull'arma).
 extern std::atomic<bool> g_leftGrip;
+extern std::atomic<float> g_leftGripCm;
 extern std::atomic<float> g_bodyBack;
 // Spostamento aggiuntivo del corpo guardando in basso (oltre 30 gradi).
 extern std::atomic<float> g_bodyBackLook;
@@ -199,6 +202,74 @@ extern std::atomic<bool> g_adsActive;
 // Mano sinistra sulla canna (mira a due mani): il grip sinistro non lancia
 // la granata (LB) mentre si tiene l'arma.
 extern std::atomic<bool> g_twoHandEngaged;
+// Mano sinistra agganciata all'arma (presa sull'astina, hooks UpdateArms):
+// come g_twoHandEngaged, il grip sinistro non e' una granata.
+extern std::atomic<bool> g_leftOnGun;
+// Posa di testa e controller letta una volta per tick sul thread di gioco
+// (inizio del Draw) invece che a ogni BeginScene ("headsample draw|render").
+extern std::atomic<bool> g_headSampleOnDraw;
+// Rotazione continua con lo stick destro fatta dalla mod (gradi/s; 0 = del gioco).
+extern std::atomic<float> g_turnSpeedDeg;
+// Direzione dello stick sinistro: "movedir head" = verso dove si guarda
+// (fuori dalla copertura), "body" = verso il corpo. g_headYawUnits = testa
+// rispetto al corpo (unita' Rotator), scritto da hooks.
+extern std::atomic<bool> g_moveWithHead;
+// Eventi di SteamVR (vr_session): dashboard aperta, richiesta di pausa del
+// gioco (Start una volta, vr_input), proiezione degli occhi da ricalcolare.
+extern std::atomic<bool> g_vrDashboard;
+// Diagnostica delle costanti dei vertex shader ("vsdiag on").
+extern std::atomic<bool> g_vsDiag;
+// Dissolvenze del compositor su tagli, teletrasporti, morte ("fades on|off")
+// e battito di ciglia sulla rotazione a scatti ("snapfade on|off").
+extern std::atomic<bool> g_fades;
+// Mancini ("hand left"): i ruoli dei controller si scambiano (il sinistro
+// regge l'arma e ha grilletto/tasti della mano dell'arma).
+extern std::atomic<bool> g_leftHanded;
+inline vr::ETrackedControllerRole GunRole() {
+    return g_leftHanded ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand;
+}
+inline vr::ETrackedControllerRole SupportRole() {
+    return g_leftHanded ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand;
+}
+// Mano logica (0 appoggio/sinistra, 1 arma/destra) -> mano fisica delle azioni.
+inline int PhysicalHand(int logical) { return g_leftHanded ? 1 - logical : logical; }
+// Ricentramento richiesto: anche lo schermo virtuale si rimette davanti.
+extern std::atomic<bool> g_cinemaRecenter;
+// Movimento della vista non fatto dal giocatore (veicoli, rotazioni del gioco),
+// 0..1, per la vignettatura (hooks).
+extern std::atomic<float> g_forcedMotion;
+// Altezza degli occhi: "height auto" = dalla testa vera in piedi al ricentramento
+// (pavimento di SteamVR), "seated on" = fissa (fp) per chi gioca seduto.
+extern std::atomic<bool> g_heightAuto;
+extern std::atomic<bool> g_seated;
+extern std::atomic<float> g_eyeHeightAuto;  // calcolata (unita' sopra il centro del Pawn), <0 = non ancora
+// Room-scale: il Pawn segue gli spostamenti fisici oltre 15 cm ("roomscale on|off").
+extern std::atomic<bool> g_roomScale;
+// Rotazioni del corpo fatte con lo stick destro (continua o a scatti), unita'
+// Rotator, consumate da hooks per ruotare attorno alla testa.
+extern std::atomic<int32_t> g_stickYawUnits;
+// Col visore in uso la perdita del focus della finestra non mette in pausa ("keepfocus").
+extern std::atomic<bool> g_keepFocus;
+// specopsvr.ini letto (i thread di aggiornamento e aptica lo aspettano).
+extern std::atomic<bool> g_configLoaded;
+// Attende la lettura dell'ini (al massimo maxMs) e poi altri extraMs.
+void WaitForConfig(unsigned maxMs, unsigned extraMs);
+// Arma in mano che spara solo mirando (RPG): LT tenuto col grilletto (vr_input).
+extern std::atomic<bool> g_weaponNeedsAim;
+// "handpredict auto": controller predetti come la testa (fino ai fotoni).
+extern std::atomic<bool> g_handPredictAuto;
+// Altezza della vista con Walker accucciato: "real" = testa vera sul
+// pavimento, "game" = abbassata dal gioco (crouchview real|game).
+extern std::atomic<bool> g_crouchViewReal;
+extern std::atomic<bool> g_snapFade;
+extern std::atomic<bool> g_vrPauseRequest;
+extern std::atomic<bool> g_vrProjectionDirty;
+extern std::atomic<int32_t> g_headYawUnits;
+// Stato del gioco per i gesti (hooks): scena bloccata (bCinematicMode),
+// Walker in copertura, gioco in pausa (WorldInfo.Pauser).
+extern std::atomic<bool> g_gameLocked;
+extern std::atomic<bool> g_inCover;
+extern std::atomic<bool> g_gamePaused;
 // Scene "nel motore" con la camera di Walker e il giocatore bloccato
 // (bCinematicMode): in 3D ("cinemawalker 3d") o sullo schermo virtuale ("screen").
 extern std::atomic<bool> g_cinemaWalker3D;
@@ -304,6 +375,9 @@ extern std::atomic<bool> g_gestureMelee;
 extern std::atomic<bool> g_reloadPhysical;
 // Caricatore rispetto al controller destro: cm in avanti lungo la canna e sotto.
 extern std::atomic<float> g_magwellCm[2];
+// Spostamento del caricatore per il tipo d'arma in mano (cm, sommato a
+// magwell): pistole nell'impugnatura, P90 sopra la canna (hooks).
+extern std::atomic<float> g_magwellClassCm[2];
 // Ultimo lancio col gesto: direzione della mano (spazio di SteamVR, unitaria)
 // e istante (GetTickCount64): la granata lanciata parte in quella direzione.
 extern std::atomic<float> g_throwDir[3];

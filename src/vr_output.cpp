@@ -100,6 +100,11 @@ struct EyePacket {
 std::mutex g_mutex;
 std::condition_variable g_cv;
 EyePacket g_ready[2];            // ultimo frame bloccato per occhio, non ancora preso
+int g_pairsDropped = 0;          // coppie in attesa scartate per un sinistro nuovo
+// Ritaglio dello schermo virtuale tenuto stabile (thread di uscita).
+UINT g_cropTop = 0, g_cropBottom = 0, g_cropCandTop = 0, g_cropCandBottom = 0;
+int g_cropCandFrames = 0;
+bool g_cropSession = false;
 bool g_frameReady = false;       // coppia completa pronta
 bool g_workerBusy = false;       // il thread di uscita sta leggendo superfici bloccate
 std::vector<int> g_doneSlots[2];  // superfici lette, da sbloccare sul thread di rendering
@@ -359,7 +364,9 @@ bool EnsureCinemaTextures(UINT w, UINT h) {
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        std::vector<uint32_t> px(16 * 16, 0xFF000000u);
+        // Grigio molto scuro invece del nero assoluto: lo schermo virtuale non
+        // galleggia nel vuoto (audit 19/10).
+        std::vector<uint32_t> px(16 * 16, 0xFF0D0D10u);
         D3D11_SUBRESOURCE_DATA init = {px.data(), 16 * 4, 0};
         if (FAILED(g_d3d11->CreateTexture2D(&td, &init, &g_blackTex))) return false;
     }
@@ -611,6 +618,27 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
     vr::log::Line("MIRRORSHOT saved: " + path);
 }
 
+// Dissolvenze (audit 19/10: nessuna; tagli, teletrasporti e cambi di schermo
+// erano netti). Richieste da qualsiasi thread, eseguite qui sotto.
+std::atomic<float> g_blinkRequest{0.0f};
+std::atomic<bool> g_holdBlack{false};
+
+void ApplyFades(vr::IVRCompositor* compositor) {
+    static bool held = false;
+    bool hold = g_holdBlack.load();
+    float blink = g_blinkRequest.exchange(0.0f);
+    if (hold && !held) {
+        compositor->FadeToColor(0.08f, 0.0f, 0.0f, 0.0f, 1.0f);
+        held = true;
+    } else if (!hold && held) {
+        compositor->FadeToColor(0.25f, 0.0f, 0.0f, 0.0f, 0.0f);
+        held = false;
+    } else if (!held && blink > 0.0f) {
+        compositor->FadeToColor(0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        compositor->FadeToColor(blink, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
 // Thread di uscita: aspetta una coppia di occhi pronta, attende il ritmo del
 // visore, prende la coppia piu' recente, la copia nelle texture D3D11 e la
 // invia. Anche le chiamate al compositor non legate al frame (finestra
@@ -636,6 +664,7 @@ void WorkerLoop() {
             g_cv.notify_all();
             continue;
         }
+        ApplyFades(compositor);
         {
             std::string mirrorPath;
             if (vr::control::TakeMirrorShotRequest(&mirrorPath)) SaveMirrorShot(compositor, mirrorPath);
@@ -674,7 +703,33 @@ void WorkerLoop() {
             if (pk[0].bits && EnsureCinemaTextures(pk[0].w, pk[0].h)) {
                 D3D11_BOX box = {0, 0, 0, pk[0].w, pk[0].h, 1};
                 g_d3d11Ctx->UpdateSubresource(g_cinemaTex, 0, &box, pk[0].bits, pk[0].pitch, 0);
-                DetectContentRows(pk[0].bits, pk[0].pitch, pk[0].w, pk[0].h, &cinemaTop, &cinemaBottom);
+                UINT top = 0, bottom = pk[0].h;
+                DetectContentRows(pk[0].bits, pk[0].pitch, pk[0].w, pk[0].h, &top, &bottom);
+                // Ritaglio stabile: cambia solo se il nuovo resta uguale per 30
+                // frame (scene scure e dissolvenze lo facevano saltare a ogni
+                // frame) o all'inizio di ogni passaggio allo schermo virtuale.
+                if (!g_cropSession) {
+                    g_cropSession = true;
+                    g_cropTop = top;
+                    g_cropBottom = bottom;
+                    g_cropCandFrames = 0;
+                } else if (top != g_cropTop || bottom != g_cropBottom) {
+                    if (top == g_cropCandTop && bottom == g_cropCandBottom) {
+                        if (++g_cropCandFrames >= 30) {
+                            g_cropTop = top;
+                            g_cropBottom = bottom;
+                            g_cropCandFrames = 0;
+                        }
+                    } else {
+                        g_cropCandTop = top;
+                        g_cropCandBottom = bottom;
+                        g_cropCandFrames = 1;
+                    }
+                } else {
+                    g_cropCandFrames = 0;
+                }
+                cinemaTop = g_cropTop;
+                cinemaBottom = g_cropBottom;
             }
         } else {
             for (int e = 0; e < 2; ++e) {
@@ -688,16 +743,44 @@ void WorkerLoop() {
                 g_d3d11Ctx->UpdateSubresource(tex[e], 0, &box, pk[e].bits, pk[e].pitch, 0);
             }
         }
+        // Le CopyResource dalle superfici condivise sono solo accodate: lo slot
+        // torna al thread di rendering (che ci riscrive con StretchRect) solo a
+        // copia finita, altrimenti un frame poteva mescolare due tick.
+        if (!cinema && (pk[0].gpuSrc || pk[1].gpuSrc)) {
+            static ID3D11Query* copyDone = nullptr;
+            if (!copyDone) {
+                D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+                g_d3d11->CreateQuery(&qd, &copyDone);
+            }
+            if (copyDone) {
+                g_d3d11Ctx->End(copyDone);
+                double tq = QpcMs();
+                BOOL doneQ = FALSE;
+                while (g_d3d11Ctx->GetData(copyDone, &doneQ, sizeof(doneQ), 0) != S_OK && QpcMs() - tq < 10.0)
+                    YieldProcessor();
+            }
+        }
         copyMs += QpcMs() - tc;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             for (int e = 0; e < 2; ++e)
                 if (pk[e].slot >= 0) g_doneSlots[e].push_back(pk[e].slot);
-            g_workerBusy = false;
+            // g_workerBusy resta vero fino a dopo il Submit: le texture degli
+            // occhi non vanno liberate (EnsureResources) mentre il compositor
+            // le legge.
         }
         g_cv.notify_all();
+        auto endBusy = [] {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_workerBusy = false;
+            }
+            g_cv.notify_all();
+        };
         if (cinema && g_cinemaTex) {
-            if (!g_cinemaShown) ShowCinemaOverlay();
+            // Ricentramento durante lo schermo virtuale: lo schermo si rimette
+            // davanti (prima restava dov'era stato aperto).
+            if (!g_cinemaShown || vr::control::g_cinemaRecenter.exchange(false)) ShowCinemaOverlay();
             if (vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) {
                 vr::Texture_t ot = {g_cinemaTex, vr::TextureType_DirectX, vr::ColorSpace_Gamma};
                 vr::VROverlay()->SetOverlayTexture(g_cinemaOverlay, &ot);
@@ -710,8 +793,12 @@ void WorkerLoop() {
             }
         } else if (!cinema) {
             HideCinemaOverlay();
+            g_cropSession = false;
         }
-        if (!tex[0] || !tex[1]) continue;
+        if (!tex[0] || !tex[1]) {
+            endBusy();
+            continue;
+        }
         // I due occhi devono essere stati presentati uno dopo l'altro: all'inizio
         // del gameplay un occhio veniva riconosciuto come l'altro e la coppia
         // univa un'immagine nuova a una vecchia (fucile doppio, 18/10). Coppia
@@ -723,6 +810,7 @@ void WorkerLoop() {
         // sdoppiamento iniziale e aggiungeva scatti (prova col visore 18/10).
         if (vr::control::g_pairCheck && !cinema && pk[0].slot >= 0 && pk[1].slot >= 0 && seqGap > 2) {
             ++mismatchedPairs;
+            endBusy();
             continue;
         }
         double ts = QpcMs();
@@ -758,6 +846,7 @@ void WorkerLoop() {
             errR = compositor->Submit(vr::Eye_Right, &texR, cinema ? &full : &bounds[1]);
         }
         submitMs += QpcMs() - ts;
+        endBusy();
         ++submits;
         // Ritardo reale testa -> fotoni di questo frame: dal campionamento della
         // posa all'invio, piu' il tempo dall'invio ai fotoni secondo il runtime
@@ -791,9 +880,10 @@ void WorkerLoop() {
             char b[300];
             std::snprintf(b, sizeof(b),
                           "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
-                          "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d; mismatched pairs skipped %d",
+                          "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d; mismatched pairs skipped %d; stale pairs "
+                          "dropped %d",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
-                          copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs);
+                          copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs, g_pairsDropped);
             vr::log::Line(b);
             windowStart = now;
             copyMs = waitMs = submitMs = 0.0;
@@ -874,10 +964,28 @@ RECT EyeCropRect(int eye) {
     return r;
 }
 
+// Con g_mutex preso. Un occhio sinistro nuovo mentre la coppia precedente
+// e' ancora in attesa del thread di uscita: la coppia vecchia si scarta tutta.
+// Prima si sostituiva solo il sinistro e il thread di uscita univa il
+// sinistro del tick N al destro del tick N-1 (immagini doppie per un frame
+// con attese del compositor oltre 25 ms, audit 19/10).
+void DropPendingPairForNewLeft(int e) {
+    if (e != 0 || !g_frameReady) return;
+    int old = g_ready[1].slot;
+    if (old >= 0) {
+        if (!g_slotGpu[1][old]) g_sysmem[1][old]->UnlockRect();
+        g_slotState[1][old] = kFree;
+    }
+    g_ready[1] = EyePacket{};
+    g_frameReady = false;
+    ++g_pairsDropped;
+}
+
 // Consegna al thread di uscita la texture condivisa dello slot (copia GPU finita).
 void DeliverGpuSlot(int e, int g) {
     g_slotState[e][g] = kLocked;
     std::lock_guard<std::mutex> lock(g_mutex);
+    DropPendingPairForNewLeft(e);
     int old = g_ready[e].slot;
     if (old >= 0) {
         if (!g_slotGpu[e][old]) g_sysmem[e][old]->UnlockRect();
@@ -940,6 +1048,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         boundsForFlip = vr::control::g_projFlip;
         boundsForW = 0;  // ricalcolo
     }
+    if (vr::control::g_vrProjectionDirty.exchange(false)) boundsForW = 0;  // IPD/visore/sessione cambiati
     if (desc.Width != boundsForW || desc.Height != boundsForH ||
         (!vr::control::g_fovAuto && g_boundsForFov != vr::control::g_fovOverride)) {
         if (UpdateFovAndBounds(desc.Width, desc.Height)) {
@@ -983,11 +1092,21 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     wasCinema = cinema;
     if (cinema || vr::control::g_stereoHalfIpd <= 0) {
         eye = -1;
-    } else if (eye < 0 && GetTickCount64() - vr::control::g_lastStereoDrawMs < 200) {
-        // Stereo attivo ma occhio non riconosciuto (raro): meglio saltare il
-        // frame che mandare a entrambi gli occhi la stessa immagine.
+    } else if (eye < 0 && GetTickCount64() - vr::control::g_lastStereoDrawMs < 1500) {
+        // Stereo attivo ma occhio non riconosciuto, o pausa breve del gioco
+        // (salvataggio del checkpoint): si salta il frame e il visore ripete
+        // l'ultima coppia. Con lo schermo virtuale gia' dopo 200 ms il
+        // salvataggio mostrava per un attimo il back buffer piatto, che nel
+        // visore sembrava il mondo sdoppiato (19/10).
         backBuffer->Release();
         return;
+    } else if (eye < 0) {
+        // Niente Draw stereo da 1,5 s fuori dallo schermo virtuale (caricamenti
+        // bloccanti, filmati di caricamento): l'immagine va sullo schermo
+        // virtuale invece che piatta a entrambi gli occhi (audit 19/10); al
+        // ritorno del 3D le immagini in attesa si scartano.
+        cinema = true;
+        wasCinema = true;
     }
 
     double t0 = QpcMs();
@@ -1027,6 +1146,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             if (SUCCEEDED(g_sysmem[e][g]->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
                 g_slotState[e][g] = kLocked;
                 std::lock_guard<std::mutex> lock(g_mutex);
+                DropPendingPairForNewLeft(e);
                 int old = g_ready[e].slot;
                 if (old >= 0) {
                     if (!g_slotGpu[e][old]) g_sysmem[e][old]->UnlockRect();
@@ -1064,10 +1184,13 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         UINT sw = static_cast<UINT>((src.right - src.left) * scale + 0.5f);
         UINT sh = static_cast<UINT>((src.bottom - src.top) * scale + 0.5f);
         if (cinema) {
-            // Tutto il back buffer nella superficie, mantenendo le proporzioni.
+            // Tutto il back buffer nella superficie, mantenendo le proporzioni,
+            // al massimo 1600 pixel di larghezza: la lettura dalla CPU di tutto
+            // il back buffer (~28 MB a frame) faceva scattare menu e filmati
+            // (audit 19/10).
             float a = static_cast<float>(desc.Width) / static_cast<float>(desc.Height);
-            sw = texW;
-            sh = static_cast<UINT>(texW / a);
+            sw = (std::min)(texW, 1600u);
+            sh = static_cast<UINT>(sw / a);
             if (sh > texH) {
                 sh = texH;
                 sw = static_cast<UINT>(texH * a);
@@ -1168,5 +1291,10 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         }
     }
 }
+
+void Blink(float seconds) {
+    if (seconds > g_blinkRequest.load()) g_blinkRequest = seconds;
+}
+void HoldBlack(bool hold) { g_holdBlack = hold; }
 
 }  // namespace vr::output

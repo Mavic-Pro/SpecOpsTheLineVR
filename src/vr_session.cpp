@@ -182,11 +182,92 @@ void Switch(vr::EVRApplicationType type) {
 // visore solo dopo 2 minuti senza movimento; lo standby vero (3, 4) dopo 3 s.
 std::atomic<bool> g_present{false};
 
+// Eventi di SteamVR (audit 19/10: nessuno era gestito).
+// - Dashboard aperta / focus dell'input a un'altra app: il gioco va in pausa
+//   (Start una volta, vr_input) e i gesti si spengono.
+// - Ricentramento del sistema (Quest: tasto Meta tenuto) o area di gioco
+//   cambiata: anche la mod ricentra.
+// - IPD o proprieta' del visore cambiate: proiezione degli occhi ricalcolata.
+// - SteamVR che chiude: si conferma l'uscita della sessione VR (non del
+//   gioco) e si riprova a collegarsi ogni 5 s finche' SteamVR non torna.
+// Ritorna false se la sessione va chiusa.
+bool PollEvents() {
+    vr::IVRSystem* sys = vr::VRSystem();
+    if (!sys) return true;
+    vr::VREvent_t ev;
+    bool keep = true;
+    while (sys->PollNextEvent(&ev, sizeof(ev))) {
+        switch (ev.eventType) {
+        case vr::VREvent_DashboardActivated:
+        case vr::VREvent_InputFocusCaptured:
+            if (!vr::control::g_vrDashboard.exchange(true)) {
+                vr::control::g_vrPauseRequest = true;
+                vr::log::Line("OpenVR: dashboard open, game paused.");
+            }
+            break;
+        case vr::VREvent_DashboardDeactivated:
+        case vr::VREvent_InputFocusReleased:
+            if (vr::control::g_vrDashboard.exchange(false)) vr::log::Line("OpenVR: dashboard closed.");
+            break;
+        case vr::VREvent_ChaperoneUniverseHasChanged:
+        case vr::VREvent_StandingZeroPoseReset:
+        case vr::VREvent_SeatedZeroPoseReset:
+            vr::control::g_recenterRequested = true;
+            vr::log::Line("OpenVR: play area / zero pose changed, recentering.");
+            break;
+        case vr::VREvent_IpdChanged:
+            vr::control::g_vrProjectionDirty = true;
+            break;
+        case vr::VREvent_PropertyChanged:
+            if (ev.trackedDeviceIndex == vr::k_unTrackedDeviceIndex_Hmd) vr::control::g_vrProjectionDirty = true;
+            break;
+        case vr::VREvent_Quit:
+        case vr::VREvent_DriverRequestedQuit:
+            vr::log::Line("OpenVR: SteamVR is closing, VR session ended (the game keeps running).");
+            if (ev.eventType == vr::VREvent_Quit) sys->AcknowledgeQuit_Exiting();
+            keep = false;
+            break;
+        default:
+            break;
+        }
+    }
+    return keep;
+}
+
 void MonitorLoop() {
-    ULONGLONG inactiveSince = 0, lastActive = 0, standbySince = 0;
+    ULONGLONG inactiveSince = 0, lastActive = 0, standbySince = 0, lastRetry = 0;
     for (;;) {
         Sleep(500);
-        if (!g_ready) continue;
+        if (!g_ready) {
+            // SteamVR assente all'avvio o chiuso: nuovo tentativo ogni 5 s.
+            ULONGLONG now = GetTickCount64();
+            if (now - lastRetry < 5000) continue;
+            lastRetry = now;
+            AcquireSRWLockExclusive(&g_lock);
+            bool ok = InitAs(vr::VRApplication_Background);
+            ReleaseSRWLockExclusive(&g_lock);
+            if (ok) {
+                vr::control::g_vrProjectionDirty = true;
+                vr::log::Line("OpenVR: connected again.");
+            }
+            continue;
+        }
+        bool quit = false;
+        {
+            Shared s;
+            quit = !PollEvents();
+        }
+        if (quit) {
+            AcquireSRWLockExclusive(&g_lock);
+            vr::VR_Shutdown();
+            g_ready = false;
+            g_scene = false;
+            ++g_generation;
+            ReleaseSRWLockExclusive(&g_lock);
+            vr::control::g_vrDashboard = false;
+            lastRetry = GetTickCount64();
+            continue;
+        }
         bool active = false;
         {
             Shared s;
@@ -257,7 +338,9 @@ bool Init() {
     AcquireSRWLockExclusive(&g_lock);
     bool ok = InitAs(vr::VRApplication_Background) || InitAs(vr::VRApplication_Scene);
     ReleaseSRWLockExclusive(&g_lock);
-    if (ok) std::thread(MonitorLoop).detach();
+    // Il controllo parte comunque: senza SteamVR riprova a collegarsi.
+    if (!ok) vr::log::Line("OpenVR: not available yet, retrying every 5 s.");
+    std::thread(MonitorLoop).detach();
     return ok;
 }
 

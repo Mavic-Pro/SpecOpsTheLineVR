@@ -20,6 +20,11 @@ void CorrectControllerPoses(vr::IVRSystem* sys, vr::TrackedDevicePose_t* poses);
 
 // Input finto per i test senza visore: valori stick in [-1,1], grilletti in
 // [0,1], bottoni = maschera XINPUT_GAMEPAD_*; durata in millisecondi.
+// Impulso di conferma sulla mano (0 sinistra, 1 destra) per ms millisecondi,
+// tramite le azioni di SteamVR Input (l'impulso legacy viene ignorato quando
+// c'e' un manifesto di azioni).
+void PulseHand(int hand, unsigned ms);
+
 void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons, unsigned durationMs);
 
 }  // namespace vr::input

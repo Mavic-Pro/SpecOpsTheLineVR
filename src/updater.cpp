@@ -4,6 +4,7 @@
 #include "version.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <winhttp.h>
 
 #include <string>
@@ -111,6 +112,35 @@ std::vector<int> ParseVersion(std::string v) {
     return out;
 }
 
+// SHA-256 esadecimale minuscolo (CNG).
+std::string Sha256Hex(const std::string& data) {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    unsigned char digest[32];
+    std::string out;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return out;
+    if (BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0 &&
+        BCryptHashData(h, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())), static_cast<ULONG>(data.size()), 0) == 0 &&
+        BCryptFinishHash(h, digest, sizeof(digest), 0) == 0) {
+        static const char* hex = "0123456789abcdef";
+        for (unsigned char c : digest) {
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    if (h) BCryptDestroyHash(h);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return out;
+}
+
+// Numero intero di una chiave JSON nell'intervallo [from, to).
+long long JsonNumberBefore(const std::string& json, const std::string& key, size_t from, size_t to) {
+    std::string k = "\"" + key + "\":";
+    size_t p = json.rfind(k, to);
+    if (p == std::string::npos || p < from) return -1;
+    return atoll(json.c_str() + p + k.size());
+}
+
 bool IsDll32(const std::string& data) {
     if (data.size() < 0x200 || data[0] != 'M' || data[1] != 'Z') return false;
     uint32_t pe = *reinterpret_cast<const uint32_t*>(data.data() + 0x3C);
@@ -135,7 +165,7 @@ bool IsRevoked(const std::string& manifest, const std::string& version) {
 }
 
 void Run() {
-    Sleep(15000);  // dopo la lettura dell'ini e l'avvio del gioco
+    vr::control::WaitForConfig(120000, 5000);  // dopo la lettura dell'ini e l'avvio del gioco
     if (!vr::control::g_autoUpdate) {
         vr::log::Line("UPDATE: disabled (autoupdate off).");
         return;
@@ -178,13 +208,28 @@ void Run() {
     }
     // Allegato "d3d9.dll" della release.
     std::string url;
-    size_t at = 0;
+    size_t at = 0, assetFrom = 0, assetUrlAt = 0;
     for (;;) {
+        size_t prev = at;
         std::string u = JsonString(json, "browser_download_url", at, &at);
         if (u.empty()) break;
         if (u.size() >= 9 && _stricmp(u.substr(u.size() - 9).c_str(), "/d3d9.dll") == 0) {
             url = u;
+            assetFrom = prev;
+            assetUrlAt = at;
             break;
+        }
+    }
+    // Dimensione e SHA-256 dichiarati da GitHub per l'allegato (campi "size" e
+    // "digest" dell'oggetto, prima di browser_download_url): una dll troncata
+    // o alterata non sostituisce quella in uso (audit 19/10).
+    long long wantSize = url.empty() ? -1 : JsonNumberBefore(json, "size", assetFrom, assetUrlAt);
+    std::string wantDigest;
+    if (!url.empty()) {
+        size_t d = json.rfind("\"digest\"", assetUrlAt);
+        if (d != std::string::npos && d >= assetFrom) {
+            std::string v = JsonString(json, "digest", d);
+            if (v.rfind("sha256:", 0) == 0) wantDigest = v.substr(7);
         }
     }
     if (url.empty()) {
@@ -197,6 +242,21 @@ void Run() {
     if (!SplitUrl(url, &host, &path) || !HttpGet(host, path, &dll, 64u << 20) || !IsDll32(dll)) {
         vr::log::Line("UPDATE: download failed or invalid file.");
         return;
+    }
+    if (wantSize > 0 && static_cast<long long>(dll.size()) != wantSize) {
+        vr::log::Line("UPDATE: downloaded " + std::to_string(dll.size()) + " bytes instead of " + std::to_string(wantSize) +
+                      ", not installed.");
+        return;
+    }
+    if (!wantDigest.empty()) {
+        std::string got = Sha256Hex(dll);
+        if (_stricmp(got.c_str(), wantDigest.c_str()) != 0) {
+            vr::log::Line("UPDATE: SHA-256 mismatch (" + got + " instead of " + wantDigest + "), not installed.");
+            return;
+        }
+        vr::log::Line("UPDATE: SHA-256 verified.");
+    } else {
+        vr::log::Line("UPDATE: the release gives no SHA-256 for d3d9.dll, size checked only.");
     }
     std::string dir = vr::log::Directory();
     std::string cur = dir + "\\d3d9.dll", neu = dir + "\\d3d9.dll.new", old = dir + "\\d3d9.dll.old";
