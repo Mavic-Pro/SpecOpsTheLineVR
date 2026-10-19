@@ -101,7 +101,12 @@ def game_window():
         p = wt.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
         if p.value == pid and user32.IsWindowVisible(hwnd):
-            found.append(hwnd)
+            # Solo la finestra di Unreal: la finestra specchio della mod
+            # ("mirrorwin") e' dello stesso processo.
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(hwnd, cls, 64)
+            if cls.value != 'SpecOpsVRMirror':
+                found.append(hwnd)
         return True
 
     user32.EnumWindows(cb, 0)

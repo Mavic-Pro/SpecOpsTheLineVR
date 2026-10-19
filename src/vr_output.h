@@ -21,7 +21,9 @@ void OnBeforeReset();
 // Thread di rendering: posa del visore con cui e' stato disegnato l'occhio del
 // frame in corso (nullptr = sconosciuta). Viaggia col frame fino al Submit.
 // tick: tick stereo del frame; si inviano solo coppie con lo stesso tick.
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter);
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter, double sampleMs = 0.0);
+// Ritardo misurato dal campionamento della testa ai fotoni (ms, 0 = non ancora).
+float PhotonLatencyMs();
 
 // Proiezione decentrata dell'occhio (tangenti esatte del visore sull'intero
 // back buffer): NDC.x = tan.x * m00 + m20, NDC.y = tan.y * m11 + m21 (vista

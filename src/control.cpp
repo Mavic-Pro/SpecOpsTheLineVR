@@ -28,6 +28,7 @@ std::atomic<bool> g_vrOutput{true};
 std::atomic<bool> g_vrOutputForce{false};
 std::atomic<int> g_mirrorRequest{-1};
 std::atomic<int> g_monitorEvery{1};
+std::atomic<bool> g_mirrorWin{false};
 std::atomic<bool> g_cinemaEnabled{true};
 std::atomic<bool> g_cinemaActive{false};
 std::atomic<bool> g_cinemaForce{false};
@@ -54,6 +55,7 @@ std::atomic<bool> g_gameCrosshair{false};
 std::atomic<bool> g_actionInput{true};
 std::atomic<bool> g_perEyeViewState{true};
 std::atomic<bool> g_offCenter{true};
+std::atomic<bool> g_projFlip{false};
 std::atomic<float> g_simCantDeg{0.0f};
 std::atomic<bool> g_dynRes{true};
 std::atomic<int> g_dynResMin{65};
@@ -68,6 +70,7 @@ std::atomic<bool> g_motionSmoothingOff{true};
 std::atomic<bool> g_threadLag{true};
 std::atomic<bool> g_poseCorrect{true};
 std::atomic<float> g_predictFrames{-1.0f};
+std::atomic<bool> g_predictAuto{false};
 std::atomic<float> g_handPredictMs{0.0f};
 std::atomic<bool> g_gpuCopy{true};
 std::atomic<float> g_stereoHalfIpd{1.6f};  // ~6,4 cm a ~2 cm per unita' Unreal
@@ -140,6 +143,10 @@ std::atomic<int> g_armDebugFrames{0};
 std::atomic<bool> g_armBonesRequested{false};
 std::atomic<bool> g_bodySizeRequested{false};
 std::atomic<int> g_camLogFrames{0};
+std::atomic<int> g_gunLogFrames{0};
+std::atomic<int> g_skelLogCalls{0};
+std::atomic<bool> g_armSkelFix{true};
+std::atomic<float> g_armSkelFixDist{8.0f};
 std::atomic<float> g_eyeHeightSmooth{0.12f};
 std::atomic<bool> g_ipdFromHmd{true};
 static std::mutex g_armNamesMutex;
@@ -151,6 +158,8 @@ std::string ArmControlName(int i) {
 std::atomic<float> g_synthLeftCm[3];
 std::atomic<bool> g_gestureGrenade{true}, g_gestureReload{true}, g_gestureCover{true};
 std::atomic<bool> g_gestureMelee{true};
+std::atomic<bool> g_reloadPhysical{true};
+std::atomic<float> g_magwellCm[2] = {4.0f, 10.0f};
 std::atomic<float> g_throwDir[3];
 std::atomic<unsigned long long> g_throwStamp{0};
 std::atomic<bool> g_gestureWeapon{true};
@@ -419,6 +428,20 @@ void Execute(const std::string& line) {
         int v = 60;
         in >> v;
         g_camLogFrames = v;
+    } else if (cmd == "skelfix") {
+        std::string v;
+        float d = 0.0f;
+        in >> v >> d;
+        g_armSkelFix = (v != "off");
+        if (d > 0.0f) g_armSkelFixDist = d;
+    } else if (cmd == "skellog") {
+        int v = 200;
+        in >> v;
+        g_skelLogCalls = v;
+    } else if (cmd == "gunlog") {
+        int v = 200;
+        in >> v;
+        g_gunLogFrames = v;
     } else if (cmd == "bodysize") {
         g_bodySizeRequested = true;
     } else if (cmd == "twohand") {
@@ -441,6 +464,17 @@ void Execute(const std::string& line) {
         if (which == "reload" || which == "all") g_gestureReload = on;
         if (which == "cover" || which == "all") g_gestureCover = on;
         if (which == "weapon" || which == "all") g_gestureWeapon = on;
+    } else if (cmd == "reload") {
+        // reload physical|simple
+        std::string v;
+        in >> v;
+        g_reloadPhysical = (v != "simple");
+    } else if (cmd == "magwell") {
+        // magwell <avanti cm> <sotto cm>: caricatore rispetto al controller destro
+        float f = 4.0f, d = 10.0f;
+        in >> f >> d;
+        g_magwellCm[0] = f;
+        g_magwellCm[1] = d;
     } else if (cmd == "gesturesim") {
         std::string v;
         in >> v;
@@ -594,6 +628,13 @@ void Execute(const std::string& line) {
         std::string v;
         in >> v;
         g_offCenter = (v != "off");
+    } else if (cmd == "projflip") {
+        // Prova nel visore: alto e basso del frustum degli occhi scambiati
+        // (on = come fino alla 0.9.5).
+        std::string v;
+        in >> v;
+        g_projFlip = (v == "on");
+        vr::log::Line(std::string("CMD: projflip ") + (g_projFlip ? "on" : "off"));
     } else if (cmd == "eyestate") {
         std::string v;
         in >> v;
@@ -653,7 +694,8 @@ void Execute(const std::string& line) {
     } else if (cmd == "predict") {
         std::string t;
         in >> t;
-        float v = t == "off" ? -1.0f : static_cast<float>(std::atof(t.c_str()));
+        g_predictAuto = (t == "auto");
+        float v = t == "off" || t == "auto" ? -1.0f : static_cast<float>(std::atof(t.c_str()));
         g_predictFrames = v > 4.0f ? 4.0f : v;
     } else if (cmd == "outputscale") {
         float v = 1.0f;
@@ -673,6 +715,10 @@ void Execute(const std::string& line) {
         in >> w >> d;
         if (w > 0.3f) g_cinemaWidthM = w;
         if (d > 0.3f) g_cinemaDistM = d;
+    } else if (cmd == "mirrorwin") {
+        std::string v;
+        in >> v;
+        g_mirrorWin = (v != "off");
     } else if (cmd == "monitor") {
         int v = 1;
         in >> v;

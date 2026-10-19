@@ -560,7 +560,10 @@ struct GestureSample {
     bool leftValid, rightValid;
     float left[3], leftVel[3];
     float right[3];
+    float rightFwd[3], rightUp[3];  // assi dell'arma (controller destro corretto con aimpitch)
     bool rightGrip;     // grip destro premuto
+    bool leftGrip;      // grip sinistro premuto
+    bool reloadButton;  // X premuto (ricarica col tasto)
 };
 
 class GestureDetector {
@@ -613,16 +616,7 @@ public:
                 m_throwReady = s.t + 0.5;
             }
         }
-        if (s.leftValid && s.rightValid && vr::control::g_gestureReload) {
-            float d = Dist(s.left, s.right);
-            if (d < 0.18f && s.left[1] < s.right[1]) m_nearMagT = s.t;
-            if (s.t > m_reloadReady && s.t - m_nearMagT < 0.6 && s.leftVel[1] < -1.0f && d > 0.2f) {
-                Press(kX, s.t, 0.12, "ricarica", -s.leftVel[1]);
-                vr::haptics::Reload();
-                m_reloadReady = s.t + 1.5;
-                m_nearMagT = -10.0;
-            }
-        }
+        UpdateReload(s);
         // Arma dalla spalla: grip destro premuto con la mano sopra la spalla,
         // all'altezza della testa e non davanti al viso -> Y (arma seguente).
         // Il grip, che altrimenti e' RB (ordini alla squadra), resta escluso
@@ -646,6 +640,8 @@ public:
     }
 
     bool SuppressRightGrip() const { return m_gripIsSwap; }
+    // Grip sinistro usato dalla ricarica: non arriva al gioco come LB (granata).
+    bool SuppressLeftGrip() const { return m_leftBusy; }
     bool TakeHaptic() {
         bool h = m_hapticPending;
         m_hapticPending = false;
@@ -664,6 +660,122 @@ private:
         WORD button;
         double from, until;
     };
+    // Ricarica. "simple": mano sinistra sul caricatore e tirare giu'.
+    // "physical" (predefinita), in tre tempi con conferma a vibrazione:
+    //  1. grip sinistro sul caricatore (sotto l'arma) e tirarlo via: espulso;
+    //  2. grip alla cintura (mano 35+ cm sotto la testa, vicina al corpo):
+    //     caricatore nuovo in mano, da tenere col grip;
+    //  3. portarlo sul caricatore dell'arma: inserito, il gioco ricarica (X).
+    // Lasciando il grip prima dell'inserimento il caricatore cade (si torna
+    // al punto 2); dopo 12 s senza finire o col tasto X si ricomincia.
+    enum class Mag { In, Out, Held };
+    void UpdateReload(const GestureSample& s) {
+        m_leftBusy = false;
+        bool gripDown = s.leftGrip && !m_leftGripWas;
+        m_leftGripWas = s.leftGrip;
+        if (!s.leftValid || !s.rightValid || !vr::control::g_gestureReload) {
+            m_mag = Mag::In;
+            m_magGrab = m_leftLatch = false;
+            return;
+        }
+        if (!vr::control::g_reloadPhysical) {
+            m_mag = Mag::In;
+            float d = Dist(s.left, s.right);
+            if (d < 0.18f && s.left[1] < s.right[1]) m_nearMagT = s.t;
+            if (s.t > m_reloadReady && s.t - m_nearMagT < 0.6 && s.leftVel[1] < -1.0f && d > 0.2f) {
+                Press(kX, s.t, 0.12, "ricarica", -s.leftVel[1]);
+                vr::haptics::Reload();
+                m_reloadReady = s.t + 1.5;
+                m_nearMagT = -10.0;
+            }
+            return;
+        }
+        float well[3];
+        float fwdM = vr::control::g_magwellCm[0] * 0.01f, downM = vr::control::g_magwellCm[1] * 0.01f;
+        for (int k = 0; k < 3; ++k) well[k] = s.right[k] + s.rightFwd[k] * fwdM - s.rightUp[k] * downM;
+        float dw = Dist(s.left, well);
+        if (s.reloadButton && m_mag != Mag::In) {
+            vr::log::Line("GESTURE: reload finished with the X button");
+            m_mag = Mag::In;
+        }
+        if (m_mag != Mag::In && s.t - m_magT > 12.0) {
+            vr::log::Line("GESTURE: physical reload not finished in 12 s, reset");
+            m_mag = Mag::In;
+        }
+        switch (m_mag) {
+        case Mag::In:
+            if (dw < 0.12f) m_leftBusy = true;  // mano sul caricatore: il grip non e' una granata
+            if (gripDown && dw < 0.12f && s.t > m_reloadReady) m_magGrab = true;
+            if (m_magGrab) {
+                m_leftBusy = true;
+                if (!s.leftGrip) {
+                    m_magGrab = false;
+                } else if (dw > 0.18f) {
+                    m_magGrab = false;
+                    m_leftLatch = true;
+                    m_mag = Mag::Out;
+                    m_magT = s.t;
+                    Pulse(0, 40);
+                    Pulse(1, 40);
+                    Log("GESTURE: magazine out (left hand %.0f cm from the magwell)", dw * 100.0f);
+                }
+            }
+            break;
+        case Mag::Out: {
+            float below = s.hmd[1] - s.left[1];
+            float hx = s.left[0] - s.hmd[0], hz = s.left[2] - s.hmd[2];
+            float horiz = std::sqrt(hx * hx + hz * hz);
+            // Grip premuto alla cintura, oppure tenuto dall'espulsione fino
+            // all'anca (18/10: nel visore il grip restava premuto e la presa
+            // non scattava mai). Tenuto serve scendere di piu', se no il
+            // caricatore vecchio diventava subito quello nuovo.
+            bool held = s.leftGrip && m_leftLatch;
+            float need = held ? 0.55f : 0.35f;
+            if ((gripDown || held) && below > need && horiz < 0.45f && dw > 0.20f) {
+                m_mag = Mag::Held;
+                m_magT = s.t;
+                m_leftBusy = true;
+                Pulse(0, 60);
+                Log("GESTURE: new magazine taken (%.0f cm below the head)", below * 100.0f);
+            } else if (gripDown) {
+                char b[160];
+                std::snprintf(b, sizeof(b),
+                              "GESTURE: grip with the magazine out, not at the belt (%.0f cm below the head, %.0f cm "
+                              "from it horizontally, %.0f cm from the magwell)",
+                              below * 100.0f, horiz * 100.0f, dw * 100.0f);
+                vr::log::Line(b);
+            }
+            break;
+        }
+        case Mag::Held:
+            m_leftBusy = true;
+            if (!s.leftGrip) {
+                m_mag = Mag::Out;
+                m_magT = s.t;
+                vr::log::Line("GESTURE: magazine dropped (grip released), take a new one");
+            } else if (dw < 0.07f) {
+                m_mag = Mag::In;
+                m_leftLatch = true;
+                m_reloadReady = s.t + 1.0;
+                Press(kX, s.t, 0.12, "ricarica (caricatore inserito)", 0.0f);
+                vr::haptics::Reload();
+                Pulse(0, 90);
+                Pulse(1, 90);
+            }
+            break;
+        }
+        // Grip tenuto dopo l'espulsione o l'inserimento: resta della ricarica.
+        if (m_leftLatch) {
+            if (s.leftGrip) m_leftBusy = true;
+            else m_leftLatch = false;
+        }
+    }
+    static void Pulse(int hand, int ms) { g_hapticUntil[hand] = GetTickCount64() + ms; }
+    static void Log(const char* fmt, float v) {
+        char b[160];
+        std::snprintf(b, sizeof(b), fmt, v);
+        vr::log::Line(b);
+    }
     static float Dist(const float* a, const float* b) {
         float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
         return std::sqrt(x * x + y * y + z * z);
@@ -684,6 +796,9 @@ private:
     double m_lastLogT = 0.0;
     double m_lastT = 0.0, m_throwReady = 0.0, m_reloadReady = 0.0, m_duckReady = 0.0, m_nearMagT = -10.0;
     double m_meleeReady = 0.0, m_twoHandT = -10.0;
+    Mag m_mag = Mag::In;
+    double m_magT = 0.0;
+    bool m_magGrab = false, m_leftLatch = false, m_leftBusy = false, m_leftGripWas = false;
 };
 
 GestureDetector g_gestures;
@@ -729,9 +844,23 @@ bool ReadGestureSample(GestureSample* s) {
     };
     s->leftValid = hand(vr::TrackedControllerRole_LeftHand, s->left, s->leftVel);
     s->rightValid = hand(vr::TrackedControllerRole_RightHand, s->right, nullptr);
+    if (s->rightValid) {
+        // Assi dell'arma: avanti = -Z del controller e su = +Y, ruotati
+        // dell'angolo del calcio (aimpitch) come la mira.
+        vr::TrackedDeviceIndex_t ri = sys->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        const vr::HmdMatrix34_t& c = poses[ri].mDeviceToAbsoluteTracking;
+        float a = vr::control::g_aimPitchOffsetDeg * 0.01745329252f;
+        float ca = std::cos(a), sa = std::sin(a);
+        for (int k = 0; k < 3; ++k) {
+            s->rightFwd[k] = -ca * c.m[k][2] + sa * c.m[k][1];
+            s->rightUp[k] = ca * c.m[k][1] + sa * c.m[k][2];
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(g_handStateMutex);  // letto da ReadTouchControllers
         s->rightGrip = g_handStateValid[1] && GripValue(g_handState[1]) > 0.6f;
+        s->leftGrip = g_handStateValid[0] && GripValue(g_handState[0]) > 0.6f;
+        s->reloadButton = g_handStateValid[0] && ButtonPressed(g_handState[0], vr::k_EButton_A);
     }
     if (g_gestures.TakeHaptic()) {
         ULONGLONG until = GetTickCount64() + 70;  // conferma del gesto su entrambe le mani
@@ -762,6 +891,21 @@ void RunGestureSim(const std::string& which) {
             s.left[1] = 1.2f;
             s.left[2] = -0.1f - 0.5f * u;
             s.leftVel[2] = (k > 10 && k < 20) ? -3.2f : -0.2f;
+        } else if (which == "reload" && vr::control::g_reloadPhysical) {
+            // Fucile davanti al petto che punta a -Z: caricatore 10 cm sotto
+            // la mano destra. Grip sul caricatore, via, grip alla cintura,
+            // ritorno al caricatore.
+            s.rightFwd[2] = -1.0f;
+            s.rightUp[1] = 1.0f;
+            float fw = vr::control::g_magwellCm[0] * 0.01f, dn = vr::control::g_magwellCm[1] * 0.01f;
+            float well[3] = {s.right[0], s.right[1] - dn, s.right[2] - fw};
+            float belt[3] = {-0.15f, 1.0f, -0.1f};
+            const float* at = well;
+            if (k >= 3 && k < 8) at = belt;               // estratto e portato alla cintura
+            else if (k >= 8 && k < 14) at = belt;         // presa del caricatore nuovo
+            for (int j = 0; j < 3; ++j) s.left[j] = at[j];
+            if (k >= 14 && k < 18) for (int j = 0; j < 3; ++j) s.left[j] = 0.5f * (belt[j] + well[j]);
+            s.leftGrip = (k >= 1 && k < 5) || k >= 10;
         } else if (which == "reload") {  // tocca il caricatore, poi tira giu'
             if (k < 15) {
                 s.left[0] = 0.2f; s.left[1] = 1.2f; s.left[2] = -0.3f;
@@ -797,6 +941,7 @@ void ApplyGestures(XGamepad* pad) {
         vr::log::Line(b);
     }
     lastLogged = g;
+    if (g_gestures.SuppressLeftGrip()) pad->wButtons &= ~kLB;  // prima dei gesti: il lancio resta
     pad->wButtons |= g;
     if (g_gestures.SuppressRightGrip()) pad->wButtons &= ~kRB;
 }

@@ -56,6 +56,12 @@ UINT g_slotW[2][kSlots] = {}, g_slotH[2][kSlots] = {};
 bool g_slotCinema[2][kSlots] = {};  // lettura fatta in modalita' schermo virtuale
 bool g_slotPoseValid[2][kSlots] = {};
 vr::HmdMatrix34_t g_slotPose[2][kSlots] = {};
+// Momento (ProfMs/QpcMs) in cui e' stata campionata la posa della testa del frame.
+double g_slotSampleMs[2][kSlots] = {};
+double g_renderSampleMs[2] = {};
+// Ritardo misurato dal campionamento della testa ai fotoni (ms, media mobile;
+// 0 = ancora nessuna misura): serve a "predict auto".
+std::atomic<float> g_photonLatencyMs{0.0f};
 // Posa con cui e' stato disegnato l'ultimo frame di ciascun occhio (thread di rendering).
 bool g_renderPoseValid[2] = {};
 uint32_t g_renderTick[2] = {};
@@ -88,6 +94,7 @@ struct EyePacket {
     uint32_t seq = 0;                   // numero del Present che l'ha prodotto
     bool poseValid = false;             // posa del visore usata per disegnarlo
     vr::HmdMatrix34_t pose = {};
+    double sampleMs = 0.0;              // campionamento della testa usata per disegnarlo
     vr::VRTextureBounds_t bounds = {0, 0, 1, 1};  // parte della texture con l'immagine
 };
 std::mutex g_mutex;
@@ -159,7 +166,34 @@ bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
     float l[2], r[2], t[2], b[2];
     float maxH = 0.0f, maxV = 0.0f;
     for (int e = 0; e < 2; ++e) {
-        sys->GetProjectionRaw(static_cast<vr::EVREye>(e), &l[e], &r[e], &t[e], &b[e]);
+        float rl, rr, rt, rb;
+        sys->GetProjectionRaw(static_cast<vr::EVREye>(e), &rl, &rr, &rt, &rb);
+        // Il verso di "top"/"bottom" di GetProjectionRaw e' ambiguo (in
+        // ComposeProjection di OpenVR "bottom" e' il lato in alto): fino alla
+        // 0.9.5 la mod li usava al contrario e su Quest 3 (55 gradi in basso,
+        // 44 in alto) disegnava il frustum capovolto in verticale, immagine
+        // deformata muovendo la testa (19/10, "fisheye" segnalato con Virtual
+        // Desktop; sparisce riducendo il FOV inferiore in SteamVR). Le
+        // tangenti si ricavano dalla matrice che compone SteamVR stesso (stile
+        // OpenGL: y in su, avanti = -z): in NDC +-1 ai bordi.
+        vr::HmdMatrix44_t pm = sys->GetProjectionMatrix(static_cast<vr::EVREye>(e), 1.0f, 1000.0f);
+        float p00 = pm.m[0][0], p02 = pm.m[0][2], p11 = pm.m[1][1], p12 = pm.m[1][2];
+        if (p00 > 0.05f && p11 > 0.05f && p00 < 100.0f && p11 < 100.0f && std::isfinite(p02) && std::isfinite(p12)) {
+            l[e] = (p02 - 1.0f) / p00;
+            r[e] = (p02 + 1.0f) / p00;
+            t[e] = -(p12 + 1.0f) / p11;  // convenzione della mod: alto negativo = in su
+            b[e] = -(p12 - 1.0f) / p11;
+        } else {
+            l[e] = rl; r[e] = rr; t[e] = rt; b[e] = rb;
+        }
+        if (vr::control::g_projFlip) std::swap(t[e], b[e]), t[e] = -t[e], b[e] = -b[e];
+        if (std::fabs(t[e] - rt) > 0.01f || std::fabs(b[e] - rb) > 0.01f || std::fabs(l[e] - rl) > 0.01f) {
+            char pb[200];
+            std::snprintf(pb, sizeof(pb),
+                          "VR-FOV: %s eye raw tangents L%.3f R%.3f T%.3f B%.3f; from the projection matrix: "
+                          "up %.3f down %.3f", e ? "right" : "left", rl, rr, rt, rb, -t[e], b[e]);
+            vr::log::Line(pb);
+        }
         vr::HmdMatrix34_t eh = sys->GetEyeToHeadTransform(static_cast<vr::EVREye>(e));
         // Colonne OpenVR: x destra, y su, z indietro; UE3: (avanti, destra, su) = (-z, x, y).
         float ax[9] = {eh.m[2][2],  -eh.m[0][2], -eh.m[1][2],   // avanti = -colonna z
@@ -725,6 +759,32 @@ void WorkerLoop() {
         }
         submitMs += QpcMs() - ts;
         ++submits;
+        // Ritardo reale testa -> fotoni di questo frame: dal campionamento della
+        // posa all'invio, piu' il tempo dall'invio ai fotoni secondo il runtime
+        // (fino al prossimo vsync + vsync->fotoni; con Link comprende la
+        // trasmissione). Media mobile per "predict auto": ogni PC e visore ha
+        // il suo valore.
+        if (!cinema && pk[0].sampleMs > 0.0) {
+            vr::IVRSystem* sys = vr::VRSystem();
+            static float hz = 0.0f, vsyncToPhotons = 0.0f;
+            static int propsAge = 0;
+            if (sys && (propsAge++ % 600 == 0 || hz < 30.0f)) {
+                hz = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+                vsyncToPhotons = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
+                                                                    vr::Prop_SecondsFromVsyncToPhotons_Float);
+            }
+            float sinceVsync = 0.0f;
+            uint64_t counter = 0;
+            if (sys && hz > 30.0f && sys->GetTimeSinceLastVsync(&sinceVsync, &counter)) {
+                float frame = 1.0f / hz;
+                sinceVsync = std::fmod(sinceVsync < 0.0f ? 0.0f : sinceVsync, frame);
+                double total = (QpcMs() - pk[0].sampleMs) + 1000.0 * (frame - sinceVsync + vsyncToPhotons);
+                if (total > 0.0 && total < 200.0) {
+                    float old = g_photonLatencyMs.load();
+                    g_photonLatencyMs = old <= 0.0f ? static_cast<float>(total) : old + (static_cast<float>(total) - old) * 0.02f;
+                }
+            }
+        }
         if (submits == 1 || submits % 300 == 0 || (errL != vr::VRCompositorError_None && submits % 120 == 0)) {
             double now = QpcMs();
             double n = submits == 1 ? 1.0 : 300.0;
@@ -768,6 +828,8 @@ bool OffCenterProjection(int eye, EyeProjection* out) {
 
 float HmdRefreshHz() { return g_hmdHz; }
 
+float PhotonLatencyMs() { return g_photonLatencyMs; }
+
 void SetSameTickWait(float ms) { g_sameTickWaitMs = ms; }
 
 void SetRenderScreenPercent(int eye, int percent) {
@@ -794,8 +856,9 @@ bool EyeCant(int eye, float* fwd, float* right, float* up) {
     return true;
 }
 
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter) {
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter, double sampleMs) {
     if (eye < 0 || eye > 1) return;
+    g_renderSampleMs[eye] = sampleMs;
     g_renderOffCenter[eye] = offCenter;
     g_renderTick[eye] = tick;
     g_renderPoseValid[eye] = pose != nullptr;
@@ -829,6 +892,7 @@ void DeliverGpuSlot(int e, int g) {
     pk.tick = g_slotTick[e][g];
     pk.seq = g_slotSeq[e][g];
     pk.pose = g_slotPose[e][g];
+    pk.sampleMs = g_slotSampleMs[e][g];
     pk.bounds = g_slotBounds[e][g];
     g_ready[e] = pk;
     g_gpuSlot[e] = -1;
@@ -871,6 +935,11 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     D3DSURFACE_DESC desc;
     backBuffer->GetDesc(&desc);
     static UINT boundsForW = 0, boundsForH = 0;
+    static bool boundsForFlip = false;
+    if (boundsForFlip != vr::control::g_projFlip) {
+        boundsForFlip = vr::control::g_projFlip;
+        boundsForW = 0;  // ricalcolo
+    }
     if (desc.Width != boundsForW || desc.Height != boundsForH ||
         (!vr::control::g_fovAuto && g_boundsForFov != vr::control::g_fovOverride)) {
         if (UpdateFovAndBounds(desc.Width, desc.Height)) {
@@ -969,6 +1038,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
                 g_ready[e].tick = g_slotTick[e][g];
                 g_ready[e].seq = g_slotSeq[e][g];
                 g_ready[e].pose = g_slotPose[e][g];
+                g_ready[e].sampleMs = g_slotSampleMs[e][g];
                 g_ready[e].bounds = g_slotBounds[e][g];
             } else {
                 g_slotState[e][g] = kFree;
@@ -1024,6 +1094,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotPoseValid[e][s] = g_renderPoseValid[e];
             g_slotBounds[e][s] = texBounds;
             g_slotPose[e][s] = g_renderPose[e];
+            g_slotSampleMs[e][s] = g_renderSampleMs[e];
             g_slotTick[e][s] = g_renderTick[e];
             g_slotSeq[e][s] = g_presentSeq;
             g_gpuSlot[e] = s;
@@ -1042,6 +1113,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         g_slotPoseValid[e][s] = g_renderPoseValid[e];
         g_slotBounds[e][s] = texBounds;
         g_slotPose[e][s] = g_renderPose[e];
+        g_slotSampleMs[e][s] = g_renderSampleMs[e];
         g_slotTick[e][s] = g_renderTick[e];
         g_slotSeq[e][s] = g_presentSeq;
         g_slotGpu[e][s] = false;

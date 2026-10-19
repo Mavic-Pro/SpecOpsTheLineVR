@@ -30,6 +30,8 @@ extern std::atomic<int> g_mirrorRequest;
 // Aggiornamento della finestra sul monitor in stereo: 1 frame ogni N (il
 // Present della finestra 2400x2500 costa ~5 ms al thread di rendering).
 extern std::atomic<int> g_monitorEvery;
+// Occhio destro in una finestra specchio sempre in primo piano ("mirrorwin on").
+extern std::atomic<bool> g_mirrorWin;
 // Schermo virtuale: fuori dal gameplay (cinematiche, menu, caricamenti) la
 // scena del gioco, mono e in 16:9, viene mostrata su un grande schermo fisso
 // nella stanza invece che attorno alla testa. g_cinemaActive = stato del tick
@@ -56,6 +58,8 @@ extern std::atomic<bool> g_commandFollowsGun;
 // Pose di testa e controller predette per l'istante in cui il frame arriva
 // sul display: fino al prossimo vsync + vsync->fotoni + predictFrames frame.
 extern std::atomic<float> g_predictFrames;
+// "predict auto": predizione = ritardo misurato testa -> fotoni (vr_output).
+extern std::atomic<bool> g_predictAuto;
 // Predizione dei soli controller in millisecondi ("handpredict"; 0 = nessuna).
 extern std::atomic<float> g_handPredictMs;
 // Con il device D3D9Ex (file specopsvr_gpushare): copia GPU->GPU degli occhi
@@ -216,6 +220,7 @@ extern std::atomic<bool> g_perEyeViewState;
 // Proiezione decentrata per occhio: tutto il back buffer e' l'occhio, niente
 // ritaglio ("offcenter on|off").
 extern std::atomic<bool> g_offCenter;
+extern std::atomic<bool> g_projFlip;  // alto/basso degli occhi scambiati (prova)
 // Prova dei display inclinati senza Pimax ("eyecant <gradi>", 0 = visore reale).
 extern std::atomic<float> g_simCantDeg;
 // Risoluzione dinamica: con la GPU vicina al limite del frame del visore la
@@ -269,6 +274,12 @@ extern std::atomic<bool> g_armBonesRequested;
 extern std::atomic<bool> g_bodySizeRequested;
 // "camlog N": per N frame, posizione di base della vista (gioco) e finale (6DOF) nel log.
 extern std::atomic<int> g_camLogFrames;
+extern std::atomic<int> g_gunLogFrames;
+extern std::atomic<int> g_skelLogCalls;
+// Ossa dell'ultimo aggiornamento buono rimesse quando la mano destra resta
+// lontana dal bersaglio IK ("skelfix on|off [unita']").
+extern std::atomic<bool> g_armSkelFix;
+extern std::atomic<float> g_armSkelFixDist;  // diagnostica: aggiornamenti dello scheletro di Walker  // diagnostica: canna dell'arma rispetto agli occhi per N tick
 // Costante di tempo (s) con cui l'altezza della vista segue quella del gioco:
 // accovacciarsi in copertura o sporgersi abbassa/alza Walker di ~40 cm in un
 // frame (18/10, "when taking cover my screen is shaking"). 0 = immediato.
@@ -287,6 +298,12 @@ extern std::atomic<float> g_synthLeftCm[3];
 extern std::atomic<bool> g_gestureGrenade, g_gestureReload, g_gestureCover;
 // Pugno in avanti con la sinistra all'altezza del petto = corpo a corpo (B).
 extern std::atomic<bool> g_gestureMelee;
+// Ricarica fisica (reload physical, predefinita): grip sinistro sul
+// caricatore e tirarlo via, grip alla cintura per prenderne uno nuovo,
+// portarlo sotto l'arma per inserirlo (X). "simple" = tocca e tira giu'.
+extern std::atomic<bool> g_reloadPhysical;
+// Caricatore rispetto al controller destro: cm in avanti lungo la canna e sotto.
+extern std::atomic<float> g_magwellCm[2];
 // Ultimo lancio col gesto: direzione della mano (spazio di SteamVR, unitaria)
 // e istante (GetTickCount64): la granata lanciata parte in quella direzione.
 extern std::atomic<float> g_throwDir[3];

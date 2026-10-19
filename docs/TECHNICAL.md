@@ -73,12 +73,39 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 
 ## Per-eye projection and view state (0.9.4)
 
+- Eye tangents (0.9.6): taken from `GetProjectionMatrix` (OpenGL style:
+  NDC y = +1 is up) instead of reading `GetProjectionRaw` by name. In
+  OpenVR's raw values `bottom` is the upper edge (Quest 3: up 0.966, down
+  1.428); up to 0.9.5 the mod used them the other way round and drew every
+  eye vertically flipped in asymmetry (55 degrees up instead of down), a
+  warp that changed with head pitch ("fisheye", reported with Virtual
+  Desktop; it faded when the lower FOV was cut in SteamVR). A `VR-FOV` line
+  is logged when raw and matrix tangents disagree.
+- Head prediction and pose submit (0.9.6, tested in the headset with Quest 3
+  over Link): frames are submitted without a render pose (`submitpose off`;
+  with it the compositor's correction showed black bands at the edges and a
+  warped image when moving the head) and the view is drawn with the head
+  pose predicted to photon time. `predict auto` measures that delay per
+  frame: from the head sample to `Submit`, plus next vsync and
+  `Prop_SecondsFromVsyncToPhotons_Float` from the runtime (moving average;
+  ~53 ms on Link). Controllers are sampled without head prediction
+  (predicted with the head the gun looked doubled).
+- Frame-tag queue (0.9.6): more than 4 tags at a Present means Draws without
+  Present (loading); an even surplus never broke the eye check, so after a
+  console `open` every frame went out with the pose of ~7 ticks earlier
+  (98 ms). Older pairs are dropped (`stale tags` in STATS).
+- Aim marker and squad-target box (0.9.6): computed during each eye's Draw
+  and copied into that eye's frame tag (same tick only); Present draws the
+  values of the tag it pops. Before, Present read the latest globals, which
+  the game thread could already have overwritten for the next tick: one eye
+  showed the marker of another frame ("marker doubles now and then").
+  STATS: `marker from tag N, from globals M` (M should be 0 in gameplay).
 - Off-center projection: `FPerspectiveMatrix(HalfFOV, W, H, MinZ)`
   (`0x009EAE80`, thiscall) is hooked; when it returns to
   `ULocalPlayer::CalcSceneView` (`0x0075CAC5` / `0x0075CBBA`) during an eye's
   Draw, M[0][0], M[1][1], M[2][0], M[2][1] are replaced with the eye's exact
   frustum from `GetProjectionRaw` (Quest 3: m00 0.903, m11 0.835, m20
-  +-0.243, m21 -0.193). The whole back buffer is the eye: no crop, full
+  +-0.243, m21 +0.193; -0.193 up to 0.9.5, see eye tangents above). The whole back buffer is the eye: no crop, full
   texture bounds; before, 1932x2087 of 2400x2500 pixels were used. The mode
   travels in the frame tag, so crop/bounds, the aim marker, the HUD canvas
   and the vignette always match how the image was drawn. Not used while a
@@ -177,6 +204,15 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
   not at the eye point (which is `fp` forward units ahead): with Walker
   pressed against a wall in scripted scenes the eye point is inside the wall,
   and a trace starting there kept the view stuck inside it (0.9.5).
+- **Wall in front of the body** (0.9.6): a second trace from the Pawn's
+  center along the `fp` forward offset. If a wall is closer than
+  `fp + 12` units, the view (with arms and gun) moves back so the wall stays
+  at least 12 units away, up to 10 units behind the center when there is
+  room. The body mesh is not moved with it (moved 20 units back, the cover
+  pose looked broken in the headset). In cover against a tall wall (chapter 1
+  airplane hostage standoff) Walker faces the wall at ~17 units: before, the
+  eyes stopped 8 units from it and the whole view was wall. Moves back at
+  once, returns in ~0.2 s; `CAMLOG` prints `wall pull`.
 
 ## Engine objects (UE3)
 
@@ -226,7 +262,27 @@ Useful offsets (`ue3.py props`):
   cylinders"; in first person they are set to zero, the `head` bone is hidden
   (`HideBoneByName`) and the mesh is moved back (`bodyback`, plus up to 10
   more units when looking down past 30 degrees so the inside of the collar is
-  not visible).
+  not visible). Since 0.9.6 "back" means away from where the head looks, not
+  behind the body: looking over a shoulder (head turned 60+ degrees, full
+  extra past 120) the body slides away from the view, before the open collar
+  of the hidden head was in front of the eyes ("decapitated body").
+- **Bad compose ticks** (0.9.6): while walking, in isolated ticks the game's
+  AnimTree composed Walker's skeleton with the right hand ~32 units from our
+  limb IK target, i.e. in the animation pose, and the gun attached to it
+  jumped to the hip for one frame ("doubled gun when walking"). Hook on
+  `USkeletalMeshComponent::UpdateSkelPose` (`0x006455E0`, only caller in
+  gameplay `0x00D36121`): verified identical in good and bad ticks were the
+  limb inputs (effector, spaces, axes, joint target, flags, stretch), control
+  strengths, `bIgnoreControllers`, `LastRenderTime`, LOD, AnimTree, mesh and
+  actor transforms; zeroing every other control did not change it. After each
+  update the mod compares `Hand_Right` with the effector (good ticks 0-6
+  units): if it is over 8 (`skelfix on|off <units>`), `SpaceBases` and
+  `LocalAtoms` (126 `FBoneAtom` of 32 bytes at +0x274 / +0x280) are restored
+  from the last good update, so the skeleton holds for that tick and the gun
+  attached afterwards stays in the hand. Bad runs last at most ~12 ms; a hand
+  far from its target for 150 ms is real (arm stretched past its reach) and
+  those poses are kept. Measured walking: 0 gun jumps in 1800 frames (150-200
+  before), 263 updates restored. `gunlog N` / `skellog N` print the data.
 - Directly loading a mission (`open TheLine_P?mission=SP_Gorge01_P`) leaves
   the Gorge01 intro stuck on a transition movie (`YSeqAct_FullscreenMoviePlayer`
   `03a_transition`) also **without** the mod: an artefact of the direct load,
@@ -379,6 +435,17 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   is logged once per controller (`INPUT: right controller knuckles ...`).
 - Gestures are detected from controller and headset poses and velocities and
   injected as short button presses.
+- Physical reload (`reload physical`, 0.9.6): a three-state machine
+  (magazine in / out / held) on the left hand. The magwell is a point
+  `magwell` cm forward along the gun axis and below the right controller,
+  using the same `aimpitch` rotation as aiming. Grip within 12 cm of it and
+  pull past 18 cm = out; grip pressed with the hand 35+ cm below the head and within
+  45 cm of it horizontally (or the grip kept held from the eject down to
+  55+ cm below the head) = new magazine held; held within 7 cm of the
+  magwell = X (the game's reload). Releasing the grip drops the held
+  magazine; 12 s without finishing or the X button resets. While the left
+  hand is at the magwell or the grip belongs to the reload, the grip is not
+  sent to the game as LB (grenade).
 
 ## Developer commands
 

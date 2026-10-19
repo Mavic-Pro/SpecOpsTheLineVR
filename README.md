@@ -30,7 +30,7 @@ virtual cinema screen.
   with your body to pop out and aim.
 - **Mounted guns and the helicopter minigun** aim with your controller.
 - **Squad orders** target the enemy you point your gun at.
-- **Gestures**: throw grenades, punch (melee), reload by pulling the magazine,
+- **Gestures**: throw grenades, punch (melee), physical two-handed reload (pull the magazine, take a new one from your belt, push it in),
   duck into cover, grab the next weapon from your shoulder.
 - **Haptics**: controller rumble on the gun hand, **ProTubeVR**
   (ForceTube / ProVolver) recoil and **bHaptics** vest and sleeves.
@@ -109,7 +109,7 @@ direction, so it feels the same on every controller.
 |---|---|
 | Overhand throw with the left hand | Grenade (flies where you throw) |
 | Straight punch with the left hand (chest height) | Melee |
-| Left hand on the magazine, then pull down | Reload |
+| Left grip on the magazine (under the gun) and pull it out, grip at your belt for a new one, push it into the gun | Reload (each step vibrates; `reload simple` = touch the magazine and pull down) |
 | Duck quickly next to cover | Take cover |
 | Lean out sideways (or stand up) while in cover | Pop out and aim |
 | Gun up to your eye | Aim down the sights |
