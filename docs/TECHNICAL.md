@@ -81,6 +81,12 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
   warp that changed with head pitch ("fisheye", reported with Virtual
   Desktop; it faded when the lower FOV was cut in SteamVR). A `VR-FOV` line
   is logged when raw and matrix tangents disagree.
+- Settings migration (0.9.6): the auto-updater and `install.bat` keep the
+  user's `specopsvr.ini`, so new defaults never arrived. `configversion` in
+  the ini: below 2 the mod rewrites only lines still at the old defaults
+  (`submitpose on` -> `off`, `predict off` -> `auto`), appends
+  `configversion 2` and logs `CONFIG: specopsvr.ini updated`. A UTF-8 BOM
+  on the first line is ignored.
 - Head prediction and pose submit (0.9.6, tested in the headset with Quest 3
   over Link): frames are submitted without a render pose (`submitpose off`;
   with it the compositor's correction showed black bands at the edges and a

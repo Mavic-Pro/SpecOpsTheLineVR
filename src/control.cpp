@@ -715,6 +715,8 @@ void Execute(const std::string& line) {
         in >> w >> d;
         if (w > 0.3f) g_cinemaWidthM = w;
         if (d > 0.3f) g_cinemaDistM = d;
+    } else if (cmd == "configversion") {
+        // Versione del formato dell'ini (vedi MigrateConfig): niente da fare.
     } else if (cmd == "mirrorwin") {
         std::string v;
         in >> v;
@@ -778,18 +780,67 @@ void SaveIniValue(const std::string& key, const std::string& value) {
     vr::log::Line("CONFIG: saved \"" + key + " " + value + "\" in specopsvr.ini");
 }
 
+// Migrazione dell'ini: l'aggiornamento automatico e install.bat conservano
+// l'ini dell'utente, quindi i nuovi predefiniti non arriverebbero mai. Con
+// "configversion" minore di kConfigVersion si cambiano solo le righe rimaste
+// ai vecchi predefiniti (una scelta diversa dell'utente resta).
+// 2 (0.9.6): "submitpose on" -> off, "predict off" -> auto (fisheye e bande
+// nere muovendo la testa, 19/10).
+constexpr int kConfigVersion = 2;
+
+void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
+    int version = 1;
+    for (const auto& l : lines)
+        if (l.rfind("configversion ", 0) == 0) version = std::atoi(l.c_str() + 14);
+    if (version >= kConfigVersion) return;
+    struct Change {
+        const char* from;
+        const char* to;
+    };
+    static const Change kChanges[] = {{"submitpose on", "submitpose off"}, {"predict off", "predict auto"}};
+    std::string done;
+    for (auto& l : lines)
+        for (const auto& c : kChanges)
+            if (l == c.from) {
+                l = c.to;
+                done += std::string(" \"") + c.from + "\" -> \"" + c.to + "\";";
+            }
+    bool hasVersion = false;
+    for (auto& l : lines)
+        if (l.rfind("configversion", 0) == 0) {
+            l = "configversion " + std::to_string(kConfigVersion);
+            hasVersion = true;
+        }
+    if (!hasVersion) {
+        lines.push_back("# Settings format version (updated automatically).");
+        lines.push_back("configversion " + std::to_string(kConfigVersion));
+    }
+    std::ofstream o(path, std::ios::trunc);
+    for (const auto& l : lines) o << l << "\n";
+    vr::log::Line("CONFIG: specopsvr.ini updated to version " + std::to_string(kConfigVersion) + ":" +
+                  (done.empty() ? std::string(" no default to change") : done));
+}
+
 void LoadConfigFile() {
-    std::ifstream f(ModuleDirectory() + "\\specopsvr.ini");
-    if (!f) {
-        vr::log::Line("CONFIG: specopsvr.ini not found, using the defaults.");
-        return;
+    std::string path = ModuleDirectory() + "\\specopsvr.ini";
+    std::vector<std::string> lines;
+    {
+        std::ifstream f(path);
+        if (!f) {
+            vr::log::Line("CONFIG: specopsvr.ini not found, using the defaults.");
+            return;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            // BOM UTF-8 (ini salvato da editor che lo aggiungono).
+            if (lines.empty() && line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);
+            lines.push_back(line);
+        }
     }
+    MigrateConfig(lines, path);
     vr::log::Line("CONFIG: loading specopsvr.ini");
-    std::string line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        Execute(line);
-    }
+    for (const auto& line : lines) Execute(line);
 }
 
 void Poll() {
