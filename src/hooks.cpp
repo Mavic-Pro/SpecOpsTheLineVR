@@ -6545,10 +6545,36 @@ std::vector<void*> CheapShooters() {
 
 void UpdateSquadCommandAim(char* cam, void* pawn) {
     static void* lastPick = nullptr;
+    static uint32_t lastPickCls = 0;  // classe al momento della scelta (oggetto ancora valido?)
+    // Diagnostica sempre attiva (20/10: tester bloccati al cecchino sul
+    // cartellone, nei log nessuna traccia dell'ordine): a ogni pressione e
+    // rilascio del tasto squadra, perche' la mod sceglie o non sceglie.
+    static bool wasHeld = false;
+    static void* everPicked = nullptr;
+    bool held = vr::control::g_squadButtonHeld;
+    if (held != wasHeld) {
+        wasHeld = held;
+        uint32_t sel = 0;
+        if (HasCameraSignature(cam)) TrySafeReadUint32(cam - 0x77C + kOffPcSelectedMarkable, &sel);
+        char b[300];
+        if (held) {
+            everPicked = nullptr;
+            snprintf(b, sizeof(b),
+                     "SQUAD: button pressed (commandaim gun=%d, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
+                     "shooters=%u); game target %s",
+                     (int)vr::control::g_commandFollowsGun.load(), pawn != nullptr, (int)vr::control::g_aimHand.load(),
+                     (int)g_armsActive.load(), (int)g_muzzleAimValid.load(), (unsigned)CheapShooters().size(),
+                     sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
+        } else {
+            snprintf(b, sizeof(b), "SQUAD: button released; mod target %s, game target %s",
+                     everPicked ? vr::script::ClassName(everPicked).c_str() : "none",
+                     sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
+        }
+        vr::log::Line(b);
+    }
     // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
-    if (!vr::control::g_commandFollowsGun || !pawn || !vr::control::g_aimHand || !g_armsActive ||
-        !vr::control::g_squadButtonHeld) {
+    if (!vr::control::g_commandFollowsGun || !pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
         lastPick = nullptr;
         return;
     }
@@ -6651,6 +6677,22 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         best = lastPick;
         bestScore = lastPickScore;
     }
+    // Nessun bersaglio lungo la canna ma uno gia' agganciato in questa
+    // pressione: resta finche' e' vivo, fino al rilascio. Prima, spostando
+    // un attimo l'arma (rinculo, mano tremante, cecchino piccolo e lontano)
+    // tornava la scelta del gioco al centro della vista e al rilascio non
+    // partiva nessun ordine (20/10, cecchino sul cartellone: "game target none").
+    if (!best && lastPick && StillAlive(lastPick, lastPickCls)) {
+        bool alive = false;
+        int32_t hp = 0;
+        float fhp = 0.0f;
+        if (vr::script::ClassName(lastPick).find("CheapShooter") != std::string::npos)
+            alive = SafeCopy(&fhp, static_cast<char*>(lastPick) + kOffCheapShooterHealth, 4) && fhp > 0.0f;
+        else
+            alive = TrySafeReadUint32(static_cast<char*>(lastPick) + kOffPawnHealth, reinterpret_cast<uint32_t*>(&hp)) &&
+                    hp > 0;
+        if (alive) best = lastPick;
+    }
     if (!best) {
         lastPick = nullptr;
         return;
@@ -6671,6 +6713,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         pending = nullptr;
     }
     vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
+    everPicked = best;
     {
         float tl[3];
         if (SafeCopy(tl, static_cast<char*>(best) + 0x54, 12)) {
@@ -6681,6 +6724,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     }
     if (best != lastPick) {
         lastPick = best;
+        lastPickCls = ObjClass(best);
         pending = best;
         pendingFrames = 0;
     }
