@@ -23,20 +23,20 @@ Status: [ ] todo, [x] done (committed), [~] done but needs headset check.
 - [~] A18 (on/off normalised, gesture/dynres/gpushare fixed; numeric warnings TODO) ini: on/off/1/0 normalisation, warnings for bad values, dynres max, gpushare parsing, gesture melee documented
 
 ## B. Robustness / session
-- [ ] B1 KeepSubclass re-entrancy guard / only replace the known game proc
-- [ ] B2 Window protections only while HmdPresent (minimize/focus after taking the headset off)
-- [ ] B3 Cinema overlay re-created after SteamVR restart (generation counter also in Switch)
-- [ ] B4 Worker quiesce without timeout before releasing surfaces/textures
-- [ ] B5 ConfigureReprojection retried until the HMD tracking system is known
-- [ ] B6 SteamVR death without Quit event detected
-- [ ] B7 g_present reset on Quit; back-off on failed Scene init
-- [ ] B8 PropertyChanged filtered to projection-relevant properties
-- [ ] B9 ProTube bridge: pipe before InitPistol; wide-char paths
-- [ ] B10 bHaptics socket close order
-- [ ] B11 ini written via temp file + replace; migration on normalised lines
-- [ ] B12 Crash handler: only fatal codes, dump from helper thread
-- [ ] B13 Orderly shutdown on WM_CLOSE (exit crash)
-- [ ] B14 Display spoof wanted size updated on Reset (setres)
+- [~] B1 KeepSubclass re-entrancy guard / only replace the known game proc
+- [~] B2 Window protections only while HmdPresent (minimize/focus after taking the headset off)
+- [~] B3 Cinema overlay re-created after SteamVR restart (generation counter also in Switch)
+- [~] B4 Worker quiesce without timeout before releasing surfaces/textures
+- [~] B5 ConfigureReprojection retried until the HMD tracking system is known
+- [~] B6 SteamVR death without Quit event detected
+- [~] B7 g_present reset on Quit; back-off on failed Scene init
+- [~] B8 PropertyChanged filtered to projection-relevant properties
+- [~] B9 ProTube bridge: pipe before InitPistol; wide-char paths
+- [~] B10 bHaptics socket close order
+- [~] B11 ini written via temp file + replace; migration on normalised lines
+- [~] B12 Crash handler: only fatal codes, dump from helper thread
+- [~] B13 Orderly shutdown on WM_CLOSE (exit crash)
+- [~] B14 Display spoof wanted size updated on Reset (setres)
 
 ## C. Rendering
 - [ ] C1 Scope circle/vignette centred on tangent (0,0) per eye

@@ -300,7 +300,11 @@ bool InitD3D11() {
 // consegne in sospeso; da chiamare prima di rilasciare o ricreare risorse.
 void QuiesceWorker() {
     std::unique_lock<std::mutex> lock(g_mutex);
-    g_cv.wait_for(lock, std::chrono::milliseconds(500), [] { return !g_workerBusy; });
+    // Fino a 5 s (prima 500 ms): un Submit bloccato da un intoppo di SteamVR
+    // durante un Reset faceva liberare superfici ancora lette dal thread di
+    // uscita (audit 20/10).
+    if (!g_cv.wait_for(lock, std::chrono::milliseconds(5000), [] { return !g_workerBusy; }))
+        vr::log::Line("VR-OUTPUT: output thread still busy after 5 s, releasing resources anyway.");
     g_ready[0] = g_ready[1] = EyePacket{};
     g_frameReady = false;
     g_doneSlots[0].clear();
@@ -460,8 +464,10 @@ bool EnsureResources(IDirect3DDevice9* device, UINT w, UINT h) {
     if (g_sharedSurface && g_width == w && g_height == h) return true;
     ReleaseD3d9Surfaces();
     {
-        // Le texture D3D11 sono usate solo dal thread di uscita, fermo qui.
-        std::lock_guard<std::mutex> lock(g_mutex);
+        // Le texture D3D11 sono usate solo dal thread di uscita: si aspetta che
+        // abbia finito il Submit in corso (prima non si controllava).
+        std::unique_lock<std::mutex> lock(g_mutex);
+        g_cv.wait_for(lock, std::chrono::milliseconds(5000), [] { return !g_workerBusy; });
         ReleaseEyeTextures();
     }
     HRESULT hr = device->CreateRenderTarget(w, h, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE,
@@ -777,6 +783,18 @@ void WorkerLoop() {
             }
             g_cv.notify_all();
         };
+        // Nuova connessione a SteamVR (riavvio, cambio Background/Scene): gli
+        // overlay appartengono alla connessione vecchia. Senza ricrearlo lo
+        // schermo virtuale restava grigio fino al riavvio del gioco (audit 20/10).
+        {
+            static unsigned overlayGen = 0;
+            unsigned gen = vr::session::Generation();
+            if (gen != overlayGen) {
+                overlayGen = gen;
+                g_cinemaOverlay = vr::k_ulOverlayHandleInvalid;
+                g_cinemaShown = false;
+            }
+        }
         if (cinema && g_cinemaTex) {
             // Ricentramento durante lo schermo virtuale: lo schermo si rimette
             // davanti (prima restava dov'era stato aperto).
@@ -1009,6 +1027,7 @@ void DeliverGpuSlot(int e, int g) {
 int g_sameTickOk = 0, g_sameTickMissed = 0;
 
 void OnPresent(IDirect3DDevice9* device, int eye) {
+    if (vr::control::g_exiting) return;
     if (g_disabled || !vr::control::g_vrOutput) return;
     ++g_presentSeq;
     // Solo da applicazione Scene (visore indossato, vedi vr_session.h).

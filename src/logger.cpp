@@ -97,9 +97,11 @@ void WriteHeader(const std::string& dir) {
 // anche il rapporto di crash del gioco viene scritto.
 LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
 
-LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
-    static volatile LONG once = 0;
-    if (InterlockedExchange(&once, 1)) return g_prevFilter ? g_prevFilter(info) : EXCEPTION_CONTINUE_SEARCH;
+// Rapporto (riga di log + minidump) del crash del thread tid: con lo stack
+// esaurito (STACK_OVERFLOW) gira su un thread a parte, perche' snprintf,
+// std::string e MiniDumpWriteDump sullo stack finito facevano un secondo
+// errore e il minidump non veniva mai scritto (audit 20/10).
+void WriteCrashReport(EXCEPTION_POINTERS* info, DWORD tid) {
     DWORD code = info->ExceptionRecord->ExceptionCode;
     void* addr = info->ExceptionRecord->ExceptionAddress;
     HMODULE mod = nullptr;
@@ -110,7 +112,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
     char b[512];
     std::snprintf(b, sizeof(b), "CRASH: exception 0x%08lX at %p (%s +0x%lX), thread %lu", code, addr, modName,
                   static_cast<unsigned long>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod)),
-                  GetCurrentThreadId());
+                  tid);
     Line(b);
     std::string dump = g_dir + "\\specopsvr_crash_" + std::to_string(GetTickCount64()) + ".dmp";
     HANDLE f = CreateFileA(dump.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -120,13 +122,40 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
                                                    PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION,
                                                    PMINIDUMP_CALLBACK_INFORMATION);
         auto write = dbghelp ? reinterpret_cast<MiniDumpWriteDump_t>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
-        MINIDUMP_EXCEPTION_INFORMATION mei = {GetCurrentThreadId(), info, FALSE};
+        MINIDUMP_EXCEPTION_INFORMATION mei = {tid, info, FALSE};
         if (write &&
             write(GetCurrentProcess(), GetCurrentProcessId(), f,
                   static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory), &mei,
                   nullptr, nullptr))
             Line("CRASH: minidump written to " + dump);
         CloseHandle(f);
+    }
+}
+
+struct CrashJob {
+    EXCEPTION_POINTERS* info;
+    DWORD tid;
+};
+
+DWORD WINAPI CrashReportThread(LPVOID p) {
+    CrashJob* job = static_cast<CrashJob*>(p);
+    WriteCrashReport(job->info, job->tid);
+    return 0;
+}
+
+LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return g_prevFilter ? g_prevFilter(info) : EXCEPTION_CONTINUE_SEARCH;
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+        static CrashJob job;
+        job = {info, GetCurrentThreadId()};
+        HANDLE t = CreateThread(nullptr, 256 * 1024, &CrashReportThread, &job, 0, nullptr);
+        if (t) {
+            WaitForSingleObject(t, 30000);
+            CloseHandle(t);
+        }
+    } else {
+        WriteCrashReport(info, GetCurrentThreadId());
     }
     return g_prevFilter ? g_prevFilter(info) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -148,10 +177,12 @@ void Init() {
 // eccezioni nel loro main guardato) chiudano il gioco senza passare dal
 // filtro (audit 19/10: i minidump mancavano dalle segnalazioni).
 LONG WINAPI FatalVectoredHandler(EXCEPTION_POINTERS* info) {
+    // Solo gli errori sempre fatali: istruzioni illegali e privilegiate le
+    // usano di proposito alcune librerie per sondare la CPU (dentro __try), e
+    // contarle come crash consumava l'unico minidump (audit 20/10). Quelle
+    // vere arrivano comunque al filtro normale.
     switch (info->ExceptionRecord->ExceptionCode) {
     case EXCEPTION_STACK_OVERFLOW:
-    case EXCEPTION_ILLEGAL_INSTRUCTION:
-    case EXCEPTION_PRIV_INSTRUCTION:
     case 0xC0000374:  // STATUS_HEAP_CORRUPTION
         CrashFilter(info);
         break;

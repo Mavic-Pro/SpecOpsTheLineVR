@@ -167,6 +167,11 @@ extern std::atomic<uint32_t> g_weaponPtr;
 // alle esecuzioni gira il corpo verso il nemico a terra prima che il gioco
 // veda il tasto (vedi ExecutionAssist in hooks.cpp).
 extern std::atomic<uint64_t> g_meleeIntentMs;
+// Gioco in chiusura (WM_CLOSE / WM_DESTROY della finestra): la mod smette di
+// toccare camera, PlayerController e finestra e di inviare al visore. Il
+// gioco si chiudeva a volte con un crash nel suo codice (PlayerController
+// senza Pawn, 20/10) mentre gli hook continuavano a scrivere.
+extern std::atomic<bool> g_exiting;
 // "execassist on|off" (predefinito on).
 extern std::atomic<bool> g_execAssist;
 extern std::atomic<int32_t> g_weaponAmmo[2];

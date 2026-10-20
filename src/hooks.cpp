@@ -221,6 +221,8 @@ HRESULT WINAPI Hooked_Reset(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* param
     if (params) params->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     HRESULT hr = g_Reset_Original(self, params);
     vr::log::Line("Device reset, hr=" + std::to_string(hr));
+    if (SUCCEEDED(hr) && params)
+        vr::display::SetWantedClientSize(static_cast<int>(params->BackBufferWidth), static_cast<int>(params->BackBufferHeight));
     return hr;
 }
 
@@ -3003,7 +3005,9 @@ void* GetViewportDrawThunkAddress() {
 
 inline bool MaybeApplyCameraOverride(void* dst, size_t n) {
     char* cam = static_cast<char*>(g_cameraPtr.load(std::memory_order_relaxed));
-    if (!cam || vr::control::g_cinemaActive.load(std::memory_order_relaxed)) return false;
+    if (!cam || vr::control::g_cinemaActive.load(std::memory_order_relaxed) ||
+        vr::control::g_exiting.load(std::memory_order_relaxed))
+        return false;
     char* d = static_cast<char*>(dst);
     bool coversLocation = d <= cam + 0x10 && d + n >= cam + 0x1C;
     if (coversLocation && HasCameraSignature(cam)) {
@@ -3262,6 +3266,13 @@ bool AddControllerYaw(void* pc, int32_t delta) {
 
 void UpdateHeadTracking() {
     g_tickHmdPoseValid = false;
+    if (vr::control::g_exiting) {
+        g_deltaYaw = 0;
+        g_deltaPitch = 0;
+        g_deltaRoll = 0;
+        for (auto& v : g_headOffset) v = 0.0f;
+        return;
+    }
     static int frame = 0;
     bool shouldLog = (++frame % 120 == 0);
 

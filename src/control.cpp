@@ -157,6 +157,7 @@ std::atomic<int> g_projLogSeconds{0};
 std::atomic<bool> g_rightTriggerHeld{false};
 std::atomic<uint32_t> g_weaponPtr{0};
 std::atomic<uint64_t> g_meleeIntentMs{0};
+std::atomic<bool> g_exiting{false};
 std::atomic<bool> g_execAssist{true};
 std::atomic<int32_t> g_weaponAmmo[2] = {{-1}, {-1}};
 std::atomic<bool> g_squadButtonHeld{false};
@@ -927,6 +928,25 @@ void ExecuteNormalized(const std::string& line) {
 // specopsvr.ini (accanto alla dll): stessi comandi di specopsvr_cmd.txt,
 // eseguiti una volta all'avvio. Righe vuote e '#' ignorate. Il file NON
 // viene cancellato.
+// Scrittura dell'ini su un file temporaneo e poi sostituzione: prima si
+// riscriveva sul posto, e un crash a meta' lasciava l'ini dell'utente vuoto
+// (audit 20/10).
+void WriteIniLines(const std::string& path, const std::vector<std::string>& lines) {
+    std::string tmp = path + ".tmp";
+    {
+        std::ofstream o(tmp, std::ios::trunc);
+        for (const auto& l : lines) o << l << "\n";
+        if (!o) {
+            vr::log::Line("CONFIG: cannot write " + tmp + ", specopsvr.ini left unchanged.");
+            return;
+        }
+    }
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        vr::log::Line("CONFIG: cannot replace specopsvr.ini (error " + std::to_string(GetLastError()) + ").");
+        DeleteFileA(tmp.c_str());
+    }
+}
+
 void SaveIniValue(const std::string& key, const std::string& value) {
     std::string path = ModuleDirectory() + "\\specopsvr.ini";
     std::vector<std::string> lines;
@@ -943,8 +963,7 @@ void SaveIniValue(const std::string& key, const std::string& value) {
         }
     }
     if (!done) lines.push_back(key + " " + value);
-    std::ofstream o(path, std::ios::trunc);
-    for (const auto& l : lines) o << l << "\n";
+    WriteIniLines(path, lines);
     vr::log::Line("CONFIG: saved \"" + key + " " + value + "\" in specopsvr.ini");
 }
 
@@ -994,8 +1013,7 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
         lines.push_back("# Settings format version (updated automatically).");
         lines.push_back("configversion " + std::to_string(kConfigVersion));
     }
-    std::ofstream o(path, std::ios::trunc);
-    for (const auto& l : lines) o << l << "\n";
+    WriteIniLines(path, lines);
     vr::log::Line("CONFIG: specopsvr.ini updated to version " + std::to_string(kConfigVersion) + ":" +
                   (done.empty() ? std::string(" no default to change") : done));
 }

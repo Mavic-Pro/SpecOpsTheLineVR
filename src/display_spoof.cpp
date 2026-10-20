@@ -144,9 +144,14 @@ int g_wantedHeight = 0;
 // finestra e' stata minimizzata alla chiusura della dashboard di SteamVR, UE3
 // ha ridotto il viewport a 0x0 (SetWindowPos 6x40) e il video Bink del menu e'
 // andato in crash in binkw32.dll scrivendo oltre il suo buffer ("Fatal error").
+// Visore in uso: sessione Scene e visore indossato. Solo Scene non bastava:
+// la mod resta in Scene per tutta la partita, e tolto il visore la finestra
+// non si poteva piu' minimizzare (audit 20/10).
+bool HeadsetInUse() { return vr::session::IsScene() && vr::session::HmdPresent(); }
+
 BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
     BOOL ok = g_GetClientRect_Real(h, r);
-    if (ok && r && h == g_gameWindow && g_wantedWidth > 0 && (!IsIconic(h) || vr::session::IsScene())) {
+    if (ok && r && h == g_gameWindow && g_wantedWidth > 0 && (!IsIconic(h) || HeadsetInUse())) {
         r->left = r->top = 0;
         r->right = g_wantedWidth;
         r->bottom = g_wantedHeight;
@@ -159,11 +164,20 @@ LONG volatile g_wndMessages = 0;
 
 LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     InterlockedIncrement(&g_wndMessages);
+    if (msg == WM_CLOSE || msg == WM_DESTROY || (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE)) {
+        if (!vr::control::g_exiting.exchange(true)) vr::log::Line("DISPLAY: game window closing, the mod stops touching the game.");
+    }
+    if (msg == WM_NCDESTROY && g_originalWndProc) {
+        // Finestra distrutta: si rimette la procedura del gioco e ci si toglie.
+        WNDPROC orig = g_originalWndProc;
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(orig));
+        return CallWindowProcW(orig, hwnd, msg, wp, lp);
+    }
     // Col visore in uso la finestra del gioco che perde il focus (clic sul
     // desktop di Virtual Desktop, una notifica) non deve mettere in pausa il
     // gioco ne' fermare l'input: i messaggi di disattivazione non arrivano
     // al gioco ("keepfocus off" per il comportamento normale; audit 19/10).
-    if (vr::control::g_keepFocus && vr::session::IsScene()) {
+    if (vr::control::g_keepFocus && HeadsetInUse()) {
         bool deactivate = (msg == WM_ACTIVATEAPP && wp == FALSE) || (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) ||
                           msg == WM_KILLFOCUS;
         if (deactivate) {
@@ -209,9 +223,25 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // concatenando la procedura nuova (che non richiama la nostra: niente cicli).
 void KeepSubclass() {
     HWND h = g_gameWindow;
-    if (!h || !g_originalWndProc) return;
+    if (!h || !g_originalWndProc || vr::control::g_exiting) return;
     WNDPROC cur = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_WNDPROC));
     if (!cur || cur == &UnclampedWndProc) return;
+    // Solo procedure dell'exe del gioco: un altro programma che sottoclassa
+    // dopo di noi (Special K, rimappatori) chiama gia' la nostra; rimetterci
+    // davanti creava un ciclo infinito fino all'esaurimento dello stack
+    // (audit 20/10). In quel caso si lascia stare, una volta per tutte.
+    uintptr_t a = reinterpret_cast<uintptr_t>(cur);
+    if (a < 0x00401000 || a >= 0x01109000) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            char b[120];
+            std::snprintf(b, sizeof(b), "DISPLAY: window procedure %p belongs to another program, left in front.",
+                          reinterpret_cast<void*>(cur));
+            vr::log::Line(b);
+        }
+        return;
+    }
     g_originalWndProc = cur;
     SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&UnclampedWndProc));
     static int logged = 0;
@@ -220,6 +250,13 @@ void KeepSubclass() {
         std::snprintf(b, sizeof(b), "DISPLAY: window procedure replaced by the game (%p), ours put back in front.",
                       reinterpret_cast<void*>(cur));
         vr::log::Line(b);
+    }
+}
+
+void SetWantedClientSize(int w, int h) {
+    if (g_gameWindow && w > 0 && h > 0) {
+        g_wantedWidth = w;
+        g_wantedHeight = h;
     }
 }
 

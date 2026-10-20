@@ -3,6 +3,7 @@
 #include "logger.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <openvr.h>
 
 #include <atomic>
@@ -87,6 +88,10 @@ void ConfigureReprojection() {
                                                        system, sizeof(system));
         vr::VRSystem()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_ModelNumber_String, model,
                                                        sizeof(model));
+        // Gioco avviato senza SteamVR: al primo controllo il driver del visore
+        // non ha ancora pubblicato le proprieta' e "system" e' vuoto; si
+        // riprova (prima ASW di Link e avviso per VD saltavano; audit 20/10).
+        if (!system[0]) return;
         done = true;
         vr::log::Line(std::string("VR: headset ") + model + ", tracking system " + system + ".");
         if (vr::control::g_motionSmoothingOff && vr::VRSettings() && vr::VRApplications() &&
@@ -219,7 +224,18 @@ bool PollEvents() {
             vr::control::g_vrProjectionDirty = true;
             break;
         case vr::VREvent_PropertyChanged:
-            if (ev.trackedDeviceIndex == vr::k_unTrackedDeviceIndex_Hmd) vr::control::g_vrProjectionDirty = true;
+            // Solo proprieta' che cambiano la proiezione: Quest e VD mandano
+            // spesso batteria e simili, e ogni volta si ricalcolava tutto
+            // (audit 20/10).
+            if (ev.trackedDeviceIndex == vr::k_unTrackedDeviceIndex_Hmd) {
+                vr::ETrackedDeviceProperty prop = ev.data.property.prop;
+                if (prop == vr::Prop_UserIpdMeters_Float || prop == vr::Prop_DisplayFrequency_Float ||
+                    prop == vr::Prop_UserHeadToEyeDepthMeters_Float || prop == vr::Prop_LensCenterLeftU_Float ||
+                    prop == vr::Prop_LensCenterLeftV_Float || prop == vr::Prop_LensCenterRightU_Float ||
+                    prop == vr::Prop_LensCenterRightV_Float || prop == vr::Prop_ScreenshotHorizontalFieldOfViewDegrees_Float ||
+                    prop == vr::Prop_DisplayMCImageWidth_Int32 || prop == vr::Prop_DisplayMCImageHeight_Int32)
+                    vr::control::g_vrProjectionDirty = true;
+            }
             break;
         case vr::VREvent_Quit:
         case vr::VREvent_DriverRequestedQuit:
@@ -232,6 +248,18 @@ bool PollEvents() {
         }
     }
     return keep;
+}
+
+// vrserver.exe in esecuzione (per accorgersi di SteamVR morto senza evento).
+bool VrServerRunning() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return true;  // nel dubbio: vivo
+    PROCESSENTRY32W e = {sizeof(e)};
+    bool found = false;
+    for (BOOL ok = Process32FirstW(snap, &e); ok && !found; ok = Process32NextW(snap, &e))
+        found = _wcsicmp(e.szExeFile, L"vrserver.exe") == 0;
+    CloseHandle(snap);
+    return found;
 }
 
 void MonitorLoop() {
@@ -268,6 +296,26 @@ void MonitorLoop() {
                     vr::log::Line(open ? "OpenVR: dashboard open (state resync)." : "OpenVR: dashboard closed (state resync).");
             }
         }
+        // SteamVR morto senza l'evento di uscita (chiuso dal Task Manager,
+        // crash del driver di Link o VD): vrserver.exe sparito per 5 s = come
+        // un'uscita, e ci si ricollega quando torna (audit 20/10).
+        {
+            static ULONGLONG serverMissingSince = 0, lastCheck = 0;
+            ULONGLONG t = GetTickCount64();
+            if (t - lastCheck > 2000) {
+                lastCheck = t;
+                if (VrServerRunning()) {
+                    serverMissingSince = 0;
+                } else {
+                    if (!serverMissingSince) serverMissingSince = t;
+                    if (t - serverMissingSince > 5000) {
+                        vr::log::Line("OpenVR: vrserver.exe is gone (SteamVR crashed or was closed), VR session ended.");
+                        serverMissingSince = 0;
+                        quit = true;
+                    }
+                }
+            }
+        }
         if (quit) {
             AcquireSRWLockExclusive(&g_lock);
             vr::VR_Shutdown();
@@ -276,6 +324,11 @@ void MonitorLoop() {
             ++g_generation;
             ReleaseSRWLockExclusive(&g_lock);
             vr::control::g_vrDashboard = false;
+            // Stato del visore da rifare da capo: con il vecchio "indossato"
+            // e la Scene che non si lascia piu', al ritorno di SteamVR col
+            // visore sul tavolo si restava in Scene (audit 20/10).
+            g_present = false;
+            inactiveSince = lastActive = standbySince = 0;
             lastRetry = GetTickCount64();
             continue;
         }
@@ -346,7 +399,14 @@ void MonitorLoop() {
         ULONGLONG now = GetTickCount64();
         if (wantScene) {
             inactiveSince = 0;
-            if (!g_scene) Switch(vr::VRApplication_Scene);
+            // Dopo un passaggio a Scene fallito si riprova ogni 5 s, non ogni
+            // 500 ms (ogni tentativo e' Shutdown + due Init sotto il lock
+            // esclusivo: testa e comandi fermi; audit 20/10).
+            static ULONGLONG lastSceneTry = 0;
+            if (!g_scene && now - lastSceneTry > 5000) {
+                lastSceneTry = now;
+                Switch(vr::VRApplication_Scene);
+            }
             if (g_scene) ConfigureReprojection();
         } else if (g_scene) {
             if (!inactiveSince) inactiveSince = now;

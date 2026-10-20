@@ -22,6 +22,11 @@ void UnclampWindow(HWND window, int clientWidth, int clientHeight);
 // richiamare la nostra: va ricontrollato a ogni frame (EndScene).
 void KeepSubclass();
 
+// Dimensione client riportata da GetClientRect: aggiornata a ogni Reset del
+// device (setres della risoluzione automatica; prima restava quella di
+// CreateDevice e UE3 poteva tornare alla vecchia; audit 20/10).
+void SetWantedClientSize(int w, int h);
+
 // Diagnostica ("wndinfo"): procedura di finestra attiva e messaggi ricevuti.
 void LogWindowInfo();
 

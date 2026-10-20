@@ -85,19 +85,22 @@ void Rumble(unsigned char power, float seconds, int channel) {
     }
 }
 
-std::string SelfDirectory() {
-    char path[MAX_PATH] = {};
+// Percorsi in Unicode: una cartella del gioco con caratteri fuori dalla
+// code page ANSI (nomi utente, librerie Steam) faceva fallire estrazione e
+// avvio del ponte (audit 20/10).
+std::wstring SelfDirectoryW() {
+    wchar_t path[MAX_PATH] = {};
     HMODULE self = nullptr;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCSTR>(&SelfDirectory), &self);
-    GetModuleFileNameA(self, path, MAX_PATH);
-    std::string dir(path);
-    return dir.substr(0, dir.find_last_of("\\/") + 1);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&SelfDirectoryW), &self);
+    GetModuleFileNameW(self, path, MAX_PATH);
+    std::wstring dir(path);
+    return dir.substr(0, dir.find_last_of(L"\\/") + 1);
 }
 
 // Il ponte e' incorporato in d3d9.dll: lo riscrive accanto al gioco solo se
 // manca o e' diverso (dopo un aggiornamento della mod).
-bool ExtractBridge(const std::string& exe) {
+bool ExtractBridge(const std::wstring& exe) {
     HMODULE self = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCSTR>(&ExtractBridge), &self);
@@ -106,7 +109,7 @@ bool ExtractBridge(const std::string& exe) {
     const char* data = h ? static_cast<const char*>(LockResource(h)) : nullptr;
     DWORD size = res ? SizeofResource(self, res) : 0;
     if (!data || !size) return false;
-    HANDLE f = CreateFileA(exe.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE f = CreateFileW(exe.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
         std::vector<char> cur(size + 1);
         DWORD got = 0;
@@ -114,15 +117,15 @@ bool ExtractBridge(const std::string& exe) {
         CloseHandle(f);
         if (same) return true;
     }
-    std::string tmp = exe + ".new";
-    f = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    std::wstring tmp = exe + L".new";
+    f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     DWORD put = 0;
     bool ok = WriteFile(f, data, size, &put, nullptr) && put == size;
     CloseHandle(f);
-    if (!ok || !MoveFileExA(tmp.c_str(), exe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        DeleteFileA(tmp.c_str());
-        return GetFileAttributesA(exe.c_str()) != INVALID_FILE_ATTRIBUTES;  // vecchia copia ancora utilizzabile
+    if (!ok || !MoveFileExW(tmp.c_str(), exe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        return GetFileAttributesW(exe.c_str()) != INVALID_FILE_ATTRIBUTES;  // vecchia copia ancora utilizzabile
     }
     return true;
 }
@@ -130,8 +133,8 @@ bool ExtractBridge(const std::string& exe) {
 // Avvia il ponte, si collega alla sua pipe e gli inoltra i comandi in coda
 // (thread proprio: il gioco non aspetta mai il Bluetooth).
 void BridgeThread() {
-    std::string dir = SelfDirectory();
-    std::string exe = dir + "specopsvr_protube.exe";
+    std::wstring dir = SelfDirectoryW();
+    std::wstring exe = dir + L"specopsvr_protube.exe";
     if (!ExtractBridge(exe)) {
         vr::log::Line("HAPTICS: ProTube off (cannot write specopsvr_protube.exe next to the game).");
         return;
@@ -139,10 +142,11 @@ void BridgeThread() {
     DWORD pid = GetCurrentProcessId();
     std::string shortName = "SpecOpsVR_ProTube_" + std::to_string(pid);
     std::string pipeName = "\\\\.\\pipe\\" + shortName;
-    std::string cmd = "\"" + exe + "\" " + std::to_string(pid) + " " + shortName;
-    STARTUPINFOA si = {sizeof(si)};
+    std::wstring cmd = L"\"" + exe + L"\" " + std::to_wstring(pid) + L" " +
+                       std::wstring(shortName.begin(), shortName.end());
+    STARTUPINFOW si = {sizeof(si)};
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si,
+    if (!CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si,
                         &pi)) {
         vr::log::Line("HAPTICS: ProTube off (cannot start specopsvr_protube.exe, error " +
                       std::to_string(GetLastError()) + ").");
@@ -189,8 +193,7 @@ void BridgeThread() {
 
 void StartProTube() {
     if (!vr::control::g_protube) return;
-    std::string dir = SelfDirectory();
-    HMODULE dll = LoadLibraryA((dir + "ForceTubeVR_API_x32.dll").c_str());
+    HMODULE dll = LoadLibraryW((SelfDirectoryW() + L"ForceTubeVR_API_x32.dll").c_str());
     if (!dll) {
         std::thread(BridgeThread).detach();
         return;
@@ -287,8 +290,11 @@ void BHapticsThread() {
             g_bhConnected = false;
             vr::log::Line("HAPTICS: bHaptics Player disconnected.");
             WinHttpWebSocketClose(ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
-            reader.join();
+            // Prima si chiude l'handle (annulla la ricezione in corso), poi si
+            // aspetta il lettore: al contrario, con il socket mezzo aperto il
+            // thread restava appeso per sempre (audit 20/10).
             WinHttpCloseHandle(ws);
+            reader.join();
         } else if (!loggedFail) {
             loggedFail = true;
             vr::log::Line("HAPTICS: bHaptics Player not running (retrying every 10 s).");

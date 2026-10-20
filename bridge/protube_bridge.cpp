@@ -158,6 +158,15 @@ int wmain(int argc, wchar_t** argv) {
         return 6;
     }
     Log("loaded %s", Narrow(dllPath).c_str());
+    // Pipe prima di InitPistol: se il Bluetooth tarda, la mod si collega
+    // comunque e non rinuncia dopo 30 s lasciando il ponte acceso (audit 20/10).
+    HANDLE pipe = CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
+                                   PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 0, 4096, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        Log("CreateNamedPipe %s failed (%lu)", Narrow(pipeName).c_str(), GetLastError());
+        return 7;
+    }
+
     // InitPistol: il primo ProVolver trovato va nel canale pistol1 (mano
     // dell'arma), il secondo in pistol2 (mano d'appoggio).
     init();
@@ -181,12 +190,6 @@ int wmain(int argc, wchar_t** argv) {
         }, reinterpret_cast<LPVOID>(list), 0, nullptr);
     }
 
-    HANDLE pipe = CreateNamedPipeW(pipeName.c_str(), PIPE_ACCESS_INBOUND,
-                                   PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 0, 4096, 0, nullptr);
-    if (pipe == INVALID_HANDLE_VALUE) {
-        Log("CreateNamedPipe %s failed (%lu)", Narrow(pipeName).c_str(), GetLastError());
-        return 7;
-    }
     if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) {
         Log("ConnectNamedPipe failed (%lu)", GetLastError());
         return 8;
