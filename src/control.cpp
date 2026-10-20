@@ -155,6 +155,10 @@ std::atomic<bool> g_spread{true};
 std::atomic<bool> g_fireLog{false};
 std::atomic<int> g_projLogSeconds{0};
 std::atomic<bool> g_rightTriggerHeld{false};
+std::atomic<uint32_t> g_weaponPtr{0};
+std::atomic<uint64_t> g_meleeIntentMs{0};
+std::atomic<bool> g_execAssist{true};
+std::atomic<int32_t> g_weaponAmmo[2] = {{-1}, {-1}};
 std::atomic<bool> g_squadButtonHeld{false};
 std::atomic<bool> g_autoUpdate{true};
 std::atomic<bool> g_updateBeta{false};
@@ -283,8 +287,26 @@ void Execute(const std::string& raw) {
 
 // Comandi aggiunti con l'audit del 19/10, fuori dalla catena principale di
 // Execute (MSVC ha un limite di annidamento degli else if).
+// Valori on/off dell'ini: accetta anche 1/0, true/false, yes/no (prima
+// "spread 1" spegneva la dispersione e "marker 0" lasciava il mirino acceso).
+// Un valore non riconosciuto lascia il predefinito e lo scrive nel log
+// (audit 20/10).
+bool OnOff(const std::string& cmd, const std::string& v, bool def) {
+    std::string l;
+    for (char c : v) l += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (l == "on" || l == "1" || l == "true" || l == "yes") return true;
+    if (l == "off" || l == "0" || l == "false" || l == "no") return false;
+    vr::log::Line("CONFIG: \"" + cmd + " " + v + "\" not understood (expected on or off), using " +
+                  (def ? "on" : "off") + ".");
+    return def;
+}
+
 bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
-    if (cmd == "wndinfo") {
+    if (cmd == "execassist") {
+        std::string v;
+        in >> v;
+        g_execAssist = OnOff(cmd, v, true);
+    } else if (cmd == "wndinfo") {
         vr::display::LogWindowInfo();
     } else if (cmd == "protubetest") {
         // Prova del rinculo senza sparare: un colpo da cecchino a due mani.
@@ -308,15 +330,15 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
     } else if (cmd == "vsdiag") {
         std::string v;
         in >> v;
-        g_vsDiag = (v == "on");
+        g_vsDiag = OnOff(cmd, v, false);
     } else if (cmd == "fades") {
         std::string v;
         in >> v;
-        g_fades = (v != "off");
+        g_fades = OnOff(cmd, v, true);
     } else if (cmd == "snapfade") {
         std::string v;
         in >> v;
-        g_snapFade = (v != "off");
+        g_snapFade = OnOff(cmd, v, true);
     } else if (cmd == "crouchview") {
         std::string v;
         in >> v;
@@ -324,11 +346,11 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
     } else if (cmd == "keepfocus") {
         std::string v;
         in >> v;
-        g_keepFocus = (v != "off");
+        g_keepFocus = OnOff(cmd, v, true);
     } else if (cmd == "roomscale") {
         std::string v;
         in >> v;
-        g_roomScale = (v != "off");
+        g_roomScale = OnOff(cmd, v, true);
     } else if (cmd == "height") {
         std::string v;
         in >> v;
@@ -336,7 +358,7 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
     } else if (cmd == "seated") {
         std::string v;
         in >> v;
-        g_seated = (v == "on");
+        g_seated = OnOff(cmd, v, false);
     } else {
         return false;
     }
@@ -440,7 +462,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "6dof") {
         std::string v;
         in >> v;
-        g_sixDof = (v != "off");
+        g_sixDof = OnOff(cmd, v, true);
     } else if (cmd == "posscale") {
         float v = 50.0f;
         in >> v;
@@ -458,7 +480,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "gun") {
         std::string v;
         in >> v;
-        g_gunInHand = (v != "off");
+        g_gunInHand = OnOff(cmd, v, true);
     } else if (cmd == "gunoffset") {
         float f = 0, r = 0, u = 0;
         in >> f >> r >> u;
@@ -468,11 +490,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "arms") {
         std::string v;
         in >> v;
-        g_arms = (v != "off");
+        g_arms = OnOff(cmd, v, true);
     } else if (cmd == "autoupdate") {
         std::string v;
         in >> v;
-        g_autoUpdate = (v != "off");
+        g_autoUpdate = OnOff(cmd, v, true);
     } else if (cmd == "updatechannel") {
         std::string v;
         in >> v;
@@ -489,11 +511,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "firelog") {
         std::string v;
         in >> v;
-        g_fireLog = (v != "off");
+        g_fireLog = OnOff(cmd, v, true);
     } else if (cmd == "spread") {
         std::string v;
         in >> v;
-        g_spread = (v == "on");
+        g_spread = OnOff(cmd, v, false);
     } else if (cmd == "aimassist") {
         std::string v;
         in >> v;
@@ -501,11 +523,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "muzzleaim") {
         std::string v;
         in >> v;
-        g_muzzleAim = (v != "off");
+        g_muzzleAim = OnOff(cmd, v, true);
     } else if (cmd == "fpbody") {
         std::string v;
         in >> v;
-        g_fpBody = (v != "off");
+        g_fpBody = OnOff(cmd, v, true);
     } else if (cmd == "gesturelog") {
         int n = 240;
         in >> n;
@@ -517,13 +539,13 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "leftgrip") {
         std::string v;
         in >> v;
-        g_leftGrip = (v != "off");
+        g_leftGrip = OnOff(cmd, v, true);
         float cm = 0.0f;
         if (in >> cm && cm > 0.0f) g_leftGripCm = cm;
     } else if (cmd == "bodyfollow") {
         std::string v;
         in >> v;
-        g_bodyFollowsHead = (v != "off");
+        g_bodyFollowsHead = OnOff(cmd, v, true);
     } else if (cmd == "bodyback") {
         float v = 0, look = 10.0f;
         in >> v >> look;
@@ -571,7 +593,7 @@ void ExecuteNormalized(const std::string& line) {
         std::string v;
         float d = 0.0f;
         in >> v >> d;
-        g_armSkelFix = (v != "off");
+        g_armSkelFix = OnOff(cmd, v, true);
         if (d > 0.0f) g_armSkelFixDist = d;
     } else if (cmd == "skellog") {
         int v = 200;
@@ -586,7 +608,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "twohand") {
         std::string v;
         in >> v;
-        g_twoHand = (v != "off");
+        g_twoHand = OnOff(cmd, v, true);
     } else if (cmd == "synthleft") {
         float f = 0, r = 0, u = 0;
         in >> f >> r >> u;
@@ -597,12 +619,15 @@ void ExecuteNormalized(const std::string& line) {
         // gesture grenade|reload|cover|all on|off
         std::string which, v;
         in >> which >> v;
-        bool on = (v != "off");
+        bool on = OnOff(cmd, v, true);
         if (which == "grenade" || which == "all") g_gestureGrenade = on;
         if (which == "melee" || which == "all") g_gestureMelee = on;
         if (which == "reload" || which == "all") g_gestureReload = on;
         if (which == "cover" || which == "all") g_gestureCover = on;
         if (which == "weapon" || which == "all") g_gestureWeapon = on;
+        if (which != "grenade" && which != "melee" && which != "reload" && which != "cover" && which != "weapon" &&
+            which != "all")
+            vr::log::Line("CONFIG: unknown gesture \"" + which + "\" (grenade, melee, reload, cover, weapon, all).");
     } else if (cmd == "reload") {
         // reload physical|simple
         std::string v;
@@ -630,7 +655,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "scopezoom") {
         std::string v;
         in >> v;
-        g_scopeZoom = (v != "off");
+        g_scopeZoom = OnOff(cmd, v, true);
     } else if (cmd == "synthhand") {
         float f = 0, r = 0, u = 0;
         in >> f >> r >> u;
@@ -655,11 +680,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "marker") {
         std::string v;
         in >> v;
-        g_aimMarker = (v != "off");
+        g_aimMarker = OnOff(cmd, v, true);
     } else if (cmd == "headcollision") {
         std::string v;
         in >> v;
-        g_headCollision = (v != "off");
+        g_headCollision = OnOff(cmd, v, true);
     } else if (cmd == "snapturn") {
         float v = 0.0f;
         in >> v;
@@ -667,7 +692,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "stickpitch") {
         std::string v;
         in >> v;
-        g_stickPitch = (v == "on");
+        g_stickPitch = OnOff(cmd, v, false);
     } else if (cmd == "vignette") {
         float v = 0.0f;
         in >> v;
@@ -706,19 +731,19 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "gpucopy") {
         std::string v;
         in >> v;
-        g_gpuCopy = (v != "off");
+        g_gpuCopy = OnOff(cmd, v, true);
     } else if (cmd == "paircheck") {
         std::string v;
         in >> v;
-        g_pairCheck = (v == "on");
+        g_pairCheck = OnOff(cmd, v, false);
     } else if (cmd == "submitpose") {
         std::string v;
         in >> v;
-        g_submitWithPose = (v != "off");
+        g_submitWithPose = OnOff(cmd, v, true);
     } else if (cmd == "threadlag") {
         std::string v;
         in >> v;
-        g_threadLag = (v != "off");
+        g_threadLag = OnOff(cmd, v, true);
     } else if (cmd == "motionsmoothing") {
         std::string v;
         in >> v;
@@ -730,7 +755,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "gputimer") {
         std::string v;
         in >> v;
-        g_gpuTimer = (v != "off");
+        g_gpuTimer = OnOff(cmd, v, true);
     } else if (cmd == "resolution") {
         std::string v;
         in >> v;
@@ -738,11 +763,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "lowlatency") {
         std::string v;
         in >> v;
-        g_lowLatency = (v != "off");
+        g_lowLatency = OnOff(cmd, v, true);
     } else if (cmd == "vrpreset") {
         std::string v;
         in >> v;
-        g_vrPreset = (v != "off");
+        g_vrPreset = OnOff(cmd, v, true);
     } else if (cmd == "dynres") {
         std::string v;
         in >> v;
@@ -757,7 +782,7 @@ void ExecuteNormalized(const std::string& line) {
             in >> m;
             g_dynResMin = m < 40 ? 40 : (m > 100 ? 100 : m);
         } else {
-            g_dynRes = (v != "off");
+            g_dynRes = OnOff(cmd, v, true);
         }
     } else if (cmd == "eyecant") {
         float d = 0.0f;
@@ -766,18 +791,18 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "offcenter") {
         std::string v;
         in >> v;
-        g_offCenter = (v != "off");
+        g_offCenter = OnOff(cmd, v, true);
     } else if (cmd == "projflip") {
         // Prova nel visore: alto e basso del frustum degli occhi scambiati
         // (on = come fino alla 0.9.5).
         std::string v;
         in >> v;
-        g_projFlip = (v == "on");
+        g_projFlip = OnOff(cmd, v, false);
         vr::log::Line(std::string("CMD: projflip ") + (g_projFlip ? "on" : "off"));
     } else if (cmd == "eyestate") {
         std::string v;
         in >> v;
-        g_perEyeViewState = (v != "off");
+        g_perEyeViewState = OnOff(cmd, v, true);
     } else if (cmd == "vrinput") {
         std::string v;
         in >> v;
@@ -789,7 +814,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "gamecrosshair") {
         std::string v;
         in >> v;
-        g_gameCrosshair = (v == "on");
+        g_gameCrosshair = OnOff(cmd, v, false);
     } else if (cmd == "protube") {
         std::string v;
         in >> v;
@@ -798,7 +823,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "bhaptics") {
         std::string v;
         in >> v;
-        g_bhaptics = (v != "off");
+        g_bhaptics = OnOff(cmd, v, true);
     } else if (cmd == "cinemawalker") {
         std::string v;
         in >> v;
@@ -806,7 +831,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "ads") {
         std::string v;
         in >> v;
-        g_adsEnabled = (v != "off");
+        g_adsEnabled = OnOff(cmd, v, true);
     } else if (cmd == "turretaim") {
         std::string v;
         in >> v;
@@ -814,11 +839,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "coversnap") {
         std::string v;
         in >> v;
-        g_coverSnapCompensate = (v != "off");
+        g_coverSnapCompensate = OnOff(cmd, v, true);
     } else if (cmd == "coverpeek") {
         std::string v;
         in >> v;
-        g_coverPeekEnabled = (v != "off");
+        g_coverPeekEnabled = OnOff(cmd, v, true);
     } else if (cmd == "turnwithhead") {
         float v = 45.0f;
         in >> v;
@@ -851,7 +876,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "cinema") {
         std::string v;
         in >> v;
-        g_cinemaEnabled = (v != "off");
+        g_cinemaEnabled = OnOff(cmd, v, true);
         g_cinemaForce = (v == "force");
     } else if (cmd == "cinemasize") {
         float w = 3.2f, d = 2.6f;
@@ -863,7 +888,7 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "mirrorwin") {
         std::string v;
         in >> v;
-        g_mirrorWin = (v != "off");
+        g_mirrorWin = OnOff(cmd, v, true);
     } else if (cmd == "monitor") {
         int v = 1;
         in >> v;
@@ -981,7 +1006,7 @@ std::string ConfigKey(const std::string& line) {
     std::istringstream in(line);
     std::string cmd, sub;
     in >> cmd >> sub;
-    if (cmd == "gesture" || (cmd == "dynres" && (sub == "min" || sub == "budget" || sub == "max"))) return cmd + " " + sub;
+    if (cmd == "gesture" || (cmd == "dynres" && (sub == "min" || sub == "budget"))) return cmd + " " + sub;
     return cmd;
 }
 

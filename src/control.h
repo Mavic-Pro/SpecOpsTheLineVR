@@ -159,6 +159,17 @@ extern std::atomic<bool> g_fireLog;
 extern std::atomic<int> g_projLogSeconds;
 // Grilletto destro premuto (letto dall'input VR): innesca la ricerca dei proiettili lanciati.
 extern std::atomic<bool> g_rightTriggerHeld;
+// Arma corrente del giocatore (puntatore, 0 se nessuna) e munizioni lette a
+// ogni tick (m_currentAmmoCount +0x764, m_currentMagAmmo +0x778): servono
+// alla ricarica fisica per capire se il gioco ha davvero ricaricato.
+extern std::atomic<uint32_t> g_weaponPtr;
+// Ultima pressione di B (tasto o gesto del pugno), GetTickCount64: l'aiuto
+// alle esecuzioni gira il corpo verso il nemico a terra prima che il gioco
+// veda il tasto (vedi ExecutionAssist in hooks.cpp).
+extern std::atomic<uint64_t> g_meleeIntentMs;
+// "execassist on|off" (predefinito on).
+extern std::atomic<bool> g_execAssist;
+extern std::atomic<int32_t> g_weaponAmmo[2];
 // Tasto squadra (RB) premuto nell'input passato al gioco: comando alla squadra.
 extern std::atomic<bool> g_squadButtonHeld;
 // Aggiornamento automatico (updater.cpp): "autoupdate on|off", "updaterepo proprietario/nome".

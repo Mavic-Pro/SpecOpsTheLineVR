@@ -256,6 +256,17 @@ void MonitorLoop() {
         {
             Shared s;
             quit = !PollEvents();
+            // Lo stato della dashboard viene dagli eventi, ma un evento perso
+            // (cambio Background/Scene, focus preso da un'altra app) lasciava
+            // la mod convinta che fosse aperta, con tutti i comandi bloccati:
+            // ogni secondo si riallinea allo stato vero (audit 20/10).
+            static ULONGLONG lastSync = 0;
+            if (!quit && g_scene && vr::VROverlay() && vr::VRSystem() && GetTickCount64() - lastSync > 1000) {
+                lastSync = GetTickCount64();
+                bool open = vr::VROverlay()->IsDashboardVisible() || !vr::VRSystem()->IsInputAvailable();
+                if (vr::control::g_vrDashboard.exchange(open) != open)
+                    vr::log::Line(open ? "OpenVR: dashboard open (state resync)." : "OpenVR: dashboard closed (state resync).");
+            }
         }
         if (quit) {
             AcquireSRWLockExclusive(&g_lock);

@@ -199,6 +199,7 @@ SetTransform_t g_SetTransform_Original = nullptr;
 SetVertexShaderConstantF_t g_SetVertexShaderConstantF_Original = nullptr;
 
 void UpdateHeadTracking();
+void ExecutionAssist(void* pc, void* pawn);
 bool TrySafeReadUint32(void* addr, uint32_t* outValue);
 extern std::atomic<bool> g_onTurret;
 extern std::atomic<int32_t> g_turretYawUnits;
@@ -3320,6 +3321,13 @@ void UpdateHeadTracking() {
             if (haveLeft) ApplyTwoHandAim(right, left);
             else g_twoHandActive = false;
         }
+        {
+            // Aiuto alle esecuzioni anche con le pose finte (test senza visore).
+            uint32_t ctrlPawn = 0;
+            void* pc = g_playerControllerPtr;
+            if (pc && TrySafeReadUint32(static_cast<char*>(pc) + 0x1F8, &ctrlPawn) && ctrlPawn)
+                ExecutionAssist(pc, reinterpret_cast<void*>(ctrlPawn));
+        }
         if (shouldLog) DumpCamera(camera);
         return;
     }
@@ -3541,6 +3549,10 @@ void UpdateHeadTracking() {
         static float entry[3] = {0, 0, 0};
         if (inCover && !wasCover) {
             for (int i = 0; i < 3; ++i) entry[i] = pos[i];
+            // Entrati in copertura in piedi (tasto A): il riferimento e'
+            // l'altezza da accovacciati (25 cm sotto quella in piedi), se no
+            // alzarsi non faceva mai uscire a mirare (audit 20/10).
+            if (posRef[1] > 0.5f && entry[1] > posRef[1] - 0.25f) entry[1] = posRef[1] - 0.25f;
             peeking = false;
         }
         if (inCover && vr::control::g_coverPeekEnabled) {
@@ -3562,7 +3574,17 @@ void UpdateHeadTracking() {
         vr::control::g_coverPeek = peeking;
         wasCover = inCover;
     }
-    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover && !g_gameLockedScene) {
+    {
+        // Pawn controllato: Controller.Pawn (+0x1F8).
+        uint32_t ctrlPawn = 0;
+        if (pcForTurn && TrySafeReadUint32(static_cast<char*>(pcForTurn) + 0x1F8, &ctrlPawn) && ctrlPawn)
+            ExecutionAssist(pcForTurn, reinterpret_cast<void*>(ctrlPawn));
+    }
+    // Non sulle torrette: li' il PlayerController segue il controller (sotto) e
+    // girare la testa oltre la soglia lo tirava verso lo sguardo, con la
+    // torretta che tremava e restava indietro (audit 20/10).
+    if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover && !g_gameLockedScene &&
+        !TurretAimActive()) {
         float ex = std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f);
         static double lastTurnT = 0.0;
         double nowTurn = ProfMs() * 0.001;
@@ -3658,7 +3680,10 @@ void UpdateHeadTracking() {
                     float linePitch = hmdPitch * 57.2957795f;
                     float ctrlPitch = PitchFromOpenVrPose(c) * 57.2957795f;
                     float offset = std::round((linePitch - ctrlPitch) * 2.0f) / 2.0f;
-                    if (offset < -45.0f || offset > 45.0f) {
+                    // Esito diverso al tatto: 150 ms = calibrato, 500 ms = rifiutata
+                    // (prima la stessa vibrazione anche quando falliva; audit 20/10).
+                    bool rejected = offset < -45.0f || offset > 45.0f;
+                    if (rejected) {
                         vr::log::Line("STOCK: calibration out of range (" + std::to_string(offset) +
                                       " deg), ignored: look at the target along the stock and try again.");
                         offset = vr::control::g_aimPitchOffsetDeg;
@@ -3673,9 +3698,10 @@ void UpdateHeadTracking() {
                     vr::control::SaveIniValue("aimpitch", val);
                     vr::TrackedDeviceIndex_t ri2 = vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
                     (void)ri2;
-                    vr::input::PulseHand(1, 150);
+                    vr::input::PulseHand(1, rejected ? 500 : 150);
                 } else {
                     vr::log::Line("STOCK: calibration ignored, controller too close to the headset.");
+                    vr::input::PulseHand(1, 500);
                 }
             }
             // aimpitch (calcio) come rotazione attorno all'asse destro del
@@ -3742,6 +3768,19 @@ void UpdateHeadTracking() {
     // controller destro; la vista non gira (compensazione sopra) e il
     // beccheggio del corpo non entra nella vista. Prima la torretta seguiva lo
     // stick e solo in parte il controller ("had to aim my headset", 18/10).
+    // Scesi dalla torretta: il beccheggio scritto sul PlayerController restava
+    // (lo stick su/giu' e' escluso), e razzi, lanciagranate e il controllo
+    // dell'esecuzione partivano inclinati (audit 20/10).
+    {
+        static bool wasTurret = false;
+        bool turret = TurretAimActive();
+        if (wasTurret && !turret && g_playerControllerPtr && !vr::control::g_stickPitch) {
+            int32_t zero = 0;
+            SafeCopy(static_cast<char*>(g_playerControllerPtr) + 0x60, &zero, 4);
+            vr::log::Line("TURRET: left, PlayerController pitch reset to 0.");
+        }
+        wasTurret = turret;
+    }
     if (TurretAimActive() && g_aimValid && g_playerControllerPtr) {
         char* pc = static_cast<char*>(g_playerControllerPtr);
         int32_t dy = static_cast<int32_t>(g_aimDeltaYaw.load() * 0.35f);
@@ -4996,7 +5035,18 @@ void RedirectNewProjectiles(void* pawn) {
     static int32_t lastAmmo[2] = {-1, -1};
     uint32_t weapon = 0;
     int32_t ammo[2] = {-1, -1};
-    if (!pawn || !TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) || !weapon) return;
+    if (!pawn || !TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) || !weapon) {
+        if (pawn) vr::control::g_weaponPtr = 0;
+        return;
+    }
+    {
+        int32_t a[2] = {-1, -1};
+        SafeCopy(&a[0], reinterpret_cast<char*>(weapon) + 0x764, 4);
+        SafeCopy(&a[1], reinterpret_cast<char*>(weapon) + 0x778, 4);
+        vr::control::g_weaponPtr = weapon;
+        vr::control::g_weaponAmmo[0] = a[0];
+        vr::control::g_weaponAmmo[1] = a[1];
+    }
     // Solo lanciatori (RPG, Milkor): la scansione non costa nulla con le altre armi.
     bool launcher = CurrentWeaponInfo(reinterpret_cast<void*>(weapon)).launcher;
     if (vr::control::g_fireLog) {
@@ -6197,6 +6247,113 @@ void VisibilityCheck(void* pawn) {
     }
 }
 
+// --- Aiuto alle esecuzioni ------------------------------------------------------
+//
+// Il gioco sceglie il nemico a terra da giustiziare con B dentro un box nello
+// spazio del Pawn (YGamePawn.m_executionDetectionParams +0x1D48: avanti
+// -40..95, lati +-95, altezza +-90 unita'), cioe' davanti al corpo di
+// Walker. In VR il corpo non e' dove si guarda (gira solo oltre 45 gradi di
+// testa, mai in copertura) e un nemico di lato o dietro non veniva mai scelto
+// (audit 20/10). Due aiuti:
+//  - box un po' piu' largo su ogni nuovo Pawn di Walker (scarto occhi-corpo,
+//    resto della room-scale);
+//  - alla pressione di B (tasto o gesto) il corpo si gira subito verso il
+//    nemico a terra piu' vicino entro 2 m (m_isDownButNotOut / m_isKnockedDown,
+//    +0x5FC); la vista resta ferma (stessa compensazione di "turnwithhead").
+//    B arriva al gioco dopo (cancello di 120 ms o tick successivo).
+constexpr uintptr_t kOffWorldInfoPawnList = 0x4F4;
+constexpr uintptr_t kOffPawnNextPawn = 0x218;
+constexpr uintptr_t kOffPawnHealth = 0x304;
+constexpr uintptr_t kOffActorWorldInfo = 0xEC;
+constexpr uintptr_t kOffPawnExecDetection = 0x1D48;  // YS_SpecialMoveDetectionParams (3 coppie min/max)
+constexpr uintptr_t kOffPawnDbnoFlags = 0x5FC;
+constexpr uint32_t kDbnoBits = 0x10000 | 0x40000;  // m_isKnockedDown | m_isDownButNotOut
+
+bool IsFriendOrCivilian(const std::string& cls) {
+    return cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos ||
+           cls.find("Walker") != std::string::npos || cls.find("Civil") != std::string::npos ||
+           cls.find("Refugee") != std::string::npos;
+}
+
+void ExecutionAssist(void* pc, void* pawn) {
+    static int diag = 0;
+    if (diag++ == 0) {
+        char d[96];
+        snprintf(d, sizeof(d), "EXECUTE: assist active (pc %p pawn %p)", pc, pawn);
+        vr::log::Line(d);
+    }
+    if (!pawn || !pc || !vr::control::g_execAssist) return;
+    static void* widenedFor = nullptr;
+    if (pawn != widenedFor) {
+        widenedFor = pawn;
+        float cur[6] = {};
+        if (SafeCopy(cur, static_cast<char*>(pawn) + kOffPawnExecDetection, sizeof(cur)) && cur[1] > 0.0f &&
+            cur[1] < 400.0f) {
+            float wide[6] = {(std::min)(cur[0], -80.0f), (std::max)(cur[1], 120.0f), (std::min)(cur[2], -110.0f),
+                             (std::max)(cur[3], 110.0f), (std::min)(cur[4], -120.0f), cur[5]};
+            SafeCopy(static_cast<char*>(pawn) + kOffPawnExecDetection, wide, sizeof(wide));
+            char b[200];
+            snprintf(b, sizeof(b), "EXECUTE: detection box widened, forward %.0f..%.0f side %.0f..%.0f height %.0f..%.0f",
+                     wide[0], wide[1], wide[2], wide[3], wide[4], wide[5]);
+            vr::log::Line(b);
+        }
+    }
+    static uint64_t handled = 0;
+    uint64_t intent = vr::control::g_meleeIntentMs;
+    if (intent == handled || GetTickCount64() - intent > 400) return;
+    handled = intent;
+    if (vr::control::g_cinemaActive || g_gameLockedScene || TurretAimActive()) return;
+    int32_t myHealth = 0;
+    float me[3];
+    uint32_t worldInfo = 0, p = 0;
+    if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnHealth, reinterpret_cast<uint32_t*>(&myHealth)) ||
+        myHealth <= 0 || !SafeCopy(me, static_cast<char*>(pawn) + 0x54, 12) ||
+        !TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo ||
+        !TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + kOffWorldInfoPawnList, &p))
+        return;
+    char* best = nullptr;
+    float bestD = 200.0f, bestLoc[3] = {};
+    for (int guard = 0; p && guard < 512; ++guard) {
+        char* other = reinterpret_cast<char*>(p);
+        uint32_t next = 0, flags = 0;
+        TrySafeReadUint32(other + kOffPawnNextPawn, &next);
+        int32_t health = 0;
+        float loc[3];
+        if (other != pawn && TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&health)) &&
+            health > 0 && TrySafeReadUint32(other + kOffPawnDbnoFlags, &flags) && (flags & kDbnoBits) &&
+            SafeCopy(loc, other + 0x54, 12) && std::fabs(loc[2] - me[2]) < 150.0f) {
+            float d = std::sqrt((loc[0] - me[0]) * (loc[0] - me[0]) + (loc[1] - me[1]) * (loc[1] - me[1]));
+            if (d < bestD && !IsFriendOrCivilian(vr::script::ClassName(other))) {
+                bestD = d;
+                best = other;
+                std::memcpy(bestLoc, loc, sizeof(loc));
+            }
+        }
+        p = next;
+    }
+    if (!best) return;
+    int32_t pcYaw = 0;
+    if (!TrySafeReadUint32(static_cast<char*>(pc) + 0x64, reinterpret_cast<uint32_t*>(&pcYaw))) return;
+    int32_t target = RadiansToUnreal(std::atan2(bestLoc[1] - me[1], bestLoc[0] - me[0]));
+    int32_t delta = static_cast<int16_t>(target - pcYaw);  // la via piu' corta
+    if (std::abs(delta) > 65536 / 72) {  // sotto 5 gradi non serve
+        if (AddControllerYaw(pc, delta)) {
+            g_hmdYawReference += vr::control::g_yawSign * static_cast<float>(delta) * (6.28318530718f / 65536.0f);
+            // Il gioco gira il Pawn da m_lastRotation (+0x1020) verso
+            // m_rotationToFace (+0xDE8) a velocita' limitata: scritti tutti e
+            // tre, il corpo e' girato subito (provato 20/10: resta dov'e').
+            int32_t pawnYaw = target;
+            SafeCopy(static_cast<char*>(pawn) + 0x64, &pawnYaw, 4);
+            SafeCopy(static_cast<char*>(pawn) + 0x1020 + 4, &pawnYaw, 4);
+            SafeCopy(static_cast<char*>(pawn) + 0xDE8 + 4, &pawnYaw, 4);
+        }
+    }
+    char b[160];
+    snprintf(b, sizeof(b), "EXECUTE: B near %s %.0f units away, body turned %.0f degrees toward it",
+             vr::script::ClassName(best).c_str(), bestD, delta * 360.0f / 65536.0f);
+    vr::log::Line(b);
+}
+
 // --- Comando alla squadra lungo la canna ---------------------------------------
 //
 // Tenendo il tasto squadra il gioco sceglie il bersaglio dell'ordine tra gli
@@ -6208,10 +6365,6 @@ void VisibilityCheck(void* pawn) {
 // linea della canna e lo si passa al gioco con SetAsCurrentSelectedMarkable
 // (distanza dal centro 0: vince sulla scelta dello schermo).
 constexpr uintptr_t kOffPcSelectedMarkable = 0xE98;  // m_currentSelectedTacticalMarkable
-constexpr uintptr_t kOffWorldInfoPawnList = 0x4F4;
-constexpr uintptr_t kOffPawnNextPawn = 0x218;
-constexpr uintptr_t kOffPawnHealth = 0x304;
-constexpr uintptr_t kOffActorWorldInfo = 0xEC;
 
 // Bersagli degli ordini che non sono Pawn: YCheapShooter (nemici semplificati
 // che sparano da lontano, es. il cecchino sul cartellone del capitolo 1, che
@@ -7117,8 +7270,13 @@ bool GpuShareRequested() {
     FILE* f = nullptr;
     if (fopen_s(&f, (dir + "\\specopsvr.ini").c_str(), "r") == 0 && f) {
         char line[256];
+        // Solo la prima parola dopo "gpushare", senza badare a spazi iniziali,
+        // maiuscole e commenti ("off" in un commento la spegneva; audit 20/10).
         while (fgets(line, sizeof(line), f)) {
-            if (std::strncmp(line, "gpushare", 8) == 0) on = std::strstr(line, "off") == nullptr;
+            char key[32] = {}, val[32] = {};
+            if (std::sscanf(line, " %31s %31s", key, val) < 1 || _stricmp(key, "gpushare") != 0) continue;
+            on = !(_stricmp(val, "off") == 0 || _stricmp(val, "0") == 0 || _stricmp(val, "false") == 0 ||
+                   _stricmp(val, "no") == 0);
         }
         fclose(f);
     }
