@@ -95,7 +95,7 @@ back to the previous version (it also turns automatic updates off).
 | Right stick | Turn (smooth or snap) |
 | Right trigger / left trigger | Fire / aim |
 | Left grip | Grenade (hold: trajectory, release: throw); on the gun it just holds the gun |
-| Right grip (hold, point the gun at an enemy, release) | Squad attack order |
+| Right grip (hold, point the gun or look at an enemy, release) | Squad attack order |
 | A / B / X / Y | Action-cover / melee / reload / next weapon |
 | B + Y held for 1 s | Gunstock calibration |
 | Left menu button | Pause (hold 0.6 s: Back / objectives) |
@@ -104,8 +104,9 @@ back to the previous version (it also turns automatic updates off).
 
 When the game says **RB** it means the **right grip**. Chapter 1, sniper on the
 billboard ("While holding RB target the enemy, then release"): hold the right
-grip, point the gun at the sniper until it is highlighted, then release. The
-target stays locked until you release, even if the gun drifts off it.
+grip, point the gun **or just look** at the sniper (the red triangle follows
+your view) until it is highlighted, then release. The target stays locked
+until you release, even if the gun drifts off it.
 
 On **Valve Index** controllers A and B on the right hand are A and B, on the
 left hand X and Y; the left trackpad click pauses. Every action can be

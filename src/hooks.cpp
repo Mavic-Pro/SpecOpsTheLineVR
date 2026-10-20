@@ -6603,73 +6603,84 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     static ULONGLONG lastDiag = 0;
     bool diag = vr::control::g_fireLog && GetTickCount64() - lastDiag > 1000;
     if (diag) lastDiag = GetTickCount64();
-    for (int guard = 0; p && guard < 512; ++guard) {
-        char* other = reinterpret_cast<char*>(p);
-        uint32_t next = 0;
-        TrySafeReadUint32(other + kOffPawnNextPawn, &next);
-        int32_t health = 0;
-        float loc[3];
-        if (other != pawn && TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&health)) &&
-            health > 0 && SafeCopy(loc, other + 0x54, 12)) {
-            std::string cls = vr::script::ClassName(other);
-            bool friendOrCivil = cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos ||
-                                 cls.find("Walker") != std::string::npos || cls.find("Civil") != std::string::npos ||
-                                 cls.find("Refugee") != std::string::npos;
-            loc[2] += 30.0f;  // petto
-            float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
-            float along = v[0] * bd[0] + v[1] * bd[1] + v[2] * bd[2];
-            if (!friendOrCivil && along > 50.0f) {
-                float perp[3] = {v[0] - bd[0] * along, v[1] - bd[1] * along, v[2] - bd[2] * along};
-                float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
-                // Tolleranza: 3 gradi, e almeno ~45 unita' (un corpo) da vicino.
-                float tol = std::fmax(along * 0.0524f, 45.0f);
-                float score = off / along;
-                float hitTime = 1.0f;
-                bool blocked = TraceLine(pawn, bo, loc, &hitTime) &&
-                               hitTime * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) <
-                                   std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - 60.0f;
-                if (diag) {
-                    char b[200];
-                    snprintf(b, sizeof(b), "SQUAD check: %s along=%.0f off=%.0f tol=%.0f blocked=%d (hit %.2f)",
-                             cls.c_str(), along, off, tol, (int)blocked, hitTime);
-                    vr::log::Line(b);
-                }
-                if (other == lastPick && !blocked && off < 1.5f * tol) lastPickScore = score;
-                if (off < tol && score < bestScore) {
-                    if (!blocked) {
-                        best = other;
-                        bestScore = score;
+    // Due passate: lungo la canna e, se li' non c'e' nessuno, lungo lo
+    // sguardo. Il gioco mostra il triangolo rosso del bersaglio al centro
+    // della vista: chi lo conosce muove la testa per metterlo sul nemico, non
+    // il fucile (20/10, cecchino sul cartellone: "spostano il triangolo").
+    float hd[3], hr[3], hu[3];
+    RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, hd, hr, hu);
+    const uint32_t pawnList = p;
+    for (int pass = 0; pass < 2 && !best; ++pass) {
+        const float* dir = pass ? hd : bd;
+        p = pawnList;
+        for (int guard = 0; p && guard < 512; ++guard) {
+            char* other = reinterpret_cast<char*>(p);
+            uint32_t next = 0;
+            TrySafeReadUint32(other + kOffPawnNextPawn, &next);
+            int32_t health = 0;
+            float loc[3];
+            if (other != pawn && TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&health)) &&
+                health > 0 && SafeCopy(loc, other + 0x54, 12)) {
+                std::string cls = vr::script::ClassName(other);
+                bool friendOrCivil = cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos ||
+                                     cls.find("Walker") != std::string::npos || cls.find("Civil") != std::string::npos ||
+                                     cls.find("Refugee") != std::string::npos;
+                loc[2] += 30.0f;  // petto
+                float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
+                float along = v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
+                if (!friendOrCivil && along > 50.0f) {
+                    float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
+                    float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+                    // Tolleranza: 3 gradi, e almeno ~45 unita' (un corpo) da vicino.
+                    float tol = std::fmax(along * 0.0524f, 45.0f);
+                    float score = off / along;
+                    float hitTime = 1.0f;
+                    bool blocked = TraceLine(pawn, bo, loc, &hitTime) &&
+                                   hitTime * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) <
+                                       std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - 60.0f;
+                    if (diag) {
+                        char b[200];
+                        snprintf(b, sizeof(b), "SQUAD check: %s along=%.0f off=%.0f tol=%.0f blocked=%d (hit %.2f)",
+                                 cls.c_str(), along, off, tol, (int)blocked, hitTime);
+                        vr::log::Line(b);
+                    }
+                    if (other == lastPick && !blocked && off < 1.5f * tol) lastPickScore = score;
+                    if (off < tol && score < bestScore) {
+                        if (!blocked) {
+                            best = other;
+                            bestScore = score;
+                        }
                     }
                 }
             }
+            p = next;
         }
-        p = next;
-    }
-    // Nemici semplificati (cecchini sui cartelloni, tiratori lontani): niente
-    // controllo di visibilita' (stanno dietro parapetti, sono bersagli
-    // scriptati apposta per gli ordini); il gioco li convalida comunque.
-    for (void* cs : CheapShooters()) {
-        if (cs == pawn || !StillAlive(cs, ObjClass(cs))) continue;
-        float health = 0.0f, loc[3];
-        if (!SafeCopy(&health, static_cast<char*>(cs) + kOffCheapShooterHealth, 4) || !(health > 0.0f) ||
-            !SafeCopy(loc, static_cast<char*>(cs) + 0x54, 12))
-            continue;
-        float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
-        float along = v[0] * bd[0] + v[1] * bd[1] + v[2] * bd[2];
-        if (along <= 50.0f) continue;
-        float perp[3] = {v[0] - bd[0] * along, v[1] - bd[1] * along, v[2] - bd[2] * along};
-        float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
-        float tol = std::fmax(along * 0.0699f, 60.0f);  // 4 gradi: bersagli piccoli e lontani
-        if (diag) {
-            char b[200];
-            snprintf(b, sizeof(b), "SQUAD check: %s (cheap shooter) along=%.0f off=%.0f tol=%.0f health=%.0f",
-                     vr::script::ClassName(cs).c_str(), along, off, tol, health);
-            vr::log::Line(b);
-        }
-        if (cs == lastPick && off < 1.5f * tol) lastPickScore = off / along;
-        if (off < tol && off / along < bestScore) {
-            best = cs;
-            bestScore = off / along;
+        // Nemici semplificati (cecchini sui cartelloni, tiratori lontani): niente
+        // controllo di visibilita' (stanno dietro parapetti, sono bersagli
+        // scriptati apposta per gli ordini); il gioco li convalida comunque.
+        for (void* cs : CheapShooters()) {
+            if (cs == pawn || !StillAlive(cs, ObjClass(cs))) continue;
+            float health = 0.0f, loc[3];
+            if (!SafeCopy(&health, static_cast<char*>(cs) + kOffCheapShooterHealth, 4) || !(health > 0.0f) ||
+                !SafeCopy(loc, static_cast<char*>(cs) + 0x54, 12))
+                continue;
+            float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
+            float along = v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
+            if (along <= 50.0f) continue;
+            float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
+            float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+            float tol = std::fmax(along * 0.0699f, 60.0f);  // 4 gradi: bersagli piccoli e lontani
+            if (diag) {
+                char b[200];
+                snprintf(b, sizeof(b), "SQUAD check: %s (cheap shooter) along=%.0f off=%.0f tol=%.0f health=%.0f",
+                         vr::script::ClassName(cs).c_str(), along, off, tol, health);
+                vr::log::Line(b);
+            }
+            if (cs == lastPick && off < 1.5f * tol) lastPickScore = off / along;
+            if (off < tol && off / along < bestScore) {
+                best = cs;
+                bestScore = off / along;
+            }
         }
     }
     // Si cambia bersaglio solo se il nuovo e' nettamente piu' centrato.
