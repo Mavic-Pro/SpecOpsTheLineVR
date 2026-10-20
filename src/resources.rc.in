@@ -1,0 +1,3 @@
+#include "resource_ids.h"
+
+IDR_PROTUBE_BRIDGE RCDATA "@PROTUBE_BRIDGE_EXE_RC@"

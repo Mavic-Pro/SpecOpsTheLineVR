@@ -139,9 +139,14 @@ HWND g_gameWindow = nullptr;
 int g_wantedWidth = 0;
 int g_wantedHeight = 0;
 
+// Finestra minimizzata: senza visore si lascia il comportamento normale (UE3
+// vede 0x0). Col visore in uso invece no: il 20/10, con Virtual Desktop, la
+// finestra e' stata minimizzata alla chiusura della dashboard di SteamVR, UE3
+// ha ridotto il viewport a 0x0 (SetWindowPos 6x40) e il video Bink del menu e'
+// andato in crash in binkw32.dll scrivendo oltre il suo buffer ("Fatal error").
 BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
     BOOL ok = g_GetClientRect_Real(h, r);
-    if (ok && r && h == g_gameWindow && g_wantedWidth > 0 && !IsIconic(h)) {
+    if (ok && r && h == g_gameWindow && g_wantedWidth > 0 && (!IsIconic(h) || vr::session::IsScene())) {
         r->left = r->top = 0;
         r->right = g_wantedWidth;
         r->bottom = g_wantedHeight;
@@ -150,8 +155,10 @@ BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
 }
 
 WNDPROC g_originalWndProc = nullptr;
+LONG volatile g_wndMessages = 0;
 
 LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    InterlockedIncrement(&g_wndMessages);
     // Col visore in uso la finestra del gioco che perde il focus (clic sul
     // desktop di Virtual Desktop, una notifica) non deve mettere in pausa il
     // gioco ne' fermare l'input: i messaggi di disattivazione non arrivano
@@ -162,6 +169,16 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (deactivate) {
             static int logged = 0;
             if (logged++ < 3) vr::log::Line("DISPLAY: game window lost focus, ignored while the headset is in use.");
+            return 0;
+        }
+        // Minimizzata da fuori (Virtual Desktop, Win+D, un'altra app a schermo
+        // intero): il gioco non deve vederlo; la finestra torna com'era senza
+        // prendere il focus (vedi Hooked_GetClientRect, crash Bink 20/10).
+        if (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_MINIMIZE) return 0;
+        if (msg == WM_SIZE && wp == SIZE_MINIMIZED) {
+            static int logged = 0;
+            if (logged++ < 3) vr::log::Line("DISPLAY: game window minimized while the headset is in use, restored.");
+            ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
             return 0;
         }
     }
@@ -184,6 +201,39 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 }  // namespace
+
+// 20/10: con "wndinfo" si e' visto che poco dopo l'avvio il gioco installa
+// una sua procedura (0x00F59DF0) al posto della nostra e non la richiama piu'
+// (10 messaggi ricevuti in tutto): keepfocus, WM_GETMINMAXINFO e il ripristino
+// dalla minimizzazione non funzionavano mai. Ci si rimette in testa,
+// concatenando la procedura nuova (che non richiama la nostra: niente cicli).
+void KeepSubclass() {
+    HWND h = g_gameWindow;
+    if (!h || !g_originalWndProc) return;
+    WNDPROC cur = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_WNDPROC));
+    if (!cur || cur == &UnclampedWndProc) return;
+    g_originalWndProc = cur;
+    SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&UnclampedWndProc));
+    static int logged = 0;
+    if (logged++ < 5) {
+        char b[96];
+        std::snprintf(b, sizeof(b), "DISPLAY: window procedure replaced by the game (%p), ours put back in front.",
+                      reinterpret_cast<void*>(cur));
+        vr::log::Line(b);
+    }
+}
+
+void LogWindowInfo() {
+    HWND h = g_gameWindow;
+    char b[300];
+    std::snprintf(b, sizeof(b),
+                  "DISPLAY: wndinfo hwnd=%p unicode=%d wndprocW=%p wndprocA=%p ours=%p original=%p messages=%ld iconic=%d",
+                  h, h ? IsWindowUnicode(h) : -1, h ? reinterpret_cast<void*>(GetWindowLongPtrW(h, GWLP_WNDPROC)) : nullptr,
+                  h ? reinterpret_cast<void*>(GetWindowLongPtrA(h, GWLP_WNDPROC)) : nullptr,
+                  reinterpret_cast<void*>(&UnclampedWndProc), reinterpret_cast<void*>(g_originalWndProc), g_wndMessages,
+                  h ? IsIconic(h) : -1);
+    vr::log::Line(b);
+}
 
 void UnclampWindow(HWND window, int clientWidth, int clientHeight) {
     if (!window || g_originalWndProc) return;

@@ -24,7 +24,26 @@ endforeach()
 configure_file("${CMAKE_SOURCE_DIR}/src/default_ini.h.in" "${CMAKE_BINARY_DIR}/generated/default_ini.h" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/deploy/specopsvr.ini")
 
+# Ponte ProTubeVR a 64 bit (bridge/): sotto-progetto x64 costruito a parte e
+# incorporato in d3d9.dll come risorsa, cosi' l'aggiornamento automatico (che
+# scarica solo d3d9.dll) lo porta con se'.
+include(ExternalProject)
+set(PROTUBE_BRIDGE_EXE "${CMAKE_BINARY_DIR}/bridge-x64/Release/specopsvr_protube.exe")
+ExternalProject_Add(protube_bridge
+    SOURCE_DIR "${CMAKE_SOURCE_DIR}/bridge"
+    BINARY_DIR "${CMAKE_BINARY_DIR}/bridge-x64"
+    CMAKE_GENERATOR "${CMAKE_GENERATOR}"
+    CMAKE_GENERATOR_PLATFORM x64
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release
+    INSTALL_COMMAND ""
+    BUILD_ALWAYS ON
+    BUILD_BYPRODUCTS "${PROTUBE_BRIDGE_EXE}"
+)
+file(TO_CMAKE_PATH "${PROTUBE_BRIDGE_EXE}" PROTUBE_BRIDGE_EXE_RC)
+configure_file("${CMAKE_SOURCE_DIR}/src/resources.rc.in" "${CMAKE_BINARY_DIR}/generated/resources.rc" @ONLY)
+
 add_library(d3d9proxy SHARED
+    ${CMAKE_BINARY_DIR}/generated/resources.rc
     src/dllmain.cpp
     src/logger.cpp
     src/logger.h
@@ -60,7 +79,10 @@ set_target_properties(d3d9proxy PROPERTIES
 target_include_directories(d3d9proxy PRIVATE
     ${CMAKE_SOURCE_DIR}/vendor/openvr/headers
     ${CMAKE_BINARY_DIR}/generated
+    ${CMAKE_SOURCE_DIR}/src
 )
+add_dependencies(d3d9proxy protube_bridge)
+set_source_files_properties(${CMAKE_BINARY_DIR}/generated/resources.rc PROPERTIES OBJECT_DEPENDS "${PROTUBE_BRIDGE_EXE}")
 
 target_link_libraries(d3d9proxy PRIVATE minhook d3d11 dxgi winhttp bcrypt
     ${CMAKE_SOURCE_DIR}/vendor/openvr/lib/win32/openvr_api.lib)

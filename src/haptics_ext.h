@@ -1,8 +1,8 @@
 #pragma once
 #include <string>
 
-// Feedback aptico esterno: ProTubeVR (ForceTube / ProVolver, tramite
-// ForceTubeVR_API_x32.dll accanto al gioco) e bHaptics (giubbotto TactSuit e
+// Feedback aptico esterno: ProTubeVR (ForceTube / ProVolver, tramite il ponte
+// a 64 bit o ForceTubeVR_API_x32.dll accanto al gioco) e bHaptics (giubbotto TactSuit e
 // braccia Tactosy tramite il bHaptics Player, websocket locale). Entrambi
 // facoltativi: senza dispositivo/dll/Player non fanno nulla.
 namespace vr::haptics {

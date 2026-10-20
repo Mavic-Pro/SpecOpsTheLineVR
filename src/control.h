@@ -276,8 +276,9 @@ extern std::atomic<bool> g_cinemaWalker3D;
 // Calibrazione del calcio (gunstock): B + Y tenuti 1 s con il calcio in
 // posizione di mira. La richiesta la esegue UpdateHeadTracking.
 extern std::atomic<bool> g_stockCalibRequest;
-// Feedback aptico esterno: ProTubeVR (ForceTubeVR_API_x32.dll) e bHaptics Player.
-extern std::atomic<bool> g_protube, g_bhaptics;
+// Feedback aptico esterno: ProTubeVR (ponte a 64 bit o ForceTubeVR_API_x32.dll)
+// e bHaptics Player. g_protubeSwap ("protube swap") scambia i due ProVolver.
+extern std::atomic<bool> g_protube, g_protubeSwap, g_bhaptics;
 // Mirino del gioco (al centro della vista, cioe' legato alla testa): nascosto
 // mirando con la mano, il mirino verde sulla canna lo sostituisce
 // ("gamecrosshair on|off", predefinito off).

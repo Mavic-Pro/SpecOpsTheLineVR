@@ -18,4 +18,11 @@ void InstallDesktopSizeSpoof();
 // che potessimo sottoclassarla). Da chiamare in CreateDevice.
 void UnclampWindow(HWND window, int clientWidth, int clientHeight);
 
+// Il gioco sostituisce la procedura della finestra dopo CreateDevice senza
+// richiamare la nostra: va ricontrollato a ogni frame (EndScene).
+void KeepSubclass();
+
+// Diagnostica ("wndinfo"): procedura di finestra attiva e messaggi ricevuti.
+void LogWindowInfo();
+
 }  // namespace vr::display

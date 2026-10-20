@@ -278,6 +278,39 @@ void MonitorLoop() {
             bool interacting = level == vr::k_EDeviceActivityLevel_UserInteraction ||
                                level == vr::k_EDeviceActivityLevel_UserInteraction_Timeout;
             bool standby = level == vr::k_EDeviceActivityLevel_Standby || level == vr::k_EDeviceActivityLevel_Idle_Timeout;
+            // Testa in movimento = visore indossato, qualunque sia lo stato:
+            // con Virtual Desktop, dopo uno standby lo stato resta Idle/Standby
+            // anche col visore di nuovo in testa, e la mod smetteva di mandare
+            // le immagini e bloccava i comandi (20/10). Chi lo indossa si muove
+            // sempre di qualche millimetro; un visore appoggiato o in standby ha
+            // la posa ferma.
+            {
+                vr::TrackedDevicePose_t pose;
+                sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, &pose, 1);
+                static float lastPos[3] = {}, lastFwd[3] = {};
+                static bool haveLast = false;
+                if (pose.bPoseIsValid && pose.eTrackingResult == vr::TrackingResult_Running_OK) {
+                    const auto& m = pose.mDeviceToAbsoluteTracking.m;
+                    float pos[3] = {m[0][3], m[1][3], m[2][3]}, fwd[3] = {m[0][2], m[1][2], m[2][2]};
+                    float dp = 0.0f, df = 0.0f;
+                    for (int i = 0; i < 3; ++i) {
+                        dp += (pos[i] - lastPos[i]) * (pos[i] - lastPos[i]);
+                        df += (fwd[i] - lastFwd[i]) * (fwd[i] - lastFwd[i]);
+                        lastPos[i] = pos[i];
+                        lastFwd[i] = fwd[i];
+                    }
+                    bool moving = haveLast && (dp > 0.002f * 0.002f || df > 0.003f * 0.003f);
+                    haveLast = true;
+                    if (moving && !interacting) {
+                        static int logged = 0;
+                        if (!g_present && logged++ < 10)
+                            vr::log::Line("OpenVR: headset state " + std::to_string(level) +
+                                          " but the head is moving: treated as worn.");
+                        interacting = true;
+                        standby = false;
+                    }
+                }
+            }
             if (interacting) lastActive = t;
             if (standby) {
                 if (!standbySince) standbySince = t;

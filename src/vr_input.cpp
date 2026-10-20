@@ -1165,8 +1165,13 @@ void ApplyVrStickRules(XGamepad* pad) {
     {
         // Dashboard di SteamVR aperta: Start per 150 ms (pausa del gioco), se
         // il gioco non e' gia' in pausa; poi nessun input finche' resta aperta.
+        // Solo durante il gameplay in 3D: SteamVR apre la dashboard da sola
+        // all'avvio del gioco (visto con Virtual Desktop, 20/10) e Start nel
+        // menu principale ne attivava una voce.
         static ULONGLONG pauseUntil = 0;
-        if (vr::control::g_vrPauseRequest.exchange(false) && !vr::control::g_gamePaused && !vr::control::g_cinemaActive)
+        bool stereoNow = GetTickCount64() - vr::control::g_lastStereoDrawMs < 1500;
+        if (vr::control::g_vrPauseRequest.exchange(false) && !vr::control::g_gamePaused &&
+            !vr::control::g_cinemaActive && stereoNow)
             pauseUntil = GetTickCount64() + 150;
         if (GetTickCount64() < pauseUntil) {
             *pad = {};

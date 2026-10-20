@@ -82,7 +82,7 @@ UNINSTALL_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
 if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
-foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
+foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'specopsvr_protube.exe', 'specopsvr_protube.exe.new', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst $f)
 }
 $other = Join-Path $dst 'd3d9.dll.other'
@@ -187,9 +187,9 @@ GESTURES
   Cover: lean out sideways (or stand up) to pop out and aim.
 
 HAPTIC DEVICES (optional)
-  ProTubeVR ForceTube / ProVolver: copy ForceTubeVR_API_x32.dll (from the
-  ProTubeVR software/SDK) next to SpecOpsTheLine.exe, pair the device, start
-  the game. bHaptics vest and sleeves: start the bHaptics Player before the
+  ProTubeVR ForceTube / ProVolver: install the free ProTubeVR Companion App
+  (Steam), pair the devices in Windows, close the Companion App and start the
+  game. bHaptics vest and sleeves: start the bHaptics Player before the
   game. Both can be turned off in specopsvr.ini (protube off / bhaptics off).
 
 CONFIGURATION

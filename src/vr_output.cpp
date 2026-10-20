@@ -1063,6 +1063,16 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     // il destro). Mono (nessuno stereo in corso, es. menu): entrambi gli
     // occhi dallo stesso frame, ciascuno con il suo ritaglio.
     bool cinema = vr::control::g_cinemaActive;
+    // Niente Draw stereo da 1,5 s fuori dallo schermo virtuale (caricamenti
+    // bloccanti, filmati di caricamento, menu): l'immagine va sullo schermo
+    // virtuale invece che piatta a entrambi gli occhi (audit 19/10); al
+    // ritorno del 3D le immagini in attesa si scartano. Va deciso prima del
+    // controllo di ritorno qui sotto: deciderlo dopo faceva sembrare ogni frame
+    // un "ritorno" e scartava le immagini in coda a ogni frame (20/10, test
+    // con Virtual Desktop).
+    if (!cinema && vr::control::g_stereoHalfIpd > 0 && eye < 0 &&
+        GetTickCount64() - vr::control::g_lastStereoDrawMs >= 1500)
+        cinema = true;
     // Schermo virtuale: tutto il back buffer (le eventuali bande nere del
     // 16:9 le toglie il thread di uscita, vedi DetectContentRows).
     RECT cinemaRect = {0, 0, static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height)};
@@ -1092,7 +1102,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     wasCinema = cinema;
     if (cinema || vr::control::g_stereoHalfIpd <= 0) {
         eye = -1;
-    } else if (eye < 0 && GetTickCount64() - vr::control::g_lastStereoDrawMs < 1500) {
+    } else if (eye < 0) {
         // Stereo attivo ma occhio non riconosciuto, o pausa breve del gioco
         // (salvataggio del checkpoint): si salta il frame e il visore ripete
         // l'ultima coppia. Con lo schermo virtuale gia' dopo 200 ms il
@@ -1100,13 +1110,6 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         // visore sembrava il mondo sdoppiato (19/10).
         backBuffer->Release();
         return;
-    } else if (eye < 0) {
-        // Niente Draw stereo da 1,5 s fuori dallo schermo virtuale (caricamenti
-        // bloccanti, filmati di caricamento): l'immagine va sullo schermo
-        // virtuale invece che piatta a entrambi gli occhi (audit 19/10); al
-        // ritorno del 3D le immagini in attesa si scartano.
-        cinema = true;
-        wasCinema = true;
     }
 
     double t0 = QpcMs();

@@ -2,6 +2,8 @@
 #include "default_ini.h"
 #include "logger.h"
 #include "vr_input.h"
+#include "haptics_ext.h"
+#include "display_spoof.h"
 
 #include <windows.h>
 #include <cstdlib>
@@ -80,7 +82,7 @@ std::atomic<bool> g_inCover{false};
 std::atomic<bool> g_gamePaused{false};
 std::atomic<bool> g_cinemaWalker3D{true};
 std::atomic<bool> g_stockCalibRequest{false};
-std::atomic<bool> g_protube{true}, g_bhaptics{true};
+std::atomic<bool> g_protube{true}, g_protubeSwap{false}, g_bhaptics{true};
 std::atomic<bool> g_gameCrosshair{false};
 std::atomic<bool> g_actionInput{true};
 std::atomic<bool> g_perEyeViewState{true};
@@ -282,7 +284,12 @@ void Execute(const std::string& raw) {
 // Comandi aggiunti con l'audit del 19/10, fuori dalla catena principale di
 // Execute (MSVC ha un limite di annidamento degli else if).
 bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
-    if (cmd == "hand") {
+    if (cmd == "wndinfo") {
+        vr::display::LogWindowInfo();
+    } else if (cmd == "protubetest") {
+        // Prova del rinculo senza sparare: un colpo da cecchino a due mani.
+        vr::haptics::Shot("Barrett", true);
+    } else if (cmd == "hand") {
         std::string v;
         in >> v;
         g_leftHanded = (v == "left");
@@ -787,6 +794,7 @@ void ExecuteNormalized(const std::string& line) {
         std::string v;
         in >> v;
         g_protube = (v != "off");
+        g_protubeSwap = (v == "swap");
     } else if (cmd == "bhaptics") {
         std::string v;
         in >> v;

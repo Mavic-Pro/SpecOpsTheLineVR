@@ -23,7 +23,8 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 | `display_spoof.cpp` | Lets the game create a window larger than the desktop |
 | `logger.cpp` | Per-session log with header, crash handler and minidumps |
 | `updater.cpp` | Automatic update from the GitHub releases (channels, revocation list) |
-| `haptics_ext.cpp` | ProTubeVR (ForceTubeVR_API_x32.dll) and bHaptics Player haptics |
+| `haptics_ext.cpp` | ProTubeVR (64-bit bridge or ForceTubeVR_API_x32.dll) and bHaptics Player haptics |
+| `bridge/protube_bridge.cpp` | 64-bit ProTubeVR bridge (embedded in d3d9.dll) |
 
 ## Rendering
 
@@ -412,9 +413,20 @@ Useful offsets (`ue3.py props`):
 - Controller rumble: the game's motor speed (XInputSetState) is remembered and
   pulsed every frame (legacy pulses are ~4 ms) on the gun hand, and on the
   left hand while two-handed; gestures confirm with 70 ms.
-- ProTubeVR: `ForceTubeVR_API_x32.dll` next to the game, C exports
-  `InitRifle`, `KickChannel(uint8 power, channel)`, `RumbleChannel(uint8,
-  float seconds, channel)` (channel 0 = all). Kick on every player shot
+- ProTubeVR: the only public 32-bit `ForceTubeVR_API_x32.dll` (2020) predates
+  the ProVolver, so the mod normally uses a 64-bit bridge (`bridge/`,
+  `specopsvr_protube.exe`). It is built as an x64 ExternalProject, embedded in
+  `d3d9.dll` as an RCDATA resource (so the single-file auto-update carries it)
+  and extracted next to the game when missing or different. The bridge loads
+  `ForceTubeVR_API_x64.dll` from the ProTubeVR Companion App (found via the
+  Steam library folders; a copy next to the exe wins), calls `InitPistol`
+  (first device = channel pistol1 = gun hand, second = pistol2 = support hand)
+  and reads 8-byte messages `{op, power, power2, channel, float seconds}`
+  (op 1 kick, 2 rumble, 3 shot) from `\\.\pipe\SpecOpsVR_ProTube_<pid>`. It
+  exits with the game process. A `ForceTubeVR_API_x32.dll` placed next to the
+  game is still used directly when present. C exports: `KickChannel(uint8
+  power, channel)`, `RumbleChannel(uint8, float seconds, channel)` (channel
+  0 = all). `protubetest` fires a test kick. Kick on every player shot
   (`CalcWeaponFire` hook, launcher projectiles), strength by weapon class,
   one kick per shotgun blast.
 - bHaptics: WebSocket `ws://127.0.0.1:15881/v2/feedbacks` of the bHaptics
@@ -482,6 +494,39 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   magazine; 12 s without finishing or the X button resets. While the left
   hand is at the magwell or the grip belongs to the reload, the grip is not
   sent to the game as LB (grenade).
+
+## Virtual Desktop and haptics fixes (0.9.8)
+
+Found on 20/10 by playing through Virtual Desktop (Streamer 1.34.22, Quest 3).
+VD presents the headset to SteamVR as an `oculus` device (HMD shim), so the
+mod sees the same tracking system name as over Link.
+
+- **Window procedure never active.** Shortly after CreateDevice the game
+  installs its own window procedure (0x00F59DF0) over ours and does not call
+  ours: `keepfocus`, the WM_GETMINMAXINFO unclamp and everything else in
+  `UnclampedWndProc` stopped after ~10 messages, in every version.
+  `KeepSubclass()` (called from EndScene) puts ours back in front, chaining the
+  game's procedure (which does not call ours: no loop). `wndinfo` logs the
+  current procedure and the message count.
+- **Crash in binkw32.dll when the window was minimized** (VD/SteamVR closing
+  the dashboard): the GetClientRect spoof skipped iconic windows, UE3 shrank
+  the viewport to 0x0 (SetWindowPos 6x40, 0x00BE07DA) and the menu's Bink video
+  wrote past its buffer ("Fatal error"). While the session is Scene the spoof
+  now also covers iconic windows and a minimize is undone at once
+  (WM_SYSCOMMAND SC_MINIMIZE swallowed, SIZE_MINIMIZED -> SW_SHOWNOACTIVATE).
+- **Headset state after standby.** With VD the HMD activity level stays
+  Idle/Standby after the headset is put back on, so the mod stopped sending
+  images and blocked the controls. The HMD pose moving (> 2 mm or ~0.2 degrees
+  between two 500 ms samples) now counts as worn whatever the activity level.
+- **Start pressed in the main menu.** SteamVR opens its dashboard by itself
+  when the game becomes the scene app; the pause-on-dashboard Start is now sent
+  only during 3D gameplay (stereo drawn in the last 1.5 s).
+- **Pending eye images dropped every frame outside gameplay** (0.9.7
+  regression): the "no stereo for 1.5 s -> virtual screen" fallback was decided
+  after the back-from-cinema check, so every frame looked like a return from
+  the cinema screen. It is now decided before.
+- **ProTubeVR bridge** (see Haptics): ProVolver support through the Companion
+  App's 64-bit dll.
 
 ## VR audit fixes (0.9.7)
 

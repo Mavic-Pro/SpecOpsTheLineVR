@@ -129,9 +129,14 @@ move the controllers on the stock.
 
 ## Haptic devices (optional)
 
-- **ProTubeVR ForceTube / ProVolver**: copy `ForceTubeVR_API_x32.dll` (from
-  the ProTubeVR software/SDK) next to `SpecOpsTheLine.exe`, pair the device,
-  start the game. Recoil on every shot, scaled by weapon.
+- **ProTubeVR ForceTube / ProVolver**: install the free **ProTubeVR
+  Companion App** (Steam; it provides the up-to-date ProTube driver), pair the
+  devices in Windows Bluetooth settings, close the Companion App and start the
+  game. Recoil on every shot, scaled by weapon; with two ProVolvers the second
+  one kicks in the support hand while aiming two-handed (`protube swap` in
+  `specopsvr.ini` if they come out the wrong way round). The mod starts a
+  small 64-bit helper, `specopsvr_protube.exe`, because the game is 32-bit;
+  its log is `specopsvr_protube.log`.
 - **bHaptics** vest and arm sleeves: start the bHaptics Player before the
   game. Recoil on the arms, hits taken on the vest, grenade / melee / reload
   on the left arm.
@@ -153,6 +158,9 @@ there is plenty of headroom:
 - **Virtual Desktop**: set *Synchronous Spacewarp* to *Disabled* in the
   Virtual Desktop Streamer app if the game stays at half rate (the mod cannot
   change it; it writes a reminder in the log when it detects VD).
+  For the lowest latency use the H.264+ or AV1 codec and the *High* quality
+  preset (higher presets add encoding/decoding time). When the game starts,
+  SteamVR may show its dashboard: close it with the menu button.
 
 ## Configuration
 

@@ -361,6 +361,7 @@ HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
         vr::log::Line("EndScene: " + std::to_string(count) + " frames rendered so far.");
     }
     if (vr::control::g_vsDiag) EndFrameVsConstAnalysis();
+    vr::display::KeepSubclass();
     vr::control::Poll();
     ApplyPostFxSettings();
     return g_EndScene_Original(self);
