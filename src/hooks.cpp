@@ -2713,10 +2713,13 @@ public:
         // Mirino del gioco: al centro dello schermo segue la testa e non l'arma;
         // con la mira dalla canna lo sostituisce il mirino verde.
         // YHUD.m_hideCrosshair (+0x480, bit 0x40) sull'HUD del PlayerController (+0x3EC).
+        // Anche sulle postazioni fisse mirate col controller (minigun
+        // dell'elicottero): li' non c'e' la canna in mano ma il mirino verde
+        // c'e' lo stesso, e restavano due mirini (playtest 20/10).
         {
             static bool weHid = false;
-            bool hide = HasCameraSignature(cam) && vr::control::g_aimHand && g_muzzleAimValid &&
-                        !vr::control::g_gameCrosshair;
+            bool hide = HasCameraSignature(cam) && vr::control::g_aimHand &&
+                        (g_muzzleAimValid || TurretAimActive()) && !vr::control::g_gameCrosshair;
             uint32_t hud = 0, flags = 0;
             if ((hide || weHid) && HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0x3EC, &hud) && hud &&
                 TrySafeReadUint32(reinterpret_cast<char*>(hud) + 0x480, &flags)) {
