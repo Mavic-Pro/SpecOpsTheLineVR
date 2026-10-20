@@ -228,16 +228,27 @@ std::deque<ShotRequest> g_shots;
 std::string g_mirrorShotPath;
 
 std::string ModuleDirectory() {
-    char path[MAX_PATH] = {};
+    // Cartella del gioco in Unicode: se contiene caratteri fuori dalla code
+    // page ANSI (nome utente, libreria Steam) il percorso ANSI aveva "?" e ini,
+    // log e file dei comandi non si trovavano. In quel caso si usa il nome
+    // corto 8.3, che e' solo ASCII (audit 20/10).
+    wchar_t wpath[MAX_PATH] = {};
     HMODULE self = nullptr;
-    GetModuleHandleExA(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        reinterpret_cast<LPCSTR>(&ModuleDirectory),
-        &self);
-    GetModuleFileNameA(self, path, MAX_PATH);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&ModuleDirectory), &self);
+    GetModuleFileNameW(self, wpath, MAX_PATH);
+    std::wstring wfull(wpath);
+    size_t wpos = wfull.find_last_of(L"\\/");
+    std::wstring wdir = wpos == std::wstring::npos ? L"." : wfull.substr(0, wpos);
+    BOOL lossy = FALSE;
+    char path[MAX_PATH * 2] = {};
+    WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wdir.c_str(), -1, path, sizeof(path), nullptr, &lossy);
+    if (lossy) {
+        wchar_t shortPath[MAX_PATH] = {};
+        if (GetShortPathNameW(wdir.c_str(), shortPath, MAX_PATH))
+            WideCharToMultiByte(CP_ACP, 0, shortPath, -1, path, sizeof(path), nullptr, nullptr);
+    }
     std::string full(path);
-    size_t pos = full.find_last_of("\\/");
-    return pos == std::string::npos ? "." : full.substr(0, pos);
+    return full.empty() ? "." : full;
 }
 
 std::string ShotPath(const std::string& name) {
@@ -927,6 +938,9 @@ void ExecuteNormalized(const std::string& line) {
 }
 
 }  // namespace
+
+// Cartella del gioco sicura per le API ANSI (vedi ModuleDirectory).
+std::string GameDirectory() { return ModuleDirectory(); }
 
 // specopsvr.ini (accanto alla dll): stessi comandi di specopsvr_cmd.txt,
 // eseguiti una volta all'avvio. Righe vuote e '#' ignorate. Il file NON

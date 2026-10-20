@@ -10,6 +10,10 @@
 // camera) senza ricompilare ne' riavviare il gioco. Vedi README per l'elenco.
 namespace vr::control {
 
+// Cartella del gioco (Binaries\Win32), sicura per le API ANSI: nome corto 8.3
+// se il percorso ha caratteri fuori dalla code page.
+std::string GameDirectory();
+
 enum TrackMode : int {
     kModeOff = 0,        // nessuna modifica alla camera
     kModeHmd = 1,        // posa del visore via OpenVR

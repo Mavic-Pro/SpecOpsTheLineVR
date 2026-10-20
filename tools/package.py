@@ -25,6 +25,13 @@ def version():
 # Steam library listed in libraryfolders.vdf (Steam path from the registry).
 FIND_GAME_PS1 = r"""
 function Find-Game([string]$game) {
+  # A trailing backslash before the closing quote ("C:\Games\Spec Ops\") reaches
+  # PowerShell as a stray quote; the folder, Binaries\Win32 or the exe all work.
+  if ($game) {
+    $game = $game.Trim().Trim('"').TrimEnd('\')
+    if ($game -like '*.exe') { $game = Split-Path $game -Parent }
+    if (Test-Path (Join-Path $game 'SpecOpsTheLine.exe')) { return $game }
+  }
   if (-not $game) {
     $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
     $libs = @()
@@ -82,11 +89,18 @@ UNINSTALL_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
 if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
-foreach ($f in 'd3d9.dll', 'openvr_api.dll', 'specopsvr_protube.exe', 'specopsvr_protube.exe.new', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
+# d3d9.dll only if it is the mod's (a ReShade or dgVoodoo installed later stays).
+$cur = Join-Path $dst 'd3d9.dll'
+if ((Test-Path $cur) -and (Select-String -Path $cur -Pattern 'specopsvr' -SimpleMatch -Quiet)) {
+  Remove-Item -Force -ErrorAction SilentlyContinue $cur
+} elseif (Test-Path $cur) {
+  Write-Host 'd3d9.dll is not the mod (another tool?): left in place.'
+}
+foreach ($f in 'openvr_api.dll', 'specopsvr_protube.exe', 'specopsvr_protube.exe.new', 'd3d9.dll.old', 'd3d9.dll.new', 'd3d9.dll.prev', 'd3d9.dll.rolledback') {
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst $f)
 }
 $other = Join-Path $dst 'd3d9.dll.other'
-if (Test-Path $other) {
+if ((Test-Path $other) -and -not (Test-Path (Join-Path $dst 'd3d9.dll'))) {
   Move-Item -Force $other (Join-Path $dst 'd3d9.dll')
   Write-Host 'Your previous d3d9.dll was put back.'
 }
@@ -100,9 +114,10 @@ Write-Host 'Remember to remove "-windowed ResX=2400 ResY=2500" from the Steam la
 ROLLBACK_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
-$prev = Join-Path $dst 'd3d9.dll.prev'
-# A dll that never started leaves the replaced version as d3d9.dll.old.
-if (-not (Test-Path $prev)) { $prev = Join-Path $dst 'd3d9.dll.old' }
+# A dll that never started leaves the version it replaced as d3d9.dll.old: that
+# is the one to go back to (.prev can be two updates old).
+$prev = Join-Path $dst 'd3d9.dll.old'
+if (-not (Test-Path $prev)) { $prev = Join-Path $dst 'd3d9.dll.prev' }
 if (-not (Test-Path $prev)) { Write-Host 'No previous version found (d3d9.dll.prev / .old).'; exit 1 }
 if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
 Copy-Item -Force (Join-Path $dst 'd3d9.dll') (Join-Path $dst 'd3d9.dll.rolledback')
@@ -114,11 +129,32 @@ Write-Host 'The previous version is back. Automatic updates were turned off in s
 COLLECT_PS1 = r"""
 . (Join-Path $PSScriptRoot 'find_game.ps1')
 $dst = Find-Game $args[0]
-$files = Get-ChildItem $dst -File | Where-Object {
+$files = Get-ChildItem -LiteralPath $dst -File | Where-Object {
   $_.Name -like 'specopsvr*.log' -or $_.Name -like 'specopsvr*.ini' -or $_.Name -like 'specopsvr_crash_*.dmp' }
 if (-not $files) { Write-Host 'No SpecOpsTheLineVR logs found.'; exit 1 }
+# Copied to a temporary folder first: the log of a running game is open and
+# Compress-Archive would fail on it.
+$tmp = Join-Path $env:TEMP ('SpecOpsTheLineVR_report_' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force $tmp | Out-Null
+foreach ($f in $files) {
+  try { [IO.File]::Copy($f.FullName, (Join-Path $tmp $f.Name), $true) } catch { Write-Host "Skipped $($f.Name): $($_.Exception.Message)" }
+}
+$inputDir = Join-Path $dst 'specopsvr_input'
+if (Test-Path $inputDir) { Copy-Item -Recurse -Force $inputDir (Join-Path $tmp 'specopsvr_input') }
+# SteamVR logs (input and headset problems).
+$steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+if ($steam) {
+  $vrlogs = Join-Path $steam 'logs'
+  $vrdst = Join-Path $tmp 'steamvr_logs'
+  New-Item -ItemType Directory -Force $vrdst | Out-Null
+  foreach ($n in 'vrserver.txt', 'vrcompositor.txt', 'vrmonitor.txt', 'vrclient_SpecOpsTheLine.txt') {
+    $src = Join-Path $vrlogs $n
+    if (Test-Path $src) { try { [IO.File]::Copy($src, (Join-Path $vrdst $n), $true) } catch {} }
+  }
+}
 $zip = Join-Path ([Environment]::GetFolderPath('Desktop')) ('SpecOpsTheLineVR_report_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.zip')
-Compress-Archive -Path $files.FullName -DestinationPath $zip
+Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zip
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
 Write-Host "Created $zip"
 Write-Host 'Attach it to your issue on GitHub.'
 """

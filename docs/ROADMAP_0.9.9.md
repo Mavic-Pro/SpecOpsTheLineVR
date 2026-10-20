@@ -52,12 +52,12 @@ Status: [ ] todo, [x] done (committed), [~] done but needs headset check.
 - [ ] C11 Right-eye view state leak
 
 ## D. Install / update
-- [ ] D1 Updater never installs a revoked tag
-- [ ] D2 rollback prefers .old
-- [ ] D3 uninstall checks the specopsvr marker
-- [ ] D4 Unicode paths (manifest UTF-8, ini, command file)
-- [ ] D5 collect_logs: copy first, add SteamVR logs and input folder
-- [ ] D6 Installer: accept Binaries\Win32 / exe path, non-Steam (GOG) path
+- [~] D1 Updater never installs a revoked tag
+- [~] D2 rollback prefers .old
+- [~] D3 uninstall checks the specopsvr marker
+- [~] D4 Unicode paths (manifest UTF-8, ini, command file)
+- [~] D5 collect_logs: copy first, add SteamVR logs and input folder
+- [~] D6 Installer: accept Binaries\Win32 / exe path, non-Steam (GOG) path
 
 ## E. Full-VR features
 - [ ] E1 Honest reload: no fire with the magazine out; optional chambering

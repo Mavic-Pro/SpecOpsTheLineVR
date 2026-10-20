@@ -100,15 +100,21 @@ std::vector<int> ParseVersion(std::string v) {
     if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) v = v.substr(1);
     std::vector<int> out;
     size_t i = 0;
-    while (i < v.size() && out.size() < 4) {
+    bool pre = false;
+    while (i < v.size() && out.size() < 3) {
         size_t j = i;
         while (j < v.size() && isdigit(static_cast<unsigned char>(v[j]))) ++j;
         if (j == i) break;
         out.push_back(atoi(v.substr(i, j - i).c_str()));
+        if (j < v.size() && v[j] == '-') pre = true;
         if (j >= v.size() || v[j] != '.') break;
         i = j + 1;
     }
     while (out.size() < 3) out.push_back(0);
+    // Quarto numero: 0 per le pre-release ("v0.9.9-beta1"), 1 per le finali.
+    // Prima la beta valeva quanto la finale e chi l'aveva non passava mai
+    // alla 0.9.9 vera (audit 20/10).
+    out.push_back(pre ? 0 : 1);
     return out;
 }
 
@@ -192,6 +198,25 @@ void Run() {
     size_t tagAt = 0;
     tag = JsonString(json, "tag_name", 0, &tagAt);
     if (tag.empty()) return;
+    // Mai una versione ritirata: se l'ultima release e' nella lista, chi aveva
+    // la versione buona la installava, al lancio dopo risultava ritirata e
+    // tornava alla raccomandata, all'infinito (audit 20/10). Si va invece
+    // sulla raccomandata (se piu' nuova) o si resta dove si e'.
+    if (!revoked && IsRevoked(manifest, tag)) {
+        std::string rec = JsonString(manifest, "recommended");
+        if (rec.empty() || IsRevoked(manifest, rec) || !(ParseVersion(rec) > ParseVersion(SPECOPSVR_VERSION))) {
+            vr::log::Line("UPDATE: the latest release " + tag + " was withdrawn; staying on " SPECOPSVR_VERSION ".");
+            return;
+        }
+        json.clear();
+        if (!HttpGet(L"api.github.com", Widen("/repos/" + repo + "/releases/tags/" + rec), &json, 1 << 21)) {
+            vr::log::Line("UPDATE: cannot read the recommended release " + rec + ".");
+            return;
+        }
+        tag = JsonString(json, "tag_name", 0, &tagAt);
+        if (tag.empty()) return;
+        vr::log::Line("UPDATE: the latest release was withdrawn; using the recommended " + tag + ".");
+    }
     // Con la lista (canale beta) gli allegati cercati sono quelli della prima release.
     size_t nextRelease = json.find("\"tag_name\"", tagAt);
     if (nextRelease != std::string::npos) json = json.substr(0, nextRelease);

@@ -237,14 +237,25 @@ std::string WriteFiles() {
     HMODULE self = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCSTR>(&WriteFiles), &self);
-    GetModuleFileNameA(self, path, MAX_PATH);
-    std::string dir(path);
-    dir = dir.substr(0, dir.find_last_of("\\/") + 1) + "specopsvr_input\\";
+    (void)path;
+    // Scrittura dei file tramite la cartella del gioco sicura in ANSI (vedi
+    // vr::control::ModuleDirectory: nome corto 8.3 se serve).
+    std::string dir = vr::control::GameDirectory() + "\\specopsvr_input\\";
     CreateDirectoryA(dir.c_str(), nullptr);
     for (const Profile& p : Profiles())
         if (!WriteIfChanged(dir + "bindings_" + p.type + ".json", BindingJson(p))) return "";
     if (!WriteIfChanged(dir + "actions.json", ManifestJson())) return "";
-    return dir + "actions.json";
+    // SteamVR vuole il percorso del manifesto in UTF-8: in ANSI una cartella
+    // con lettere accentate faceva fallire SetActionManifestPath e si passava
+    // all'input legacy (audit 20/10).
+    wchar_t wpath[MAX_PATH] = {};
+    GetModuleFileNameW(self, wpath, MAX_PATH);
+    std::wstring wdir(wpath);
+    wdir = wdir.substr(0, wdir.find_last_of(L"\\/") + 1) + L"specopsvr_input\\actions.json";
+    int n = WideCharToMultiByte(CP_UTF8, 0, wdir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string utf8(n > 0 ? n - 1 : 0, '\0');
+    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, wdir.c_str(), -1, &utf8[0], n, nullptr, nullptr);
+    return utf8.empty() ? dir + "actions.json" : utf8;
 }
 
 vr::VRActionSetHandle_t g_set = vr::k_ulInvalidActionSetHandle;
