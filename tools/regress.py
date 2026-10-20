@@ -91,8 +91,11 @@ def main():
         time.sleep(55)
         g.focus()
         g.send_cmds(['console open TheLine_P?mission=%s?game=SRAssets.YGameInfo_SP_Content' % MAP])
-        time.sleep(45)
-        ds.wait_gameplay([], 60)
+        # God mode as soon as gameplay starts: after a fixed 45 s wait Walker
+        # (still, leaning out of cover) could already be dead and the phases
+        # ran on the respawn (20/10).
+        time.sleep(20)
+        ds.wait_gameplay([], 90)
         for c in ['cheats', 'ucall cheat God', 'firelog on', 'spread off', 'mode synth', 'synth 0 -10 0',
                   'synthaim 0 -10', 'synthhand 40 20 -20']:
             g.send_cmds([c])

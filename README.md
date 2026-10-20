@@ -30,7 +30,9 @@ virtual cinema screen.
 - **VR cover**: the world does not spin when Walker takes cover; lean out
   with your body to pop out and aim.
 - **Mounted guns and the helicopter minigun** aim with your controller.
-- **Squad orders** target the enemy you point your gun at.
+- **Squad orders** target the enemy you point your gun at (or look at); the
+  target stays locked until you release the button.
+- **Executions**: press B next to a downed enemy and Walker turns to him.
 - **Gestures**: throw grenades, punch (melee), physical two-handed reload (pull the magazine, take a new one from your belt, push it in),
   duck into cover, grab the next weapon from your shoulder.
 - **Haptics**: controller rumble on the gun hand, **ProTubeVR**

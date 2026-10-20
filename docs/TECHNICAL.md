@@ -495,6 +495,48 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   hand is at the magwell or the grip belongs to the reload, the grip is not
   sent to the game as LB (grenade).
 
+## Audit fixes and first full-VR features (0.9.9)
+
+Audit of 20/10 (work list in `docs/ROADMAP_0.9.9.md`) and a tester report
+(Quest 3 over Virtual Desktop).
+
+- **Squad orders.** The chapter 1 billboard sniper is a `YCheapShooter`
+  (not in the Pawn list; health float at +0x264). The mod selects the target
+  along the barrel and calls `YPlayerController.SetAsCurrentSelectedMarkable`
+  (PC+0xE98). The target now stays selected until the button is released
+  while it is alive (drifting the gun off it let the game's head-centre pick
+  take over and no order was issued). When nothing is along the barrel the
+  view direction is searched too: the game's red triangle sits at the centre
+  of the view, so players aim it with the head. Every press/release is
+  logged (`SQUAD: button pressed/released`).
+- **Mounted guns aimed by hand** (helicopter minigun): the game's crosshair
+  (`YHUD.m_hideCrosshair`, +0x480 bit 0x40) is hidden like with hand-held
+  weapons; it stayed at the centre of the view next to the green marker.
+- **Input:** B/Y presses of ~105-135 ms passed the combo gate never (melee,
+  executions, punch gesture); gestures are OR-ed after the gate. Execution
+  assist (`execassist`): on B Walker turns to the nearest downed enemy within
+  2 m. Left-handed pause/Back from the physical left controller; dashboard
+  state resynced every second; D-pad no longer turns; turrets without
+  turn-with-head and with the pitch reset on exit; honest reload
+  (`honestreload`: no firing with the magazine out); grenade/melee gestures
+  separated and off with the left hand at the gun; cover peek from a standing
+  entry.
+- **Rendering:** scope circle and vignette centred on each eye's forward
+  direction (the circles were ~15 degrees apart), eyes kept apart while scoped
+  (eye recognition), no marker on cinema frames, full-screen Canvas effects
+  scaled with dynamic resolution, readback surfaces only when needed.
+- **Robustness:** window procedure chaining only over the game's own, window
+  protections only while the headset is worn, cinema overlay recreated after
+  a SteamVR restart, SteamVR death without Quit detected, orderly stop on
+  WM_CLOSE, crash handler only for fatal codes, ini written through a temp
+  file.
+- **Install/update:** withdrawn releases never installed, pre-releases rank
+  below the final version, `rollback.bat` prefers `d3d9.dll.old`,
+  `uninstall.bat` only removes the mod's dll, `collect_logs.bat` adds SteamVR
+  logs and bindings, Unicode-safe game folder.
+- **Features:** `movedir hand`, seated play uses the game's crouch view,
+  directional bHaptics damage from `Pawn.LastHitBy`.
+
 ## Virtual Desktop and haptics fixes (0.9.8)
 
 Found on 20/10 by playing through Virtual Desktop (Streamer 1.34.22, Quest 3).
