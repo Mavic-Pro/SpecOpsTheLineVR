@@ -685,6 +685,14 @@ extern double g_profOutput, g_profPresent;
 
 void PresentMarkerFromGlobals(int eye) {
     g_markerFromGlobals.fetch_add(1, std::memory_order_relaxed);
+    // Frame senza occhio (schermo virtuale, caricamenti): niente mirino ne'
+    // riquadro del bersaglio. Prima restavano quelli dell'ultimo frame 3D,
+    // disegnati sopra filmati e caricamenti (audit 20/10).
+    if (eye < 0 || vr::control::g_cinemaActive) {
+        g_presentMarker.vis = false;
+        g_presentMarker.targetVis = false;
+        return;
+    }
     int e = eye == 1 ? 1 : 0;
     g_presentMarker.vis = g_markerVisible[e];
     g_presentMarker.targetVis = g_targetVisible[e];
@@ -873,7 +881,13 @@ void DrawScopeBars(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int eye = 0) {
     if (crop.right <= crop.left || crop.bottom <= crop.top)
         crop = {0, 0, static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)};
     float pk = g_presentPercent / 100.0f, mx = d.Width * 0.5f, my = d.Height * 0.5f;
-    float cx = mx + (0.5f * (crop.left + crop.right) - mx) * pk, cy = my + (0.5f * (crop.top + crop.bottom) - my) * pk;
+    // Col cannocchiale la proiezione e' simmetrica: il davanti dell'occhio
+    // (tangente 0, dove stanno l'immagine ingrandita e il reticolo) e' il
+    // centro del back buffer, non il centro del ritaglio dell'occhio. Prima il
+    // cerchio stava ~15 gradi verso l'esterno in ciascun occhio e ~13 in basso:
+    // i due cerchi non si fondevano (audit 20/10). La risoluzione dinamica
+    // restringe attorno al centro, che quindi non si sposta.
+    float cx = mx, cy = my;
     float rad = 0.42f * 0.5f * (crop.bottom - crop.top) * pk;
     const int kStrips = 62;
     D3DRECT r[2 * kStrips + 4];
@@ -934,7 +948,9 @@ void DrawVignette(IDirect3DDevice9* dev, IDirect3DSurface9* bb, int eye) {
     bool oc = g_presentOffCenter && vr::output::OffCenterProjection(eye == 1 ? 1 : 0, &pj);
     if (oc || crop.right <= crop.left || crop.bottom <= crop.top)
         crop = {0, 0, static_cast<LONG>(d.Width), static_cast<LONG>(d.Height)};
-    float cx = 0.5f * (crop.left + crop.right), cy = 0.5f * (crop.top + crop.bottom);
+    // Davanti dell'occhio: centro del back buffer con la proiezione simmetrica
+    // (non il centro del ritaglio, che e' spostato verso l'esterno; audit 20/10).
+    float cx = 0.5f * d.Width, cy = 0.5f * d.Height;
     float hx = 0.5f * (crop.right - crop.left), hy = 0.5f * (crop.bottom - crop.top);
     if (oc) {  // centro dell'occhio (davanti) nell'immagine decentrata
         cx = (0.5f + 0.5f * pj.m20) * d.Width;
@@ -1320,6 +1336,7 @@ struct CanvasMatrixState {
     bool adjusted = false;
     UINT reg = 0;
     float orig[16], adj[16];
+    float full[16];  // originale ristretta come la scena (risoluzione dinamica)
 };
 CanvasMatrixState g_canvasState;
 
@@ -1344,7 +1361,10 @@ bool IsFullScreenCanvasDraw(UINT nv, const void* v, UINT stride) {
 template <typename Draw>
 HRESULT DrawCanvasMaybeFullScreen(IDirect3DDevice9* d, UINT nv, const void* v, UINT stride, Draw draw) {
     if (!IsFullScreenCanvasDraw(nv, v, stride)) return draw();
-    g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.orig, 4);
+    // Matrice originale ma ristretta come la scena: con la risoluzione dinamica
+    // al 70% la scena occupa il 70% centrale, e il sangue ai bordi disegnato a
+    // tutto viewport finiva fuori dall'immagine inviata (audit 20/10).
+    g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.full, 4);
     HRESULT hr = draw();
     g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.adj, 4);
     return hr;
@@ -1471,6 +1491,16 @@ HRESULT WINAPI Hooked_SetVertexShaderConstantF(
         g_canvasState.reg = StartRegister;
         std::memcpy(g_canvasState.orig, pConstantData, sizeof(g_canvasState.orig));
         std::memcpy(g_canvasState.adj, hud, sizeof(g_canvasState.adj));
+        {
+            FrameTag cur;
+            float pk = (PeekRenderingTag(&cur) ? cur.screenPercent : g_presentPercent.load()) / 100.0f;
+            if (!(pk > 0.2f && pk <= 1.0f) || g_scopeActive) pk = 1.0f;
+            std::memcpy(g_canvasState.full, pConstantData, sizeof(g_canvasState.full));
+            for (int i = 0; i < 4; ++i) {
+                g_canvasState.full[4 * i + 0] *= pk;
+                g_canvasState.full[4 * i + 1] *= pk;
+            }
+        }
         return g_SetVertexShaderConstantF_Original(self, StartRegister, hud, Vector4fCount);
     }
     if (StartRegister <= g_canvasState.reg + 3 && StartRegister + Vector4fCount > g_canvasState.reg)
@@ -5894,8 +5924,12 @@ public:
                 for (int i = 0; i < 3; ++i) lastView[i] = outLoc[i];
             }
             // Nel cannocchiale entrambi gli occhi vedono la stessa immagine
-            // (niente disparita' ingrandita 5-6 volte).
-            float eyeK = g_scopeActive ? 0.0f : 1.0f;
+            // (niente disparita' ingrandita 5-6 volte). Non esattamente zero:
+            // con origini identiche il riconoscimento dell'occhio (anello delle
+            // origini) sceglieva a caso e le immagini si scambiavano; il 2%
+            // della meta' IPD (~1,6 mm) basta a distinguerle (oltre la tolleranza di 0,01 anche a coordinate da 30000) e non si vede
+            // (audit 20/10).
+            float eyeK = g_scopeActive ? 0.05f : 1.0f;
             outLoc[0] = origin[0] + dx * t + eyeOff[0] * eyeK;
             outLoc[1] = origin[1] + dy * t + eyeOff[1] * eyeK;
             outLoc[2] = origin[2] + dz * t + eyeOff[2] * eyeK;

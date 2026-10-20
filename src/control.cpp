@@ -792,7 +792,10 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "offcenter") {
         std::string v;
         in >> v;
-        g_offCenter = OnOff(cmd, v, true);
+        bool on = OnOff(cmd, v, true);
+        // Il ritaglio degli occhi dipende dal tipo di proiezione: va
+        // ricalcolato (prima restava quello vecchio, immagine schiacciata; audit 20/10).
+        if (g_offCenter.exchange(on) != on) g_vrProjectionDirty = true;
     } else if (cmd == "projflip") {
         // Prova nel visore: alto e basso del frustum degli occhi scambiati
         // (on = come fino alla 0.9.5).

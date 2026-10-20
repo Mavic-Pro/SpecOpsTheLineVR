@@ -476,16 +476,10 @@ bool EnsureResources(IDirect3DDevice9* device, UINT w, UINT h) {
         Disable("CreateRenderTarget fallita hr=" + Hex(hr));
         return false;
     }
-    for (int e = 0; e < 2; ++e) {
-        for (int k = 0; k < kSlots; ++k) {
-            hr = device->CreateOffscreenPlainSurface(w, h, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
-                                                     &g_sysmem[e][k], nullptr);
-            if (FAILED(hr)) {
-                Disable("CreateOffscreenPlainSurface fallita hr=" + Hex(hr));
-                return false;
-            }
-        }
-    }
+    // Le superfici in memoria di sistema (lettura dalla CPU) si creano solo
+    // quando servono (schermo virtuale, "gpushare off"): con la copia via GPU
+    // erano ~170 MB di spazio di indirizzi sprecato in un processo a 32 bit
+    // (audit 20/10). Vedi EnsureSysmem.
     // D3DFMT_A8R8G8B8 in memoria = byte B,G,R,A = DXGI_FORMAT_B8G8R8A8_UNORM.
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = w;
@@ -1134,6 +1128,13 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     double t0 = QpcMs();
     float scale = vr::control::g_outputScale;
     UINT texW = static_cast<UINT>(g_cropW * scale + 0.5f), texH = static_cast<UINT>(g_cropH * scale + 0.5f);
+    // Proiezione non ancora calcolata (SteamVR non pronto al primo frame):
+    // si aspetta. Prima EnsureResources(0, 0) falliva e l'uscita verso il
+    // visore restava spenta per tutta la sessione (audit 20/10).
+    if (texW == 0 || texH == 0) {
+        backBuffer->Release();
+        return;
+    }
     bool ok = EnsureResources(device, texW, texH);
     if (!ok) {
         backBuffer->Release();
@@ -1243,6 +1244,13 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotTick[e][s] = g_renderTick[e];
             g_slotSeq[e][s] = g_presentSeq;
             g_gpuSlot[e] = s;
+            continue;
+        }
+        if (!g_sysmem[e][s] &&
+            FAILED(device->CreateOffscreenPlainSurface(g_width, g_height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+                                                       &g_sysmem[e][s], nullptr))) {
+            g_sysmem[e][s] = nullptr;
+            if (frame % 300 == 1) vr::log::Line("VR-OUTPUT: CreateOffscreenPlainSurface failed.");
             continue;
         }
         if (FAILED(device->StretchRect(backBuffer, &src, g_sharedSurface, &dst,

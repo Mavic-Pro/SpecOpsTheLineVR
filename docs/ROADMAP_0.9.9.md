@@ -39,15 +39,15 @@ Status: [ ] todo, [x] done (committed), [~] done but needs headset check.
 - [~] B14 Display spoof wanted size updated on Reset (setres)
 
 ## C. Rendering
-- [ ] C1 Scope circle/vignette centred on tangent (0,0) per eye
-- [ ] C2 Scope: eye recognition with eyeK=0 (skip RecordEyeOrigin)
+- [~] C1 Scope circle/vignette centred on tangent (0,0) per eye
+- [~] C2 Scope: eye recognition with eyeK=0 (skip RecordEyeOrigin)
 - [ ] C3 Scope state decided before the two Draws, in the frame tag
-- [ ] C4 Aim marker cleared on cinema frames
-- [ ] C5 Worker: pair ticks must match
-- [ ] C6 Full-screen overlays scaled with dynamic resolution
-- [ ] C7 System-memory surfaces only when needed (32-bit address space)
-- [ ] C8 Output not disabled when crop size is still 0
-- [ ] C9 offcenter change marks projection dirty
+- [~] C4 Aim marker cleared on cinema frames
+- [-] C5 (rejected: the ring tick is diagnostic only, a similar check added stutter on 18/10) Worker: pair ticks must match
+- [~] C6 Full-screen overlays scaled with dynamic resolution
+- [~] C7 System-memory surfaces only when needed (32-bit address space)
+- [~] C8 Output not disabled when crop size is still 0
+- [~] C9 offcenter change marks projection dirty
 - [ ] C10 Film grain off; head-locked material effects reviewed; DoF off without losing bloom
 - [ ] C11 Right-eye view state leak
 
