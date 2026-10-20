@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -344,11 +345,44 @@ void Shot(const std::string& weaponClass, bool twoHanded) {
     }
 }
 
-void Damage(int amount) {
+// Motori del giubbotto TactSuit (bHaptics "Vest"): davanti 0-19, dietro
+// 20-39, 4 colonne per 5 righe (indice = riga * 4 + colonna). Davanti la
+// colonna 0 e' a sinistra di chi lo indossa, dietro a destra (stessa faccia
+// del corpo vista da fuori).
+void VestFrame(const char* key, const std::vector<int>& motors, int intensity, int ms) {
+    std::string dots;
+    for (int i : motors) {
+        if (!dots.empty()) dots += ",";
+        dots += "{\"index\":" + std::to_string(i) + ",\"intensity\":" + std::to_string(intensity) + "}";
+    }
+    Enqueue("{\"Submit\":[{\"Type\":\"frame\",\"Key\":\"" + std::string(key) +
+            "\",\"Frame\":{\"position\":\"Vest\",\"dotPoints\":[" + dots + "],\"durationMillis\":" +
+            std::to_string(ms) + "}}]}");
+}
+
+void Damage(int amount, float angleRad) {
     if (amount <= 0) return;
     int in = std::min(100, 30 + amount * 2);
     Rumble(static_cast<unsigned char>(std::min(255, 60 + amount * 4)), 0.15f, kAll);
-    if (g_bhConnected) Frame("damage", "Vest", 0, 39, in, 150);
+    if (!g_bhConnected) return;
+    if (std::isnan(angleRad)) {
+        Frame("damage", "Vest", 0, 39, in, 150);
+        return;
+    }
+    // Colpo direzionale (audit 20/10: prima vibrava tutto il giubbotto): lato
+    // davanti o dietro, e colonne verso il lato del colpo.
+    float s = std::sin(angleRad), c = std::cos(angleRad);
+    bool front = c >= 0.0f;
+    std::vector<int> motors;
+    for (int row = 0; row < 5; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            // Colonna in coordinate "destra di chi indossa": -1.5 .. +1.5.
+            float x = front ? (col - 1.5f) : (1.5f - col);
+            float want = 1.5f * s;  // davanti/dietro: colonne centrali; di lato: le due del lato
+            if (std::fabs(x - want) <= 1.0f) motors.push_back((front ? 0 : 20) + row * 4 + col);
+        }
+    }
+    VestFrame("damage", motors, in, 150);
 }
 
 void GrenadeThrow() {

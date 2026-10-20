@@ -178,6 +178,10 @@ extern std::atomic<uint64_t> g_meleeIntentMs;
 extern std::atomic<bool> g_exiting;
 // "execassist on|off" (predefinito on).
 extern std::atomic<bool> g_execAssist;
+// "honestreload on|off": col caricatore fuori (ricarica fisica) non si spara.
+extern std::atomic<bool> g_honestReload;
+// "audiolog N": N righe di diagnostica dell'ascoltatore FMOD.
+extern std::atomic<int> g_audioLog;
 extern std::atomic<int32_t> g_weaponAmmo[2];
 // Tasto squadra (RB) premuto nell'input passato al gioco: comando alla squadra.
 extern std::atomic<bool> g_squadButtonHeld;
@@ -234,6 +238,11 @@ extern std::atomic<float> g_turnSpeedDeg;
 // (fuori dalla copertura), "body" = verso il corpo. g_headYawUnits = testa
 // rispetto al corpo (unita' Rotator), scritto da hooks.
 extern std::atomic<bool> g_moveWithHead;
+// "movedir hand" e yaw del controller sinistro rispetto al corpo (unita' UE,
+// stesso riferimento di g_headYawUnits).
+extern std::atomic<bool> g_moveDirHand;
+extern std::atomic<int32_t> g_leftYawUnits;
+extern std::atomic<bool> g_leftYawValid;
 // Eventi di SteamVR (vr_session): dashboard aperta, richiesta di pausa del
 // gioco (Start una volta, vr_input), proiezione degli occhi da ricalcolare.
 extern std::atomic<bool> g_vrDashboard;

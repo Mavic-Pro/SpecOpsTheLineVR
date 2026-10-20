@@ -11,8 +11,10 @@ void Start();  // all'avvio (thread propri, non blocca)
 
 // Colpo sparato dall'arma del giocatore. strength 0..1 (dipende dall'arma).
 void Shot(const std::string& weaponClass, bool twoHanded);
-// Danno subito (salute persa); front = colpo da davanti (se noto).
-void Damage(int amount);
+// Danno subito (salute persa). angleRad: direzione da cui arriva il colpo
+// rispetto alla testa (0 = davanti, +pi/2 = destra, +-pi = dietro); NAN se
+// non nota (tutto il giubbotto).
+void Damage(int amount, float angleRad);
 // Gesti e azioni.
 void GrenadeThrow();
 void Melee();

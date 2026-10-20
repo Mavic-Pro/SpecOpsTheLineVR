@@ -57,6 +57,9 @@ std::atomic<bool> g_leftOnGun{false};
 std::atomic<bool> g_headSampleOnDraw{true};
 std::atomic<float> g_turnSpeedDeg{150.0f};
 std::atomic<bool> g_moveWithHead{true};
+std::atomic<bool> g_moveDirHand{false};
+std::atomic<int32_t> g_leftYawUnits{0};
+std::atomic<bool> g_leftYawValid{false};
 std::atomic<bool> g_vrDashboard{false};
 std::atomic<bool> g_vsDiag{false};
 std::atomic<bool> g_fades{true};
@@ -159,6 +162,8 @@ std::atomic<uint32_t> g_weaponPtr{0};
 std::atomic<uint64_t> g_meleeIntentMs{0};
 std::atomic<bool> g_exiting{false};
 std::atomic<bool> g_execAssist{true};
+std::atomic<bool> g_honestReload{true};
+std::atomic<int> g_audioLog{0};
 std::atomic<int32_t> g_weaponAmmo[2] = {{-1}, {-1}};
 std::atomic<bool> g_squadButtonHeld{false};
 std::atomic<bool> g_autoUpdate{true};
@@ -314,7 +319,15 @@ bool OnOff(const std::string& cmd, const std::string& v, bool def) {
 }
 
 bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
-    if (cmd == "execassist") {
+    if (cmd == "audiolog") {
+        int n = 10;
+        in >> n;
+        g_audioLog = n;
+    } else if (cmd == "honestreload") {
+        std::string v;
+        in >> v;
+        g_honestReload = OnOff(cmd, v, true);
+    } else if (cmd == "execassist") {
         std::string v;
         in >> v;
         g_execAssist = OnOff(cmd, v, true);
@@ -339,6 +352,9 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_moveWithHead = (v != "body");
+        // "movedir hand": verso dove punta il controller sinistro (camminare
+        // guardando altrove, come in molti giochi VR; 20/10).
+        g_moveDirHand = (v == "hand");
     } else if (cmd == "vsdiag") {
         std::string v;
         in >> v;

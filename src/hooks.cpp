@@ -200,6 +200,9 @@ SetVertexShaderConstantF_t g_SetVertexShaderConstantF_Original = nullptr;
 
 void UpdateHeadTracking();
 void ExecutionAssist(void* pc, void* pawn);
+float HitAngleFromHead(void* pawn);
+void InstallAudioListenerHook();
+void RotatorToAxes(int32_t pitchU, int32_t yawU, int32_t rollU, float* fwd, float* right, float* up);
 bool TrySafeReadUint32(void* addr, uint32_t* outValue);
 extern std::atomic<bool> g_onTurret;
 extern std::atomic<int32_t> g_turretYawUnits;
@@ -2729,7 +2732,7 @@ public:
             void* pw = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
             int32_t hp = 0;
             if (pw && TrySafeReadUint32(static_cast<char*>(pw) + 0x304, reinterpret_cast<uint32_t*>(&hp))) {
-                if (pw == lastPawn && hp < lastHealth && hp >= 0) vr::haptics::Damage(lastHealth - hp);
+                if (pw == lastPawn && hp < lastHealth && hp >= 0) vr::haptics::Damage(lastHealth - hp, HitAngleFromHead(pw));
                 lastPawn = pw;
                 lastHealth = hp;
             }
@@ -3142,6 +3145,67 @@ bool PatchIat(uintptr_t slot, const char* name, void* replacement, Memcpy_t* out
     VirtualProtect(entry, sizeof(void*), old, &old);
     vr::log::Line(std::string("IAT: hook on ") + name + " installed.");
     return true;
+}
+
+// --- Audio: ascoltatore 3D di FMOD ---------------------------------------------
+//
+// Il gioco importa FMOD::EventSystem::set3DListenerAttributes (fmod_event.dll,
+// IAT 0x01109878): __stdcall con this sullo stack. Diagnostica (20/10): ogni
+// 2 s posizione/avanti/alto passati dal gioco, con la vista disegnata (testa)
+// e la camera logica (canna), per capire cosa segue l'audio.
+struct FmodVec {
+    float x, y, z;
+};
+typedef int(__stdcall* SetListener_t)(void* self, int listener, const FmodVec* pos, const FmodVec* vel,
+                                      const FmodVec* fwd, const FmodVec* up);
+SetListener_t g_setListenerReal = nullptr;
+constexpr uintptr_t kIatFmodSetListener = 0x01109878;
+
+int __stdcall Hooked_SetListener(void* self, int listener, const FmodVec* pos, const FmodVec* vel, const FmodVec* fwd,
+                                 const FmodVec* up) {
+    if (vr::control::g_audioLog > 0 && pos && fwd && up) {
+        static ULONGLONG last = 0;
+        if (GetTickCount64() - last > 2000) {
+            last = GetTickCount64();
+            vr::control::g_audioLog.fetch_sub(1);
+            float vf[3], vr_[3], vu[3];
+            RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, vf, vr_, vu);
+            float cf[3] = {0, 0, 0}, cr[3], cu[3], cl[3] = {0, 0, 0};
+            char* cam = static_cast<char*>(g_cameraPtr.load());
+            if (cam && HasCameraSignature(cam)) {
+                int32_t* rot = reinterpret_cast<int32_t*>(cam + kCameraOffsetPitch);
+                RotatorToAxes(rot[0], rot[1], 0, cf, cr, cu);
+                std::memcpy(cl, cam + 0x10, sizeof(cl));
+            }
+            char b[600];
+            snprintf(b, sizeof(b),
+                     "AUDIO: listener %d pos (%.1f %.1f %.1f) fwd (%.2f %.2f %.2f) up (%.2f %.2f %.2f) | view loc (%.1f %.1f "
+                     "%.1f) fwd (%.2f %.2f %.2f) | camera loc (%.1f %.1f %.1f) fwd (%.2f %.2f %.2f)",
+                     listener, pos->x, pos->y, pos->z, fwd->x, fwd->y, fwd->z, up->x, up->y, up->z, g_lastViewLoc[0],
+                     g_lastViewLoc[1], g_lastViewLoc[2], vf[0], vf[1], vf[2], cl[0], cl[1], cl[2], cf[0], cf[1], cf[2]);
+            vr::log::Line(b);
+        }
+    }
+    return g_setListenerReal(self, listener, pos, vel, fwd, up);
+}
+
+void InstallAudioListenerHook() {
+    HMODULE ev = GetModuleHandleA("fmod_event.dll");
+    void* expected =
+        ev ? reinterpret_cast<void*>(GetProcAddress(
+                 ev, "?set3DListenerAttributes@EventSystem@FMOD@@QAG?AW4FMOD_RESULT@@HPBUFMOD_VECTOR@@000@Z"))
+           : nullptr;
+    void** entry = reinterpret_cast<void**>(kIatFmodSetListener);
+    if (!expected || *entry != expected) {
+        vr::log::Line("AUDIO: FMOD listener entry unexpected, audio hook NOT installed.");
+        return;
+    }
+    DWORD old;
+    if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &old)) return;
+    g_setListenerReal = reinterpret_cast<SetListener_t>(expected);
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(entry), reinterpret_cast<LONG>(&Hooked_SetListener));
+    VirtualProtect(entry, sizeof(void*), old, &old);
+    vr::log::Line("AUDIO: hook on the FMOD 3D listener installed.");
 }
 
 void DumpCamera(void* camera) {
@@ -3789,6 +3853,8 @@ void UpdateHeadTracking() {
                 float right[3] = {g_handOffset[0], g_handOffset[1], g_handOffset[2]};
                 for (int i = 0; i < 3; ++i) g_leftOffset[i] = left[i];
                 g_leftYaw = vr::control::g_yawSign * RadiansToUnreal(YawFromOpenVrPose(lm) - g_hmdYawReference);
+                vr::control::g_leftYawUnits = g_leftYaw.load();
+                vr::control::g_leftYawValid = true;
                 g_leftPitch = vr::control::g_pitchSign *
                               RadiansToUnreal(PitchFromOpenVrPose(lm) + vr::control::g_aimPitchOffsetDeg * 0.01745329252f);
                 float lRightY = lm.m[1][0];
@@ -4931,7 +4997,8 @@ void UpdateFirstPersonBody(void* pawn) {
         // Guardando in basso (oltre 30 gradi) il rialzo si toglie: sotto di se'
         // si vede il corpo accucciato a terra, non l'interno del colletto.
         if (!onMount) {
-            if (vr::control::g_crouchViewReal) z += GameCrouchDrop(pawn) * (1.0f - look);
+            // Seduti non ci si puo' accovacciare davvero: vista come nel gioco (20/10).
+            if (vr::control::g_crouchViewReal && !vr::control::g_seated) z += GameCrouchDrop(pawn) * (1.0f - look);
             float headDrop = g_headOffset[2].load();
             if (headDrop < 0.0f) z += headDrop;
         }
@@ -5696,7 +5763,7 @@ public:
             // lui la vista, senza che il giocatore si muova. Si toglie quella
             // differenza: l'altezza della vista resta quella della testa vera
             // sul pavimento (audit 19/10). "crouchview game": come il gioco.
-            if (vr::control::g_crouchViewReal) {
+            if (vr::control::g_crouchViewReal && !vr::control::g_seated) {
                 char* camC = static_cast<char*>(g_cameraPtr.load());
                 void* pawnC = HasCameraSignature(camC) ? PlayerPawnIfViewTarget(camC) : nullptr;
                 if (PawnOnFirmGround(pawnC)) base[2] += GameCrouchDrop(pawnC);  // sui mezzi come il gioco
@@ -6397,6 +6464,21 @@ void ExecutionAssist(void* pc, void* pawn) {
     snprintf(b, sizeof(b), "EXECUTE: B near %s %.0f units away, body turned %.0f degrees toward it",
              vr::script::ClassName(best).c_str(), bestD, delta * 360.0f / 65536.0f);
     vr::log::Line(b);
+}
+
+// Direzione dell'ultimo colpo subito rispetto allo sguardo, per il giubbotto
+// bHaptics: Pawn.LastHitBy (+0x3C4, il Controller di chi ha sparato) ->
+// Pawn (+0x1F8) -> posizione. NAN se non nota.
+float HitAngleFromHead(void* pawn) {
+    uint32_t ctrl = 0, attacker = 0;
+    float me[3], at[3];
+    if (!pawn || !TrySafeReadUint32(static_cast<char*>(pawn) + 0x3C4, &ctrl) || !ctrl ||
+        !TrySafeReadUint32(reinterpret_cast<char*>(ctrl) + 0x1F8, &attacker) || !attacker || attacker == reinterpret_cast<uintptr_t>(pawn) ||
+        !SafeCopy(me, static_cast<char*>(pawn) + 0x54, 12) || !SafeCopy(at, reinterpret_cast<char*>(attacker) + 0x54, 12))
+        return std::nanf("");
+    float toAttacker = std::atan2(at[1] - me[1], at[0] - me[0]);
+    float view = g_lastViewRot[1] * (6.28318530718f / 65536.0f);
+    return std::remainder(toAttacker - view, 6.28318530718f);
 }
 
 // --- Comando alla squadra lungo la canna ---------------------------------------
@@ -7109,6 +7191,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     }
 
     PatchIat(kIatMemcpy, "memcpy", reinterpret_cast<void*>(&Hooked_memcpy), &g_memcpyReal);
+    InstallAudioListenerHook();
     PatchIat(kIatMemmove, "memmove", reinterpret_cast<void*>(&Hooked_memmove), &g_memmoveReal);
 
     g_openVrReady = InitOpenVR();

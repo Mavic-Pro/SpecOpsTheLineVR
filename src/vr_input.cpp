@@ -834,6 +834,9 @@ public:
     }
 
     bool SuppressRightGrip() const { return m_gripIsSwap; }
+    // Ricarica onesta: col caricatore fuori dall'arma (espulso o nuovo in mano)
+    // il grilletto non spara ("honestreload off" per il comportamento di prima).
+    bool MagazineOut() const { return m_mag != Mag::In; }
     // Grip sinistro dell'arma o della ricarica: non arriva al gioco come LB
     // (granata). Deciso alla pressione (Update).
     bool SuppressLeftGrip() const { return !m_lbAllowed; }
@@ -1171,6 +1174,7 @@ WORD ApplyGestures(XGamepad* pad) {
     // (pad vero o input finto) il grip non c'e' e LB passa com'e'.
     if (g_gestures.SuppressLeftGrip() && s.leftValid) pad->wButtons &= ~kLB;
     if (g_gestures.SuppressRightGrip()) pad->wButtons &= ~kRB;
+    if (vr::control::g_honestReload && g_gestures.MagazineOut()) pad->bRightTrigger = 0;
     return g;
 }
 
@@ -1353,7 +1357,9 @@ void ApplyVrStickRules(XGamepad* pad) {
     // a 45 gradi (turnwithhead) di lato rispetto allo sguardo (audit 19/10).
     // In copertura no: li' lo stick muove lungo il riparo.
     if (vr::control::g_moveWithHead && !vr::control::g_inCover && !vr::control::g_gameLocked) {
-        float a = vr::control::g_headYawUnits.load() * (6.28318530718f / 65536.0f);
+        int32_t dirUnits = vr::control::g_moveDirHand && vr::control::g_leftYawValid ? vr::control::g_leftYawUnits.load()
+                                                                                      : vr::control::g_headYawUnits.load();
+        float a = dirUnits * (6.28318530718f / 65536.0f);
         float lx = pad->sThumbLX / 32767.0f, ly = pad->sThumbLY / 32767.0f;
         float fwd = ly * std::cos(a) - lx * std::sin(a);
         float rt = ly * std::sin(a) + lx * std::cos(a);

@@ -60,8 +60,8 @@ Status: [ ] todo, [x] done (committed), [~] done but needs headset check.
 - [~] D6 Installer: accept Binaries\Win32 / exe path, non-Steam (GOG) path
 
 ## E. Full-VR features
-- [ ] E1 Honest reload: no fire with the magazine out; optional chambering
-- [ ] E2 Head-relative audio (FMOD listener)
+- [~] E1 (honestreload; chambering TODO) Honest reload: no fire with the magazine out; optional chambering
+- [x] E2 (checked 20/10: the FMOD listener already follows the rendered view/head, not the gun; hook kept as "audiolog" diagnostic) Head-relative audio (FMOD listener)
 - [ ] E3 Wrist / weapon HUD (ammo, grenades, objective), game HUD widgets hidden
 - [ ] E4 Body holsters: primary shoulder, secondary hip, grenades chest, magazines belt
 - [ ] E5 Physical grenades: grab, hold, throw strength = distance
@@ -70,7 +70,7 @@ Status: [ ] todo, [x] done (committed), [~] done but needs headset check.
 - [ ] E8 Squad orders by pointing with the left hand
 - [ ] E9 Comfort in scripted camera/vehicle sequences
 - [ ] E10 Moral choices / QTE by gestures (ending: gun to the temple)
-- [ ] E11 Directional bHaptics damage
+- [~] E11 Directional bHaptics damage
 - [ ] E12 Laser pointer in cinema-screen menus
-- [ ] E13 Seated / one-handed presets, movedir hand
+- [~] E13 (movedir hand, seated -> game crouch view; one-handed TODO) Seated / one-handed presets, movedir hand
 - [ ] E14 Hidden-area mesh (performance)
