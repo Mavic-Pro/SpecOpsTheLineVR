@@ -469,12 +469,51 @@ bool DetectContentRowsGpu(UINT* top, UINT* bottom) {
 // seguono il cursore e mostrano il loro), grilletto = clic sinistro. Niente
 // input focus di SteamVR sull'overlay: i tasti restano al gioco (oggi un
 // overlay interattivo aveva "spento" i tasti, 21/10). Non con il menu del mod aperto.
+// Puntino del laser: overlay di 3 cm posato sullo schermo nel punto colpito
+// (il menu del gioco non mostra un cursore proprio, 21/10).
+vr::VROverlayHandle_t g_cursorOverlay = vr::k_ulOverlayHandleInvalid;
+bool g_cursorVisible = false;
+vr::HmdMatrix34_t g_cinemaXform = {};
+void HideLaserCursor() {
+    if (g_cursorVisible && vr::VROverlay() && g_cursorOverlay != vr::k_ulOverlayHandleInvalid)
+        vr::VROverlay()->HideOverlay(g_cursorOverlay);
+    g_cursorVisible = false;
+}
+void ShowLaserCursor(vr::IVROverlay* ov, const vr::HmdVector3_t& point) {
+    if (g_cursorOverlay == vr::k_ulOverlayHandleInvalid) {
+        if (ov->CreateOverlay("specopsvr.cursor", "SpecOpsVR laser dot", &g_cursorOverlay) != vr::VROverlayError_None) {
+            g_cursorOverlay = vr::k_ulOverlayHandleInvalid;
+            return;
+        }
+        // Cerchio rosso con bordo chiaro, 32x32 RGBA.
+        std::vector<uint32_t> px(32 * 32, 0);
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 32; ++x) {
+                float dx = x - 15.5f, dy = y - 15.5f, d = std::sqrt(dx * dx + dy * dy);
+                if (d < 10.0f) px[y * 32 + x] = 0xFF3030FFu;        // ABGR: rosso pieno
+                else if (d < 13.0f) px[y * 32 + x] = 0xFFF0F0F0u;   // bordo chiaro
+            }
+        ov->SetOverlayRaw(g_cursorOverlay, px.data(), 32, 32, 4);
+        ov->SetOverlayWidthInMeters(g_cursorOverlay, 0.03f);
+        ov->SetOverlaySortOrder(g_cursorOverlay, 900);
+    }
+    vr::HmdMatrix34_t t = g_cinemaXform;
+    // Un centimetro davanti allo schermo (lungo la sua normale, colonna Z).
+    t.m[0][3] = point.v[0] + t.m[0][2] * 0.01f;
+    t.m[1][3] = point.v[1] + t.m[1][2] * 0.01f;
+    t.m[2][3] = point.v[2] + t.m[2][2] * 0.01f;
+    ov->SetOverlayTransformAbsolute(g_cursorOverlay, vr::TrackingUniverseStanding, &t);
+    if (!g_cursorVisible) ov->ShowOverlay(g_cursorOverlay);
+    g_cursorVisible = true;
+}
+
 void CinemaLaserTick(bool cinema) {
     static bool triggerWas = false, hitWas = false;
     static int logged = 0;
     if (!cinema || !g_cinemaShown || !vr::control::g_cinemaLaser || vr::menu::IsOpen() ||
         !vr::control::g_gunCtrlPoseValid || g_cinemaOverlay == vr::k_ulOverlayHandleInvalid) {
         hitWas = false;
+        HideLaserCursor();
         return;
     }
     vr::IVROverlay* ov = vr::VROverlay();
@@ -489,8 +528,10 @@ void CinemaLaserTick(bool cinema) {
     vr::VROverlayIntersectionResults_t r = {};
     if (!ov->ComputeOverlayIntersection(g_cinemaOverlay, &p, &r)) {
         hitWas = false;
+        HideLaserCursor();
         return;
     }
+    ShowLaserCursor(ov, r.vPoint);
     float u = r.vUVs.v[0], v = r.vUVs.v[1];
     if (!vr::control::g_cinemaLaserFlipY) v = 1.0f - v;  // OpenVR: UV con origine in basso a sinistra (da provare)
     if (!(u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) || !g_cinemaTexW || !g_cinemaTexH) return;
@@ -506,21 +547,35 @@ void CinemaLaserTick(bool cinema) {
                 static_cast<LONG>(texY / g_cinemaTexH * (rc.bottom - rc.top))};
     ClientToScreen(h, &pt);
     SetCursorPos(pt.x, pt.y);
+    POINT now = {};
+    GetCursorPos(&now);
+    bool moved = std::abs(now.x - pt.x) <= 2 && std::abs(now.y - pt.y) <= 2;
     bool trigger = vr::control::g_rightTriggerHeld;
     bool edge = trigger != triggerWas;
     if (edge) {
-        INPUT in = {};
-        in.type = INPUT_MOUSE;
-        in.mi.dwFlags = trigger ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-        SendInput(1, &in, sizeof(in));
+        // Il clic va solo se sotto il cursore c'e' la finestra del gioco:
+        // un clic su un'altra finestra toglieva il focus al gioco (21/10).
+        HWND under = WindowFromPoint(pt);
+        bool ours = under == h || IsChild(h, under);
+        if (ours) {
+            INPUT in = {};
+            in.type = INPUT_MOUSE;
+            in.mi.dwFlags = trigger ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+            SendInput(1, &in, sizeof(in));
+        } else if (logged < 6) {
+            char title[80] = {};
+            if (under) GetWindowTextA(under, title, sizeof(title));
+            vr::log::Line(std::string("LASER: click skipped, window under the cursor is not the game (") + title + ").");
+        }
+        if (GetForegroundWindow() != h) SetForegroundWindow(h);
     }
     triggerWas = trigger;
     if ((!hitWas || edge) && logged < 6) {
         ++logged;
         char b[200];
-        std::snprintf(b, sizeof(b), "LASER: screen hit uv=(%.3f, %.3f) rows %u-%u -> client (%ld, %ld) of %ldx%ld%s", u,
-                      r.vUVs.v[1], top, bottom, pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top,
-                      edge ? (trigger ? " click down" : " click up") : "");
+        std::snprintf(b, sizeof(b), "LASER: screen hit uv=(%.3f, %.3f) rows %u-%u -> screen (%ld, %ld), client %ldx%ld, cursor %s%s", u,
+                      r.vUVs.v[1], top, bottom, pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top, moved ? "moved" : "NOT moved",
+                      edge ? (trigger ? ", click down" : ", click up") : "");
         vr::log::Line(b);
     }
     hitWas = true;
@@ -557,6 +612,7 @@ void ShowCinemaOverlay() {
     t.m[1][0] = 0.0f; t.m[1][1] = 1.0f; t.m[1][2] = 0.0f; t.m[1][3] = pose.bPoseIsValid ? m.m[1][3] : 1.6f;
     t.m[2][0] = -zx;  t.m[2][1] = 0.0f; t.m[2][2] = zz; t.m[2][3] = m.m[2][3] + fz * dist;
     ov->SetOverlayTransformAbsolute(g_cinemaOverlay, vr::TrackingUniverseStanding, &t);
+    g_cinemaXform = t;
     ov->SetOverlayWidthInMeters(g_cinemaOverlay, vr::control::g_cinemaWidthM);
     ov->ShowOverlay(g_cinemaOverlay);
     g_cinemaShown = true;
@@ -589,6 +645,7 @@ void DetectContentRows(const uint8_t* bits, UINT pitch, UINT w, UINT h, UINT* to
 void HideCinemaOverlay() {
     if (!g_cinemaShown) return;
     if (vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->HideOverlay(g_cinemaOverlay);
+    HideLaserCursor();
     g_cinemaShown = false;
     vr::log::Line("CINEMA: virtual screen hidden.");
 }

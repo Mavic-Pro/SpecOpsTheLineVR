@@ -5189,6 +5189,25 @@ ArmRig g_rig;
 // quell'osso: orientando la mano cosi', l'arma ha l'orientamento del controller.
 float g_handInWeapon[2][3][3];
 bool g_handInWeaponValid[2] = {false, false};
+// Mancini ("hand left" + "armswap on"): il lato 0 (arma) e' il braccio
+// SINISTRO di Walker e il lato 1 (supporto) il destro; l'arma viene
+// riagganciata all'osso Weapon_Left. Niente mesh specchiata: l'IK del motore
+// converte gli spazi con atomi a quaternione, che una riflessione rompe
+// (22/10, Ghidra 0x00583610 / GetBoneQuaternion a caso).
+inline bool ArmsSwapped() { return vr::control::g_leftHanded && vr::control::g_armSwap; }
+inline bool WalkerRightArm(int side) { return (side == 0) != ArmsSwapped(); }
+inline const char* HandBone(int side) { return WalkerRightArm(side) ? "Hand_Right" : "Hand_Left"; }
+inline const char* WeaponBone(int side) { return WalkerRightArm(side) ? "Weapon_Right" : "Weapon_Left"; }
+inline const char* IkHelperBone(int side) { return WalkerRightArm(side) ? "IK_Hand_R" : "IK_Hand_L"; }
+inline const char* ShoulderBone(int side) { return WalkerRightArm(side) ? "Arm_Right" : "Arm_Left"; }
+// Corpo specchiato (mancini): stato condiviso tra corpo, braccia e misure.
+bool g_fpMirrored = false;
+int g_unmirrorFrames = 0;  // frame senza specchio per rimisurare la relazione mano/arma (cambio d'arma)
+// Mancini: dopo il riaggancio dell'arma la mano sinistra resta all'animazione
+// per questi frame e la relazione mano/arma si misura all'ultimo, ferma; poi
+// non si rimisura piu' (misurarla con la mano guidata faceva ruotare la
+// relazione di ~10 gradi a ogni misura, spirale, 22/10).
+int g_relaxFrames = 0;
 float g_armEyeBase[3];
 bool g_armEyeBaseValid = false;
 
@@ -5230,7 +5249,7 @@ bool AcquireArms(void* mesh) {
     ReleaseArms();
     std::string names;
     for (int i = 0; i < ArmRig::kCount; ++i) {
-        std::string n = i < 4 ? vr::control::ArmControlName(i) : (i == 4 ? "IKBone_RightHand" : "IKBone_LeftHand");
+        std::string n = i < 4 ? vr::control::ArmControlName(ArmsSwapped() ? (i ^ 1) : i) : (i == 4 ? "IKBone_RightHand" : "IKBone_LeftHand");
         void* c = FindSkelControl(mesh, n);
         names += " " + n + (c ? "=ok" : "=missing");
         if (!c || !SafeCopy(g_rig.saved[i], static_cast<char*>(c) + kCtrlSaveFrom, kCtrlSaveLen)) {
@@ -5380,6 +5399,17 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
     void* limb = g_rig.ctrl[side];
     void* rotc = g_rig.ctrl[2 + side];
     if (!limb) return;
+    if (side == 0 && ArmsSwapped() && g_relaxFrames > 0) {
+        // Mano dell'arma a riposo (animazione) mentre si misura la relazione.
+        static const float zero3[3] = {0, 0, 0};
+        SafeCopy(static_cast<char*>(limb) + kOffCtrlStrength, zero3, 4);
+        SafeCopy(static_cast<char*>(limb) + kOffCtrlStrengthTarget, zero3, 4);
+        if (rotc) {
+            SafeCopy(static_cast<char*>(rotc) + kOffCtrlStrength, zero3, 4);
+            SafeCopy(static_cast<char*>(rotc) + kOffCtrlStrengthTarget, zero3, 4);
+        }
+        return;
+    }
     float mirror = vr::control::PhysicalHand(side) == 0 ? 1.0f : -1.0f;  // laterale per mano fisica (M17)
     const float* hf = axes[0];
     const float* hr = axes[1];
@@ -5391,6 +5421,20 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
     WorldToActor(hf, af, ar, au, 1.0f, lf);
     WorldToActor(hr, af, ar, au, 1.0f, lr);
     WorldToActor(hu, af, ar, au, 1.0f, lu);
+    if (g_fpMirrored) {
+        // Mesh specchiata (Scale3D.Y = -1): il motore porta i bersagli in spazio
+        // attore nello spazio del componente con la sua trasformazione. Se vi
+        // include lo specchio, il bersaglio resta com'e' (effY 0) e la
+        // rotazione coniugata (M R M) rende la mano specchiata con avanti e
+        // alto del controller (rot 1); altrimenti Y negata. "mirrortest".
+        if (vr::control::g_mirrorEffNeg) eff[1] = -eff[1];
+        if (vr::control::g_mirrorRotConj) {
+            lf[1] = -lf[1];
+            lu[1] = -lu[1];
+            lr[0] = -lr[0];
+            lr[2] = -lr[2];
+        }
+    }
     int32_t lrot[3];
     AxesToRotator(lf, lr, lu, lrot);
     // Gomito: in basso, verso l'esterno e un po' indietro rispetto alla mano.
@@ -5410,6 +5454,18 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
                  side == 0 ? "right" : "left", pos[0], pos[1], pos[2], eff[0], eff[1], eff[2], lrot[0], lrot[1],
                  lrot[2]);
         vr::log::Line(buf);
+        struct {
+            int32_t name[2];
+            int32_t space;
+            float ret[3];
+        } bl = {{vr::script::NameIndex(HandBone(side)), 0}, 0, {0, 0, 0}};
+        if (g_rig.mesh && vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &bl)) {
+            float dx = bl.ret[0] - pos[0], dy = bl.ret[1] - pos[1], dz = bl.ret[2] - pos[2];
+            snprintf(buf, sizeof(buf), "ARMS %s: actual hand world=(%.1f, %.1f, %.1f), %.1f units from the wanted one%s",
+                     side == 0 ? "right" : "left", bl.ret[0], bl.ret[1], bl.ret[2], std::sqrt(dx * dx + dy * dy + dz * dz),
+                     g_fpMirrored ? " (mirrored body)" : "");
+            vr::log::Line(buf);
+        }
     }
 }
 
@@ -5423,7 +5479,9 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
 bool SupportGripRelation(void* mesh, float pos[3], float rot[3][3]) {
     static void* cachedMesh = nullptr;
     static int idxR = -1, idxL = -1;
-    if (mesh != cachedMesh) {
+    static bool cachedSwap = false;
+    if (mesh != cachedMesh || cachedSwap != ArmsSwapped()) {
+        cachedSwap = ArmsSwapped();
         cachedMesh = mesh;
         idxR = idxL = -1;
         for (int i = 0; i < 256 && (idxR < 0 || idxL < 0); ++i) {
@@ -5433,8 +5491,8 @@ bool SupportGripRelation(void* mesh, float pos[3], float rot[3][3]) {
             } parms = {i, {0, 0}};
             if (!vr::script::CallFunction(mesh, "GetBoneName", &parms) || parms.ret[0] <= 0) break;
             std::string n = vr::script::NameFromIndex(parms.ret[0]);
-            if (n == "IK_Hand_R") idxR = i;
-            if (n == "IK_Hand_L") idxL = i;
+            if (n == IkHelperBone(0)) idxR = i;
+            if (n == IkHelperBone(1)) idxL = i;
         }
         vr::log::Line("ARMS: grip bones IK_Hand_R=" + std::to_string(idxR) + " IK_Hand_L=" + std::to_string(idxL));
     }
@@ -5515,7 +5573,7 @@ bool ArmReach(void* mesh, int side, float shoulder[3], float* reach) {
         int32_t name[2];
         int32_t space;
         float ret[3];
-    } hp = {{vr::script::NameIndex(side == 0 ? "Arm_Right" : "Arm_Left"), 0}, 0, {0, 0, 0}};
+    } hp = {{vr::script::NameIndex(ShoulderBone(side)), 0}, 0, {0, 0, 0}};
     if (hp.name[0] < 0 || !vr::script::CallFunction(mesh, "GetBoneLocation", &hp)) return false;
     std::memcpy(shoulder, hp.ret, 12);
     *reach = minLen * vr::control::g_armStretch;
@@ -5602,13 +5660,188 @@ bool WeaponAxes(void* mesh, int side, void* gunComp, float w[3][3]) {
             if (ok) return true;
         }
     }
-    return BoneAxes(mesh, side == 0 ? "Weapon_Right" : "Weapon_Left", w);
+    return BoneAxes(mesh, WeaponBone(side), w);
+}
+
+// Mancini: l'arma, che il gioco aggancia all'osso Weapon_Right, passa a
+// Weapon_Left riscrivendo il nome dell'osso nella voce Attachments della mesh
+// (FAttachment: Component, BoneName, RelativeLocation/Rotation/Scale, 48
+// byte); l'array si trova cercando la voce con il componente dell'arma. Il
+// motore rilegge il nome a ogni aggiornamento dei figli. Torna indietro con
+// "hand right". Ritorna true quando ha cambiato aggancio (relazione da rimisurare).
+bool UpdateGunAttachment(void* mesh, void* gunComp, void* pawn) {
+    static void* lastComp = nullptr;
+    static bool lastLeft = false;
+    static uint32_t knownOff = 0x348;  // USkeletalMeshComponent.Attachments (visto dal vivo 22/10; se cambia si cerca)
+    static int32_t origName = -1;  // nome originale della voce (osso o socket destro)
+    bool wantLeft = ArmsSwapped();
+    if (!mesh || !gunComp) return false;
+    if (gunComp == lastComp && wantLeft == lastLeft) return false;
+    char* m = static_cast<char*>(mesh);
+    // Voce Attachments con Component == arma: qualsiasi nome (il gioco puo'
+    // agganciare a un socket, non all'osso Weapon_Right).
+    char* entry = nullptr;
+    uint32_t foundOff = 0, foundIdx = 0;
+    for (int pass = 0; pass < 2 && !entry; ++pass)
+    for (uint32_t off = pass == 0 ? knownOff : 0x100; off < 0xC00 && !entry; off += 4) {
+        uint32_t data = 0, num = 0;
+        if (!TrySafeReadUint32(m + off, &data) || !TrySafeReadUint32(m + off + 4, &num) || !data || num == 0 || num > 32) {
+            if (pass == 0) break;
+            continue;
+        }
+        // Passo della voce non fissato (FAttachment qui e' 52 byte, non 48: la
+        // voce dell'arma stava a 312 = 6*52, 22/10): si cerca il puntatore a
+        // passi di 4 byte, seguito da un FName valido.
+        for (uint32_t q = 0; q < num * 64; q += 4) {
+            char* e = reinterpret_cast<char*>(data) + q;
+            uint32_t comp = 0;
+            int32_t bn = 0;
+            if (!TrySafeReadUint32(e, &comp)) break;
+            if (comp != reinterpret_cast<uintptr_t>(gunComp)) continue;
+            if (!TrySafeReadUint32(e + 4, reinterpret_cast<uint32_t*>(&bn)) || bn <= 0 || bn > 200000) continue;
+            entry = e;
+            foundOff = off;
+            foundIdx = q;
+            break;
+        }
+        if (pass == 0) break;
+    }
+    lastComp = gunComp;
+    lastLeft = wantLeft;
+    if (!entry) {
+        static bool logged = false;
+        if (!logged && wantLeft) {
+            logged = true;
+            vr::log::Line("ARMS: weapon attachment entry not found in the pawn mesh (0x100..0xC00): no arm swap for the gun.");
+            // Diagnostica: l'arma e' un attore basato sul Pawn (SetBase con osso)?
+            // Actor.Base +0xAC, poi BaseBoneName / BaseSkelComponent nei dintorni.
+            uint32_t weapon = 0;
+            if (pawn && TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) && weapon) {
+                std::string line = "ARMS: weapon actor fields:";
+                for (uint32_t o = 0xA8; o <= 0xD0; o += 4) {
+                    uint32_t v = 0;
+                    if (!TrySafeReadUint32(reinterpret_cast<char*>(weapon) + o, &v)) continue;
+                    char b[96];
+                    std::string nm = (v > 0 && v < 200000) ? vr::script::NameFromIndex(static_cast<int32_t>(v)) : std::string();
+                    std::snprintf(b, sizeof(b), " +0x%X=%08X%s%s%s", o, v, nm.empty() ? "" : " (name ", nm.c_str(), nm.empty() ? "" : ")");
+                    line += b;
+                }
+                vr::log::Line(line);
+                // Il componente mesh dell'arma: a chi e' agganciato? (UActorComponent.Owner +0x?? non noto: si logga il puntatore del Pawn e della mesh)
+                char b2[120];
+                std::snprintf(b2, sizeof(b2), "ARMS: pawn %p, pawn mesh %p, weapon actor %p, weapon mesh comp %p", pawn, mesh,
+                              reinterpret_cast<void*>(weapon), gunComp);
+                vr::log::Line(b2);
+                // Dove sta il puntatore del componente arma? In ogni TArray della
+                // mesh del Pawn (blocchi fino a num*64 byte) e nei campi diretti.
+                std::string hits = "ARMS: gun comp pointer found in pawn mesh:";
+                for (uint32_t o = 0x0; o < 0xC00; o += 4) {
+                    uint32_t v = 0;
+                    if (!TrySafeReadUint32(m + o, &v)) continue;
+                    if (v == reinterpret_cast<uintptr_t>(gunComp)) {
+                        char b[40];
+                        std::snprintf(b, sizeof(b), " direct+0x%X", o);
+                        hits += b;
+                        continue;
+                    }
+                    uint32_t num = 0;
+                    if (!v || !TrySafeReadUint32(m + o + 4, &num) || num == 0 || num > 64) continue;
+                    for (uint32_t q = 0; q < num * 64; q += 4) {
+                        uint32_t w = 0;
+                        if (!TrySafeReadUint32(reinterpret_cast<char*>(v) + q, &w)) break;
+                        if (w == reinterpret_cast<uintptr_t>(gunComp)) {
+                            int32_t nm = 0;
+                            TrySafeReadUint32(reinterpret_cast<char*>(v) + q + 4, reinterpret_cast<uint32_t*>(&nm));
+                            char b[120];
+                            std::snprintf(b, sizeof(b), " array+0x%X[num %u] at byte %u (next name %s)", o, num, q,
+                                          (nm > 0 && nm < 200000) ? vr::script::NameFromIndex(nm).c_str() : "?");
+                            hits += b;
+                        }
+                    }
+                }
+                vr::log::Line(hits);
+                // Nomi (FName) nell'attore arma attorno al componente mesh (+0x2C0..+0x330).
+                std::string names = "ARMS: weapon actor names near the mesh comp:";
+                for (uint32_t o = 0x2C0; o <= 0x330; o += 4) {
+                    uint32_t v = 0;
+                    if (!TrySafeReadUint32(reinterpret_cast<char*>(weapon) + o, &v) || v == 0 || v > 200000) continue;
+                    std::string nm = vr::script::NameFromIndex(static_cast<int32_t>(v));
+                    if (nm.empty() || nm == "None") continue;
+                    char b[80];
+                    std::snprintf(b, sizeof(b), " +0x%X=%s", o, nm.c_str());
+                    names += b;
+                }
+                vr::log::Line(names);
+            }
+        }
+        return false;
+    }
+    knownOff = foundOff;
+    int32_t cur = 0;
+    TrySafeReadUint32(entry + 4, reinterpret_cast<uint32_t*>(&cur));
+    std::string curName = vr::script::NameFromIndex(cur);
+    if (origName < 0 || (!wantLeft && cur != origName)) {
+        // Prima volta (o nuova arma): il nome di adesso e' quello del gioco.
+        if (origName < 0) {
+            origName = cur;
+            vr::log::Line("ARMS: weapon attached by the game to \"" + curName + "\" (attachments at mesh+0x" +
+                          std::to_string(foundOff) + ", entry " + std::to_string(foundIdx) + ").");
+        }
+    }
+    int32_t target = origName;
+    std::string targetName = vr::script::NameFromIndex(origName);
+    if (wantLeft) {
+        // Nome speculare: Right -> Left, _R -> _L.
+        std::string leftName = targetName;
+        // Weapon_Left non e' rigido rispetto a Hand_Left (la relazione mano/arma
+        // misurata ruotava di ~10 gradi a ogni misura, 22/10): l'arma va
+        // direttamente sull'osso della mano sinistra.
+        if (targetName == "Weapon_Right") leftName = "Hand_Left";
+        size_t q = leftName == targetName ? leftName.find("Right") : std::string::npos;
+        if (q != std::string::npos) leftName.replace(q, 5, "Left");
+        else if (leftName.size() > 2 && leftName.compare(leftName.size() - 2, 2, "_R") == 0) leftName.replace(leftName.size() - 2, 2, "_L");
+        else if (leftName.size() > 1 && leftName.back() == 'R') leftName.back() = 'L';
+        int32_t leftIdx = leftName != targetName ? vr::script::NameIndex(leftName) : -1;
+        // Esiste come osso o come socket?
+        bool exists = false;
+        if (leftIdx >= 0) {
+            for (int i = 0; i < 256 && !exists; ++i) {
+                struct {
+                    int32_t index;
+                    int32_t ret[2];
+                } parms = {i, {0, 0}};
+                if (!vr::script::CallFunction(mesh, "GetBoneName", &parms) || parms.ret[0] <= 0) break;
+                if (parms.ret[0] == leftIdx) exists = true;
+            }
+            if (!exists) {
+                struct {
+                    int32_t name[2];
+                    uint32_t ret;
+                } sp = {{leftIdx, 0}, 0};
+                if (vr::script::CallFunction(mesh, "GetSocketByName", &sp) && sp.ret) exists = true;
+            }
+        }
+        if (exists) {
+            target = leftIdx;
+            targetName = leftName;
+        } else {
+            static bool logged = false;
+            if (!logged) vr::log::Line("ARMS: no left-hand counterpart for \"" + targetName + "\" (tried \"" + leftName + "\"): gun stays in the right hand.");
+            logged = true;
+            return false;
+        }
+    }
+    if (cur == target) return false;
+    SafeCopy(entry + 4, &target, 4);
+    vr::log::Line("ARMS: weapon re-attached from \"" + curName + "\" to \"" + targetName + "\".");
+    return true;
 }
 
 void MeasureHandInWeapon(void* mesh, int side, void* gunComp) {
+    if (g_fpMirrored) return;  // mesh specchiata: GetBoneQuaternion da' valori a caso; la relazione resta quella misurata senza specchio
     float h[3][3], w[3][3];
-    const char* hand = side == 0 ? "Hand_Right" : "Hand_Left";
-    const char* weap = side == 0 ? (gunComp ? "weapon mesh" : "Weapon_Right") : "Weapon_Left";
+    const char* hand = HandBone(side);
+    const char* weap = side == 0 && gunComp ? "weapon mesh" : WeaponBone(side);
     if (!BoneAxes(mesh, hand, h) || !WeaponAxes(mesh, side, gunComp, w)) return;
     float v[3][3];
     for (int a = 0; a < 3; ++a)
@@ -5735,7 +5968,6 @@ float g_fpSavedMeshX = 0.0f, g_fpSavedMeshY = 0.0f, g_fpSavedMeshZ = 0.0f;
 // la trasformazione specchiata della mesh li riporta al posto giusto.
 constexpr uintptr_t kOffMeshRotationYaw = 0x1D0, kOffMeshScale3D = 0x1DC;
 float g_fpSavedScale3D[3] = {1.0f, 1.0f, 1.0f};
-bool g_fpMirrored = false;
 bool MirrorBodyWanted() {
     int m = vr::control::g_mirrorBody.load();
     return m == 1 || (m == 2 && vr::control::g_leftHanded);
@@ -5911,8 +6143,28 @@ void UpdateFirstPersonBody(void* pawn) {
             if (headDrop < 0.0f) z += headDrop;
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX + 8, &z, 4);
-        bool mirror = MirrorBodyWanted();
+        bool mirror = MirrorBodyWanted() && g_handInWeaponValid[0] && g_unmirrorFrames <= 0;
+        if (g_unmirrorFrames > 0) --g_unmirrorFrames;
         if (mirror != g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, mirror);
+        if (g_fpMirrored) {
+            // UpdateSkelPose (0x006455E0) valuta i controlli solo se la mesh e'
+            // stata renderizzata di recente (LastRenderTime +0x1F0 contro
+            // WorldInfo.TimeSeconds +0x454): con la scala negativa il renderer
+            // non lo aggiornava e le braccia restavano all'animazione (22/10).
+            uint32_t wi = 0;
+            float ts = 0.0f, lrt = 0.0f;
+            if (TrySafeReadUint32(static_cast<char*>(pawn) + 0xEC, &wi) && wi &&  // Actor.WorldInfo
+                SafeCopy(&ts, reinterpret_cast<char*>(wi) + 0x454, 4) && SafeCopy(&lrt, static_cast<char*>(g_fpHeadMesh) + 0x1F0, 4)) {
+                static int logged = 0;
+                if (logged < 3 && ++logged) {
+                    char b[160];
+                    std::snprintf(b, sizeof(b), "BODY: mirrored, LastRenderTime %.2f, TimeSeconds %.2f%s", lrt, ts,
+                                  ts - lrt > 1.0f ? " (not rendered recently: forced)" : "");
+                    vr::log::Line(b);
+                }
+                SafeCopy(static_cast<char*>(g_fpHeadMesh) + 0x1F0, &ts, 4);
+            }
+        }
     }
 }
 
@@ -6266,7 +6518,14 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         static ULONGLONG failedAt = 0;
         static void* failedMesh = nullptr;
         bool retry = failedMesh == reinterpret_cast<void*>(mesh) && !g_rig.ctrl[0] && GetTickCount64() - failedAt > 1000;
-        if ((reinterpret_cast<void*>(mesh) != g_rig.mesh || retry) && !AcquireArms(reinterpret_cast<void*>(mesh))) {
+        // Cambio di mano dominante (armswap): i controlli IK vanno ripresi con i nomi scambiati.
+        static bool rigSwapped = false;
+        bool swapChanged = rigSwapped != ArmsSwapped();
+        if (swapChanged) {
+            rigSwapped = ArmsSwapped();
+            vr::log::Line(std::string("ARMS: dominant hand changed, IK controls re-acquired (") + (rigSwapped ? "left-handed, arms swapped" : "right-handed") + ").");
+        }
+        if ((reinterpret_cast<void*>(mesh) != g_rig.mesh || retry || swapChanged) && !AcquireArms(reinterpret_cast<void*>(mesh))) {
             ReleaseArms();
             g_rig.mesh = reinterpret_cast<void*>(mesh);
             if (failedMesh != reinterpret_cast<void*>(mesh)) vr::log::Line("ARMS: IK controls not found on this mesh, retrying every second.");
@@ -6300,7 +6559,25 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             SafeCopy(c + kOffCtrlFlags, &cf, 4);
         }
     }
-    if (vr::control::g_armBonesRequested.exchange(false)) LogBones(g_rig.mesh);
+    if (vr::control::g_armBonesRequested.exchange(false)) {
+        LogBones(g_rig.mesh);
+        // Diagnostica: vtable dei controlli (limb e single bone) per trovare
+        // CalculateNewBoneTransforms in Ghidra (corpo specchiato, 22/10).
+        for (int ci : {0, 2}) {
+            if (!g_rig.ctrl[ci]) continue;
+            uint32_t vt = 0;
+            if (!TrySafeReadUint32(g_rig.ctrl[ci], &vt) || !vt) continue;
+            std::string line = std::string("VTABLE ") + (ci == 0 ? "limb" : "single") + " @" + std::to_string(vt) + ":";
+            for (int k = 0; k < 110; ++k) {
+                uint32_t fn = 0;
+                if (!TrySafeReadUint32(reinterpret_cast<void*>(vt + 4 * k), &fn)) break;
+                char h[16];
+                std::snprintf(h, sizeof(h), " %x", fn);
+                line += h;
+            }
+            vr::log::Line(line);
+        }
+    }
     {
         // Modello dell'arma in mano (indipendente dalla posa dell'arma): osso
         // del caricatore durante la ricarica fisica (R-W7) e "weaponbones".
@@ -6329,9 +6606,21 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     static void* lastGunComp = nullptr;
     static int remeasure = 0;
     static bool measureDue[2] = {true, true};
+    if (UpdateGunAttachment(g_rig.mesh, gunComp, pawn)) {
+        measureDue[0] = true;
+        if (ArmsSwapped()) {
+            g_relaxFrames = 20;
+            g_handInWeaponValid[0] = false;
+        }
+    }
+    if (ArmsSwapped() && g_relaxFrames > 0) {
+        --g_relaxFrames;
+        measureDue[0] = (g_relaxFrames == 0);  // misura solo all'ultimo frame di riposo
+    }
     if (gunComp != lastGunComp) {
         lastGunComp = gunComp;
         measureDue[0] = true;
+        if (g_fpMirrored || MirrorBodyWanted()) g_unmirrorFrames = 12;  // misura senza specchio, poi di nuovo specchiato
     }
     bool gunInHand = false;
     if (gunComp) {
@@ -6339,7 +6628,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             int32_t name[2];
             int32_t space;
             float ret[3];
-        } hp = {{vr::script::NameIndex("Hand_Right"), 0}, 0, {0, 0, 0}};
+        } hp = {{vr::script::NameIndex(HandBone(0)), 0}, 0, {0, 0, 0}};
         float gm[16];
         if (hp.name[0] >= 0 && vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &hp) &&
             SafeCopy(gm, static_cast<char*>(gunComp) + kOffCompLocalToWorld, sizeof(gm))) {
@@ -6349,10 +6638,11 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     }
     if (++remeasure >= 30) {
         remeasure = 0;
-        if (gunInHand) measureDue[0] = true;
+        if (gunInHand && !ArmsSwapped()) measureDue[0] = true;  // mancini: relazione misurata una volta, a mano ferma
     }
     for (int side = 0; side < 2; ++side)
-        if ((measureDue[side] || !g_handInWeaponValid[side] || debugNow) && (side == 1 || gunInHand || !gunComp)) {
+        if ((measureDue[side] || (!g_handInWeaponValid[side] && !(side == 0 && ArmsSwapped() && g_relaxFrames > 0)) || debugNow) &&
+            (side == 1 || gunInHand || !gunComp)) {
             MeasureHandInWeapon(g_rig.mesh, side, side == 0 ? gunComp : nullptr);
             measureDue[side] = false;
         }
@@ -6458,7 +6748,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             }
         }
         if (relValid) haveLastRel = true;
-        bool canGrip = vr::control::g_leftGrip && gunInHand && relValid;
+        bool canGrip = vr::control::g_leftGrip && gunInHand && relValid && !ArmsSwapped();
         bool canPose = canGrip || (gripBlend > 0.0f && haveLastRel);
         if (canPose) {
             std::memcpy(relPos, cPos, sizeof(relPos));
@@ -7767,6 +8057,9 @@ void PublishWristData(char* cam) {
     vr::wrist::SetData(show, vr::control::g_weaponAmmo[1].load(), vr::control::g_weaponAmmo[0].load(), health, g_weaponInfo.cls);
 }
 
+std::string g_squadClosestCls;  // candidato piu' vicino al raggio durante la pressione (diagnostica)
+float g_squadClosestDeg = 999.0f;
+
 void UpdateSquadCommandAim(char* cam, void* pawn) {
     static void* lastPick = nullptr;
     static uint32_t lastPickCls = 0;  // classe al momento della scelta (oggetto ancora valido?)
@@ -7784,15 +8077,19 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         if (held) {
             everPicked = nullptr;
             snprintf(b, sizeof(b),
-                     "SQUAD: button pressed (commandaim gun=%d, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
+                     "SQUAD: button pressed (commandaim %s, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
                      "shooters=%u); game target %s",
-                     (int)vr::control::g_commandFollowsGun.load(), pawn != nullptr, (int)vr::control::g_aimHand.load(),
+                     vr::control::g_commandAimMode == 2 ? "support" : (vr::control::g_commandAimMode == 1 ? "gun" : "head"),
+                     pawn != nullptr, (int)vr::control::g_aimHand.load(),
                      (int)g_armsActive.load(), (int)g_muzzleAimValid.load(), (unsigned)CheapShooters().size(),
                      sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
         } else {
-            snprintf(b, sizeof(b), "SQUAD: button released; mod target %s, game target %s",
+            snprintf(b, sizeof(b), "SQUAD: button released; mod target %s, game target %s; closest candidate %s at %.1f deg",
                      everPicked ? vr::script::ClassName(everPicked).c_str() : "none",
-                     sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
+                     sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none",
+                     g_squadClosestCls.empty() ? "none" : g_squadClosestCls.c_str(), g_squadClosestDeg);
+            g_squadClosestCls.clear();
+            g_squadClosestDeg = 999.0f;
         }
         vr::log::Line(b);
     }
@@ -7806,8 +8103,12 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // verde): lo stesso della camera logica del gioco. La visibilita' si
     // controlla dagli occhi, come fa il gioco: la canna all'altezza del fianco
     // dietro una copertura "vede" solo la copertura.
-    float bo[3], bd[3];
-    if (vr::control::g_commandAimMode == 2 && vr::control::g_supportFwdValid && g_handWorldValid[1]) {
+    float bo[3], bd[3], eo[3];
+    std::memcpy(eo, cam + 0x10, sizeof(eo));  // occhi: origine della passata lungo lo sguardo
+    bool support = vr::control::g_commandAimMode == 2 && vr::control::g_supportFwdValid && g_handWorldValid[1];
+    // Mano che punta senza mirino: tolleranza piu' larga (8 / 10 gradi invece di 3 / 4).
+    const float tolPawn = support ? 0.1405f : 0.0524f, tolCheap = support ? 0.1763f : 0.0699f;
+    if (support) {
         // Mano di supporto che punta (fase 4, E8): raggio dalla mano lungo la
         // sua direzione; la visibilita' resta controllata dagli occhi sotto.
         std::memcpy(bo, g_handWorld[1], sizeof(bo));
@@ -7843,6 +8144,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     const uint32_t pawnList = p;
     for (int pass = 0; pass < 2 && !best; ++pass) {
         const float* dir = pass ? hd : bd;
+        const float* o = pass ? eo : bo;  // lo sguardo parte dagli occhi, non dalla mano
         p = pawnList;
         for (int guard = 0; p && guard < 512; ++guard) {
             char* other = reinterpret_cast<char*>(p);
@@ -7857,18 +8159,22 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
                                      cls.find("Walker") != std::string::npos || cls.find("Civil") != std::string::npos ||
                                      cls.find("Refugee") != std::string::npos;
                 loc[2] += 30.0f;  // petto
-                float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
+                float v[3] = {loc[0] - o[0], loc[1] - o[1], loc[2] - o[2]};
                 float along = v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
                 if (!friendOrCivil && along > 50.0f) {
                     float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
                     float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
                     // Tolleranza: 3 gradi, e almeno ~45 unita' (un corpo) da vicino.
-                    float tol = std::fmax(along * 0.0524f, 45.0f);
+                    float tol = std::fmax(along * tolPawn, 45.0f);
                     float score = off / along;
+                    if (pass == 0 && std::atan2(off, along) * 57.2957795f < g_squadClosestDeg) {
+                        g_squadClosestDeg = std::atan2(off, along) * 57.2957795f;
+                        g_squadClosestCls = cls;
+                    }
                     float hitTime = 1.0f;
                     // Traccia solo i candidati vicini al raggio (L13: prima ogni
                     // Pawn del livello, due passate, due volte per tick).
-                    bool blocked = off < 1.5f * tol && TraceLine(pawn, bo, loc, &hitTime) &&
+                    bool blocked = off < 1.5f * tol && TraceLine(pawn, o, loc, &hitTime) &&
                                    hitTime * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) <
                                        std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) - 60.0f;
                     if (diag) {
@@ -7897,12 +8203,16 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
             if (!SafeCopy(&health, static_cast<char*>(cs) + kOffCheapShooterHealth, 4) || !(health > 0.0f) ||
                 !SafeCopy(loc, static_cast<char*>(cs) + 0x54, 12))
                 continue;
-            float v[3] = {loc[0] - bo[0], loc[1] - bo[1], loc[2] - bo[2]};
+            float v[3] = {loc[0] - o[0], loc[1] - o[1], loc[2] - o[2]};
             float along = v[0] * dir[0] + v[1] * dir[1] + v[2] * dir[2];
             if (along <= 50.0f) continue;
             float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
             float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
-            float tol = std::fmax(along * 0.0699f, 60.0f);  // 4 gradi: bersagli piccoli e lontani
+            float tol = std::fmax(along * tolCheap, 60.0f);  // 4 gradi (10 con la mano): bersagli piccoli e lontani
+            if (pass == 0 && std::atan2(off, along) * 57.2957795f < g_squadClosestDeg) {
+                g_squadClosestDeg = std::atan2(off, along) * 57.2957795f;
+                g_squadClosestCls = vr::script::ClassName(cs) + " (cheap shooter)";
+            }
             if (diag) {
                 char b[200];
                 snprintf(b, sizeof(b), "SQUAD check: %s (cheap shooter) along=%.0f off=%.0f tol=%.0f health=%.0f",
@@ -8280,8 +8590,7 @@ float HandToEffectorDistance(void* mesh, int side = 0) {
     RotatorToAxes(rot[0], rot[1], rot[2], af, ar, au);
     float target[3];
     for (int i = 0; i < 3; ++i) target[i] = loc[i] + (af[i] * eff[0] + ar[i] * eff[1] + au[i] * eff[2]) * scale;
-    static const int32_t handNames[2] = {vr::script::NameIndex("Hand_Right"), vr::script::NameIndex("Hand_Left")};
-    const int32_t handName = handNames[side];
+    const int32_t handName = vr::script::NameIndex(HandBone(side));
     struct {
         int32_t name[2];
         int32_t space;

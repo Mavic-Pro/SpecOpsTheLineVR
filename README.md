@@ -49,7 +49,8 @@ virtual cinema screen.
   in-engine scenes stay in 3D.
 - **Comfort options**: smooth turning at a fixed speed or snap turning,
   movement where you look, vignette, recentering (also follows the
-  headset's own recenter), left-handed mode.
+  headset's own recenter), left-handed mode (gun buttons on the left
+  controller and Walker holds the gun in his left hand).
 - **Sniper scopes** work as a lens along the barrel.
 - Fast GPU-to-GPU frame copy (D3D9Ex shared surfaces to Direct3D 11 / OpenVR).
 - **Performance**: each eye drawn with its exact field of view (no wasted

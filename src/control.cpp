@@ -73,7 +73,9 @@ std::atomic<bool> g_vsDiag{false};
 std::atomic<bool> g_fades{true};
 std::atomic<bool> g_leftHanded{false};
 std::atomic<int> g_mirrorBody{0};  // sperimentale: spento (vedi TECHNICAL.md)
-std::atomic<bool> g_cinemaLaser{true}, g_cinemaLaserFlipY{false}, g_cinemaLaserFullUv{false};
+std::atomic<bool> g_armSwap{true};
+std::atomic<int> g_mirrorEffNeg{0}, g_mirrorRotConj{1};
+std::atomic<bool> g_cinemaLaser{false}, g_cinemaLaserFlipY{false}, g_cinemaLaserFullUv{false};  // sperimentale: il gioco ricentra il mouse
 std::atomic<float> g_gunCtrlPose[12];
 std::atomic<bool> g_gunCtrlPoseValid{false};
 std::atomic<bool> g_wristHud{true};
@@ -439,10 +441,20 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_leftHanded = (v == "left");
+    } else if (cmd == "armswap") {
+        std::string v;
+        in >> v;
+        g_armSwap = OnOff(cmd, v, true);
     } else if (cmd == "mirrorbody") {
         std::string v;
         in >> v;
         g_mirrorBody = v == "on" ? 1 : (v == "off" ? 0 : 2);
+    } else if (cmd == "mirrortest") {
+        // mirrortest <effY 0|1> <rot 0|1>: varianti della conversione dei bersagli IK con la mesh specchiata
+        int e = 0, r = 1;
+        in >> e >> r;
+        g_mirrorEffNeg = e;
+        g_mirrorRotConj = r;
     } else if (cmd == "cinemalaser") {
         // cinemalaser on|off | flipy on|off | uv band|full
         std::string v, w;

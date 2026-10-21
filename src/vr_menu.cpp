@@ -38,7 +38,7 @@ struct Item {
 // Scheda Basic: le scelte che un giocatore tocca davvero.
 std::vector<Item> BasicItems() {
     return {
-        {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: everything mirrors.", Kind::Choice, {"right", "left"}},
+        {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: the gun buttons move to the left controller and Walker holds the gun in his left hand.", Kind::Choice, {"right", "left"}},
         {"mirrorbody", "Mirrored body", "Walker's body mirrored so the gun is in his left hand (auto = with the left dominant hand).", Kind::Choice, {"auto", "on", "off"}},
         {"cinemalaser", "Laser on the screen", "Point the gun controller at the virtual screen to move the game's cursor on its menus; trigger = click.", Kind::OnOff},
         {"wristhud", "Wrist HUD", "Ammo, weapon and health on the support-hand wrist, like a watch.", Kind::OnOff},
@@ -445,12 +445,21 @@ void DoShow(bool show) {
         Place();
         g_dirty = true;
         Redraw();
+        // Puntatore di SteamVR solo con il menu aperto: da chiuso l'overlay
+        // tratteneva il focus dei controller e i tasti (A) non arrivavano al
+        // gioco finche' non si premeva Meta (21/10).
+        vr::VROverlay()->SetOverlayInputMethod(g_overlay, vr::VROverlayInputMethod_Mouse);
+        vr::VROverlay()->SetOverlayFlag(g_overlay, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
         vr::VROverlay()->ShowOverlay(g_overlay);
         g_open = true;
         vr::control::g_vrMenuOpen = true;
         vr::log::Line("VRMENU: shown.");
     } else {
-        if (vr::VROverlay() && g_overlay != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->HideOverlay(g_overlay);
+        if (vr::VROverlay() && g_overlay != vr::k_ulOverlayHandleInvalid) {
+            vr::VROverlay()->SetOverlayFlag(g_overlay, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, false);
+            vr::VROverlay()->SetOverlayInputMethod(g_overlay, vr::VROverlayInputMethod_None);
+            vr::VROverlay()->HideOverlay(g_overlay);
+        }
         g_open = false;
         vr::control::g_vrMenuOpen = false;
         vr::log::Line("VRMENU: closed.");

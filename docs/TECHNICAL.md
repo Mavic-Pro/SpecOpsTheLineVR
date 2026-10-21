@@ -761,8 +761,18 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   send left clicks with `SendInput`. No SteamVR input focus on the overlay,
   so the controller buttons keep reaching the game. `cinemalaser flipy on`
   and `cinemalaser uv full` are the two UV conventions to try if the cursor
-  lands in the wrong place (`LASER:` lines log the first hits). The in-VR
-  quick menu part of R-U5 is the settings menu (`vrmenu`).
+  lands in the wrong place (`LASER:` lines log the first hits). **Outcome
+  (21/10, headset + headless):** the intersection and the mapping work, but
+  the game recentres the Windows cursor every frame even on the title screen
+  (`SetCursorPos` and relative `SendInput` moves both end at the screen
+  centre, `cursor NOT moved` in the log) and its UIScene menus are pad /
+  keyboard driven: no highlight follows the mouse. So the laser cannot drive
+  the game's menus without a deeper hook (the engine's mouse capture / a
+  `GetCursorPos` IAT hook plus synthesized UI navigation), which is left
+  out: `cinemalaser off` by default, code kept. The menus are navigated with
+  the stick and A/B as before. The in-VR quick menu part of R-U5 is the
+  settings menu (`vrmenu`), whose overlay now releases SteamVR input focus
+  when it closes (otherwise A did not reach the game until Meta was pressed).
 - **Interaction stages 3-4 (21/10):** stage 3 was already covered: B of the
   punch gesture held back one poll (M3), candidates within 60 degrees of the
   gaze with `IsBeingExecutedOrRevived`, body turned only by the needed angle,
@@ -818,16 +828,30 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   the reference is taken with the headset worn. Before, with `height 1.55`
   and the head seated at 1.2 m, the view sat 35 cm under Walker's eyes and
   the body followed it into the floor ("deformed dwarf").
-- **Left-handed body (21/10, open):** with `hand left` the mod drives
-  Walker's right arm (the gun arm) to the physical left controller, so the
-  arms cross. `mirrorbody` (experimental, off) mirrors the mesh
-  (`Scale3D` +0x1DC, lateral axis from the mesh yaw at +0x1D0, Walker's is
-  0 → Y): the mesh renders mirrored, but the hand/weapon relation measured
-  from the (reflected) bone matrices becomes garbage every frame and the
-  hands fly away (headless shots `shots/mirror_*.png`). To finish it: freeze
-  the relation measured unmirrored, mirror the actor-space effector/joint
-  (Y → -Y) and the rotation frame (f, -r, u mirrored) in `WriteHand`, and
-  review every other bone-based measurement (support grip, barrel, magazine).
+- **Left-handed body (21-22/10): arm swap.** With `hand left` (and
+  `armswap on`, default) the gun side (side 0) is Walker's LEFT arm and the
+  support side his right: `HandBone/WeaponBone/IkHelperBone/ShoulderBone(side)`
+  return the swapped names, the IK control names are taken with `i ^ 1`
+  (`IK_LeftHand`, `IKRot_LeftHand` for side 0) and the rig is re-acquired
+  when the dominant hand changes. The weapon mesh component, which the game
+  attaches to the pawn mesh at bone `Weapon_Right` (`Attachments` TArray at
+  USkeletalMeshComponent+0x348, 52-byte `FAttachment` entries: Component,
+  BoneName, RelativeLocation/Rotation/Scale + 4), is re-attached by
+  rewriting the entry's BoneName to `Hand_Left` (`UpdateGunAttachment`;
+  `Weapon_Left` is not rigid with the hand). After the re-attach the gun hand
+  rests on the animation for 20 frames and the hand/weapon relation is
+  measured once at the last frame, then frozen: measuring it while the hand
+  is driven made the relation rotate ~10 degrees per measurement (spiral).
+  The support grip (`leftgrip`) is off in this mode (the animation's grip
+  is for the other hand). Headless check (`armswaptest.py`, synthetic
+  poses): both hands 0.0 units from their targets, pistol drawn in the left
+  hand (`shots/swap_left.png`). Still to judge in a headset by a left-handed
+  player: finger poses (the left hand uses the animation's support-hand
+  fingers), the attach offset on the hand, holster/reload gestures.
+  Mirroring the mesh (`mirrorbody`, experimental, off) is a dead end: the
+  engine's `CalcComponentToFrameMatrix` (0x00583610) and bone quaternions
+  do not survive a reflection (IK controls simply stop acting; Ghidra, vtable
+  slot 84 = `USkelControlLimb::CalculateNewBoneTransforms` 0x00CE6EA0).
 - **Automatic recenters (21/10):** Virtual Desktop sends
   `ChaperoneUniverseHasChanged` / zero-pose-reset events in bursts; they are
   now debounced to one per 10 s and silent (no toast, no blink;
