@@ -63,6 +63,9 @@ add_library(d3d9proxy SHARED
     src/vr_session.cpp
     src/script_call.cpp
     src/updater.cpp
+    src/pure_utils.h
+    src/vr_toast.cpp
+    src/vr_toast.h
     src/haptics_ext.cpp
     src/updater.h
     src/version.h
@@ -117,3 +120,8 @@ add_custom_command(TARGET vrtest POST_BUILD
         "${CMAKE_SOURCE_DIR}/vendor/openvr/bin/win32/openvr_api.dll"
         "${CMAKE_SOURCE_DIR}/deploy/openvr_api.dll"
 )
+
+# Test offline delle funzioni pure (updater, ini): build/Release/unit_tests.exe,
+# nessun gioco e nessun visore (R-T2). tools/regress.py li lancia per primo.
+add_executable(unit_tests tests/unit_tests.cpp)
+target_include_directories(unit_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

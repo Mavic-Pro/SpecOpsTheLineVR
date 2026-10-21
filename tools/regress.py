@@ -8,6 +8,11 @@ phases while reading the STATS / SHOT / WATCHDOG lines of the log:
   move      walking               -> eye pairing while moving
   checkpoint  'ce' jump + cutscene -> eye pairing right after the cinema screen
   fire      M4 burst              -> shots along the barrel (< 0.3 degrees)
+  gestures  simulated physical reload -> "magazine inserted" in the log
+  cinema    SetCinematicMode on/off -> arms released and re-acquired, no crash
+
+Before the game: build/Release/unit_tests.exe (pure functions of the updater
+and the ini parser) must pass.
 
 Exit code 0 = all checks passed, 1 = something failed (details printed and
 saved to shots/regress.json). Saves are backed up and restored.
@@ -18,6 +23,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -82,8 +88,25 @@ def phase(name, cmds, seconds):
     return pos
 
 
+def unit_tests(failures):
+    exe = os.path.join(ROOT, 'build', 'Release', 'unit_tests.exe')
+    if not os.path.exists(exe):
+        failures.append('unit: build/Release/unit_tests.exe missing (cmake --build build --config Release --target unit_tests)')
+        return 'missing'
+    r = subprocess.run([exe], capture_output=True, text=True)
+    out = (r.stdout or '').strip().splitlines()
+    if r.returncode != 0:
+        failures.append('unit: ' + (out[-1] if out else 'exit %d' % r.returncode))
+    return out[-1] if out else 'no output'
+
+
 def main():
     failures, report = [], {}
+    report['unit'] = unit_tests(failures)
+    print('unit tests:', report['unit'])
+    if failures:
+        print('RESULT: FAIL')
+        sys.exit(1)
     ls.backup_saves()
     try:
         ls.gamectl('kill')
@@ -154,6 +177,33 @@ def main():
             failures.append('fire: no SHOT lines')
         elif max(angles) > MAX_SHOT_ANGLE:
             failures.append('fire: shot %.2f degrees off the barrel' % max(angles))
+
+        # Physical reload simulated from fake poses: the state machine must
+        # reach "magazine inserted" (gesture pipeline alive, M14 kept).
+        # The synthetic left hand sits on the gun (two-hand grip) and would
+        # block the magazine grab: move it away first, as m14test does.
+        g.send_cmds(['synthleft 10 -45 -25', 'reload physical'])
+        time.sleep(1.5)
+        pos = ls.log_size()
+        g.send_cmds(['gesturesim reload'])
+        time.sleep(4)
+        txt = ls.log_since(pos)
+        report['gestures'] = {'magazine_inserted': 'GESTURE: magazine inserted' in txt}
+        if not report['gestures']['magazine_inserted']:
+            failures.append('gestures: simulated physical reload never reached "magazine inserted"')
+
+        # Game-driven cinematic on Walker (H1): arms must be released while
+        # bCinematicMode is on and come back afterwards, with stereo intact.
+        pos = ls.log_size()
+        g.send_cmds(['ucall pc SetCinematicMode 1 0 0 1 1 1'])
+        time.sleep(6)
+        g.send_cmds(['ucall pc SetCinematicMode 0 0 0 1 1 1'])
+        time.sleep(8)
+        txt = ls.log_since(pos)
+        report['cinema'] = check_pairing('cinema', stats_since(pos), failures)
+        report['cinema']['arms_reacquired'] = bool(re.search(r"ARMS: Walker's IK controls", txt))
+        if not report['cinema']['arms_reacquired']:
+            failures.append('cinema: arms not re-acquired after SetCinematicMode 0')
 
         txt = ls.log_since(start)
         stalls = re.findall(r'WATCHDOG: render thread stalled for (\d+)s', txt)

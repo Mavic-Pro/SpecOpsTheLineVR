@@ -6,17 +6,62 @@
 #include <fstream>
 #include <mutex>
 #include <chrono>
+#include <condition_variable>
 #include <ctime>
+#include <deque>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 namespace vr::log {
 
 namespace {
 
-std::mutex g_mutex;
+std::mutex g_mutex;  // file
 std::ofstream g_file;
 std::string g_dir;
+
+// Logger asincrono (R-R5): chi chiama Line() formatta la riga e la mette in
+// coda; un thread dedicato la scrive e scarica su disco al massimo ogni
+// 250 ms. Prima ogni riga (anche dal thread di rendering) prendeva il mutex
+// del file e scriveva sull'ofstream. ERROR e CRASH restano sincroni: coda
+// scaricata, riga scritta e flush subito, cosi' non si perdono se il
+// processo muore un attimo dopo.
+std::mutex g_queueMutex;
+std::condition_variable g_queueCv;
+std::deque<std::string> g_queue;
+bool g_drainStarted = false;
+constexpr size_t kMaxQueued = 20000;
+
+void WriteEntries(std::deque<std::string>& batch) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const std::string& e : batch) {
+        OutputDebugStringA(e.c_str());
+        OutputDebugStringA("\n");
+        if (g_file.is_open()) g_file << e << "\n";
+    }
+}
+
+void DrainQueue() {
+    std::deque<std::string> batch;
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        batch.swap(g_queue);
+    }
+    if (!batch.empty()) WriteEntries(batch);
+}
+
+void DrainThread() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(g_queueMutex);
+            g_queueCv.wait_for(lock, std::chrono::milliseconds(250), [] { return !g_queue.empty(); });
+        }
+        DrainQueue();
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_file.is_open()) g_file.flush();
+    }
+}
 
 std::string ModuleDirectory() {
     char path[MAX_PATH] = {};
@@ -170,6 +215,10 @@ void Init() {
     g_file.open(g_dir + "\\specopsvr.log", std::ios::out | std::ios::trunc);
     WriteHeader(g_dir);
     g_file.flush();
+    if (!g_drainStarted) {
+        g_drainStarted = true;
+        std::thread(DrainThread).detach();
+    }
 }
 
 // Codici sempre fatali, mai usati dalle prove di lettura protette (__try):
@@ -205,6 +254,17 @@ DWORD WINAPI KeepCrashFilter(LPVOID) {
     return 0;
 }
 
+void ReportCrash(EXCEPTION_POINTERS* info) {
+    if (!info || !info->ExceptionRecord) return;
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    char b[160];
+    std::snprintf(b, sizeof(b), "CRASH: game thread exception 0x%08lX at %p (caught by the engine's filter, hooked)",
+                  info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
+    Line(b);
+    WriteCrashReport(info, GetCurrentThreadId());
+}
+
 void InstallCrashHandler() {
     LPTOP_LEVEL_EXCEPTION_FILTER prev = SetUnhandledExceptionFilter(&CrashFilter);
     if (prev != &CrashFilter) g_prevFilter = prev;
@@ -215,23 +275,23 @@ void InstallCrashHandler() {
 
 void Line(const std::string& message) {
     std::string entry = "[" + Timestamp() + "] " + message;
-
-    OutputDebugStringA(entry.c_str());
-    OutputDebugStringA("\n");
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_file.is_open()) {
-        g_file << entry << "\n";
-        // Scrittura su disco al massimo ogni 250 ms (prima a ogni riga, anche
-        // sul thread di rendering); subito per errori e crash.
-        static ULONGLONG lastFlush = 0;
-        ULONGLONG now = GetTickCount64();
-        if (now - lastFlush > 250 || message.find("ERROR") != std::string::npos ||
-            message.find("CRASH") != std::string::npos) {
-            g_file.flush();
-            lastFlush = now;
-        }
+    bool urgent = message.find("ERROR") != std::string::npos || message.find("CRASH") != std::string::npos ||
+                  message.find("FATAL") != std::string::npos || !g_drainStarted;
+    if (urgent) {
+        DrainQueue();  // prima le righe in attesa, poi questa, in ordine
+        std::deque<std::string> one;
+        one.push_back(entry);
+        WriteEntries(one);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_file.is_open()) g_file.flush();
+        return;
     }
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        if (g_queue.size() >= kMaxQueued) g_queue.pop_front();  // meglio perdere righe vecchie che bloccare il gioco
+        g_queue.push_back(std::move(entry));
+    }
+    g_queueCv.notify_one();
 }
 
 std::string Directory() { return g_dir; }

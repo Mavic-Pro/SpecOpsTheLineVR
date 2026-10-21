@@ -4,8 +4,8 @@
 // standby rallenta il gioco quasi a zero (driver NVIDIA in attesa: < 300
 // frame in 70 s, 4 avvii su 4 il 16/10); come "Background" no (0 su 2,
 // ~42000 frame). Quindi la mod parte come Background (pose e stato del
-// visore bastano) e passa a Scene solo con il visore indossato; torna a
-// Background dopo 20 s di visore inattivo.
+// visore bastano) e passa a Scene solo con il visore indossato; una volta in
+// Scene resta in Scene (con Link lo stato "indossato" oscilla).
 //
 // Ogni uso di OpenVR (VRSystem(), VRCompositor()) va fatto dentro un
 // vr::session::Shared: il cambio di tipo chiude e riapre OpenVR in

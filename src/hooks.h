@@ -9,6 +9,8 @@ namespace vr::hooks {
 bool GpuShareRequested();
 // PlayerController del giocatore verificato vivo (GObjects), oppure null.
 void* PlayerControllerAlive();
+// Walker su una postazione fissa (torretta, minigun dell'elicottero).
+bool OnTurret();
 extern bool g_d3d9ex;
 
 // Aggancia IDirect3D9::CreateDevice sull'oggetto appena creato dal vero d3d9.dll.

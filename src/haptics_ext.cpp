@@ -1,5 +1,6 @@
 #include "haptics_ext.h"
 #include "control.h"
+#include "vr_toast.h"
 #include "logger.h"
 #include "resource_ids.h"
 
@@ -190,6 +191,7 @@ void BridgeThread() {
     g_ptBridge = false;
     CloseHandle(pipe);
     vr::log::Line("HAPTICS: ProTube bridge disconnected.");
+    vr::toast::Notify("ProTube disconnected");
 }
 
 void StartProTube() {
@@ -290,6 +292,7 @@ void BHapticsThread() {
             }
             g_bhConnected = false;
             vr::log::Line("HAPTICS: bHaptics Player disconnected.");
+            vr::toast::Notify("bHaptics Player disconnected");
             WinHttpWebSocketClose(ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
             // Prima si chiude l'handle (annulla la ricezione in corso), poi si
             // aspetta il lettore: al contrario, con il socket mezzo aperto il
@@ -328,6 +331,10 @@ void Start() {
     }).detach();
 }
 
+// Avambracci bHaptics per mano dell'arma e di supporto (mancini: scambiati, L19).
+const char* GunArm() { return vr::control::g_leftHanded ? "ForearmL" : "ForearmR"; }
+const char* SupportArm() { return vr::control::g_leftHanded ? "ForearmR" : "ForearmL"; }
+
 void Shot(const std::string& weaponClass, bool twoHanded) {
     static ULONGLONG last = 0;
     ULONGLONG now = GetTickCount64();
@@ -339,8 +346,8 @@ void Shot(const std::string& weaponClass, bool twoHanded) {
     if (twoHanded) Kick(static_cast<unsigned char>(power * 2 / 3), SupportChannel());
     if (g_bhConnected) {
         int in = static_cast<int>(40 + 60 * k);
-        Frame("shotR", "ForearmR", 0, 5, in, 60);
-        if (twoHanded) Frame("shotL", "ForearmL", 0, 5, in * 2 / 3, 60);
+        Frame("shotR", GunArm(), 0, 5, in, 60);
+        if (twoHanded) Frame("shotL", SupportArm(), 0, 5, in * 2 / 3, 60);
         Frame("shotVest", "Vest", 0, 3, in / 2, 50);  // spalla/petto in alto davanti
     }
 }
@@ -386,16 +393,16 @@ void Damage(int amount, float angleRad) {
 }
 
 void GrenadeThrow() {
-    if (g_bhConnected) Frame("throw", "ForearmL", 0, 5, 70, 120);
+    if (g_bhConnected) Frame("throw", SupportArm(), 0, 5, 70, 120);
 }
 
 void Melee() {
-    if (g_bhConnected) Frame("melee", "ForearmL", 0, 5, 100, 100);
+    if (g_bhConnected) Frame("melee", SupportArm(), 0, 5, 100, 100);
 }
 
 void Reload() {
     Rumble(70, 0.08f, GunChannel());
-    if (g_bhConnected) Frame("reload", "ForearmL", 0, 2, 50, 80);
+    if (g_bhConnected) Frame("reload", SupportArm(), 0, 2, 50, 80);
 }
 
 }  // namespace vr::haptics

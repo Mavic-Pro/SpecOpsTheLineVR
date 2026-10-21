@@ -2,6 +2,8 @@
 #include "control.h"
 #include "logger.h"
 #include "version.h"
+#include "pure_utils.h"
+#include "vr_toast.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -20,9 +22,115 @@
 // Windows permette di rinominare una dll caricata, quindi la vecchia diventa
 // d3d9.dll.old (cancellata all'avvio seguente) e la nuova vale dal prossimo
 // avvio del gioco. "autoupdate off" nell'ini lo disattiva.
+//
+// Sicurezza (R-R4):
+//  - sentinella di avvio: la versione appena installata lascia
+//    specopsvr_update.pending; ogni avvio incrementa specopsvr_boot.count, che
+//    viene azzerato quando il gioco esce normalmente o resta vivo 90 s dopo la
+//    lettura dell'ini. Due avvii morti prima -> al terzo la d3d9.dll.prev
+//    torna al suo posto e la versione finisce in specopsvr_skip.txt (non viene
+//    reinstallata finche' il file esiste);
+//  - file compagni: la release puo' avere un allegato companions.json (nome,
+//    dimensione, SHA-256 di openvr_api.dll, script .bat/.ps1, README.txt):
+//    quelli diversi o mancanti vengono scaricati, mai specopsvr.ini.
 namespace vr::updater {
 
 namespace {
+
+const char* kPendingFile = "\\specopsvr_update.pending";
+const char* kBootCountFile = "\\specopsvr_boot.count";
+const char* kSkipFile = "\\specopsvr_skip.txt";
+constexpr int kFailedBootsBeforeRollback = 2;
+constexpr DWORD kHealthyAfterConfigMs = 90000;
+
+std::string ReadTextFile(const std::string& path) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    char buf[256];
+    DWORD n = 0;
+    std::string out;
+    if (ReadFile(f, buf, sizeof(buf), &n, nullptr)) out.assign(buf, n);
+    CloseHandle(f);
+    while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
+bool WriteTextFile(const std::string& path, const std::string& text) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD w = 0;
+    bool ok = WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &w, nullptr) && w == text.size();
+    CloseHandle(f);
+    return ok;
+}
+
+bool FileExists(const std::string& path) { return GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+std::string ReadWholeFile(const std::string& path, size_t maxBytes) {
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    std::string out;
+    std::vector<char> buf(1 << 16);
+    DWORD n = 0;
+    while (ReadFile(f, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) && n) {
+        out.append(buf.data(), n);
+        if (out.size() > maxBytes) break;
+    }
+    CloseHandle(f);
+    return out;
+}
+
+// Avvio sano: ini letto e gioco vivo per 90 s. Spegne sentinella e contatore.
+void ConfirmBoot() {
+    vr::control::WaitForConfig(120000, 0);
+    if (!vr::control::g_configLoaded) return;
+    Sleep(kHealthyAfterConfigMs);
+    std::string dir = vr::log::Directory();
+    std::string tag = ReadTextFile(dir + kPendingFile);
+    DeleteFileA((dir + kBootCountFile).c_str());
+    if (DeleteFileA((dir + kPendingFile).c_str()))
+        vr::log::Line("UPDATE: version " + tag + " confirmed (healthy start).");
+}
+
+// Avvio con un aggiornamento ancora da confermare: conta gli avvii falliti e
+// al limite rimette la versione precedente.
+void CheckPendingUpdate(const std::string& dir) {
+    std::string pending = dir + kPendingFile;
+    if (!FileExists(pending)) return;
+    std::string tag = ReadTextFile(pending);
+    int failed = atoi(ReadTextFile(dir + kBootCountFile).c_str());
+    if (failed >= kFailedBootsBeforeRollback) {
+        std::string cur = dir + "\\d3d9.dll", prev = dir + "\\d3d9.dll.prev", bad = dir + "\\d3d9.dll.bad";
+        DeleteFileA((dir + kBootCountFile).c_str());
+        DeleteFileA(pending.c_str());
+        if (!FileExists(prev)) {
+            vr::log::Line("UPDATE: version " + tag + " died " + std::to_string(failed) +
+                          " times right after starting, but there is no d3d9.dll.prev to go back to.");
+            return;
+        }
+        DeleteFileA(bad.c_str());
+        if (MoveFileA(cur.c_str(), bad.c_str()) && MoveFileA(prev.c_str(), cur.c_str())) {
+            WriteTextFile(dir + kSkipFile, tag);
+            vr::log::Line("UPDATE: version " + tag + " died " + std::to_string(failed) +
+                          " times right after starting: the previous version is back from the next launch "
+                          "(this one kept as d3d9.dll.bad). It will not be reinstalled while specopsvr_skip.txt exists.");
+        } else {
+            MoveFileA(bad.c_str(), cur.c_str());
+            vr::log::Line("UPDATE: version " + tag + " died " + std::to_string(failed) +
+                          " times right after starting; automatic rollback failed, run rollback.bat.");
+        }
+        return;
+    }
+    WriteTextFile(dir + kBootCountFile, std::to_string(failed + 1));
+    vr::log::Line("UPDATE: first starts of version " + tag + " (failed so far: " + std::to_string(failed) + ").");
+    std::thread(ConfirmBoot).detach();
+}
+
+using vr::pure::IsDll32;
+using vr::pure::IsRevoked;
+using vr::pure::JsonNumberBefore;
+using vr::pure::JsonString;
+using vr::pure::ParseVersion;
 
 std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
@@ -83,41 +191,6 @@ bool SplitUrl(const std::string& url, std::wstring* host, std::wstring* path) {
     return true;
 }
 
-// Valore stringa di una chiave JSON a partire da "from" (niente parser: la
-// risposta di GitHub ha forma fissa).
-std::string JsonString(const std::string& json, const std::string& key, size_t from = 0, size_t* at = nullptr) {
-    std::string k = "\"" + key + "\"";
-    size_t p = json.find(k, from);
-    if (p == std::string::npos) return {};
-    p = json.find('"', json.find(':', p + k.size()) + 1);
-    size_t e = json.find('"', p + 1);
-    if (p == std::string::npos || e == std::string::npos) return {};
-    if (at) *at = e;
-    return json.substr(p + 1, e - p - 1);
-}
-
-std::vector<int> ParseVersion(std::string v) {
-    if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) v = v.substr(1);
-    std::vector<int> out;
-    size_t i = 0;
-    bool pre = false;
-    while (i < v.size() && out.size() < 3) {
-        size_t j = i;
-        while (j < v.size() && isdigit(static_cast<unsigned char>(v[j]))) ++j;
-        if (j == i) break;
-        out.push_back(atoi(v.substr(i, j - i).c_str()));
-        if (j < v.size() && v[j] == '-') pre = true;
-        if (j >= v.size() || v[j] != '.') break;
-        i = j + 1;
-    }
-    while (out.size() < 3) out.push_back(0);
-    // Quarto numero: 0 per le pre-release ("v0.9.9-beta1"), 1 per le finali.
-    // Prima la beta valeva quanto la finale e chi l'aveva non passava mai
-    // alla 0.9.9 vera (audit 20/10).
-    out.push_back(pre ? 0 : 1);
-    return out;
-}
-
 // SHA-256 esadecimale minuscolo (CNG).
 std::string Sha256Hex(const std::string& data) {
     BCRYPT_ALG_HANDLE alg = nullptr;
@@ -139,35 +212,78 @@ std::string Sha256Hex(const std::string& data) {
     return out;
 }
 
-// Numero intero di una chiave JSON nell'intervallo [from, to).
-long long JsonNumberBefore(const std::string& json, const std::string& key, size_t from, size_t to) {
-    std::string k = "\"" + key + "\":";
-    size_t p = json.rfind(k, to);
-    if (p == std::string::npos || p < from) return -1;
-    return atoll(json.c_str() + p + k.size());
-}
-
-bool IsDll32(const std::string& data) {
-    if (data.size() < 0x200 || data[0] != 'M' || data[1] != 'Z') return false;
-    uint32_t pe = *reinterpret_cast<const uint32_t*>(data.data() + 0x3C);
-    if (pe + 6 > data.size() || data.compare(pe, 4, std::string("PE\0\0", 4)) != 0) return false;
-    uint16_t machine = *reinterpret_cast<const uint16_t*>(data.data() + pe + 4);
-    return machine == 0x014C;  // IMAGE_FILE_MACHINE_I386
-}
-
 // Il manifesto updates.json nel ramo main del repository elenca le versioni
 // ritirate ("revoked") e quella raccomandata: chi ha una versione ritirata
 // riceve la raccomandata anche se e' piu' vecchia (18/10: la 0.9.1 con le
 // immagini doppie restava installata perche' l'aggiornamento non torna mai
 // indietro). Esempio: {"revoked": ["0.9.1"], "recommended": "v0.9.2"}
-bool IsRevoked(const std::string& manifest, const std::string& version) {
-    size_t r = manifest.find("\"revoked\"");
-    if (r == std::string::npos) return false;
-    size_t open = manifest.find('[', r), close = manifest.find(']', r);
-    if (open == std::string::npos || close == std::string::npos) return false;
-    std::string list = manifest.substr(open, close - open);
-    return list.find("\"" + version + "\"") != std::string::npos ||
-           list.find("\"v" + version + "\"") != std::string::npos;
+// File compagni della release (companions.json): {"files": [{"name": "...",
+// "size": N, "sha256": "..."}]}. Scarica quelli mancanti o diversi dagli
+// allegati della stessa release. openvr_api.dll e' caricata: la vecchia viene
+// rinominata .old come la d3d9.dll. Mai specopsvr.ini, mai d3d9.dll.
+void RefreshCompanions(const std::string& json, const std::string& dir) {
+    std::string manifestUrl;
+    size_t at = 0;
+    for (;;) {
+        std::string u = JsonString(json, "browser_download_url", at, &at);
+        if (u.empty()) break;
+        if (u.size() >= 16 && _stricmp(u.substr(u.size() - 16).c_str(), "/companions.json") == 0) {
+            manifestUrl = u;
+            break;
+        }
+    }
+    if (manifestUrl.empty()) return;  // release senza manifesto: solo la dll
+    std::wstring host, path;
+    std::string manifest;
+    if (!SplitUrl(manifestUrl, &host, &path) || !HttpGet(host, path, &manifest, 1 << 16)) {
+        vr::log::Line("UPDATE: cannot read companions.json.");
+        return;
+    }
+    std::string refreshed, failed;
+    for (const vr::pure::Companion& c : vr::pure::ParseCompanions(manifest)) {
+        const std::string& name = c.name;
+        const std::string& sha = c.sha256;
+        long long size = c.size;
+        std::string local = dir + "\\" + name;
+        std::string cur = ReadWholeFile(local, 64u << 20);
+        if (!cur.empty() && static_cast<long long>(cur.size()) == size && _stricmp(Sha256Hex(cur).c_str(), sha.c_str()) == 0)
+            continue;  // identico
+        std::string url;
+        size_t a = 0;
+        for (;;) {
+            std::string u = JsonString(json, "browser_download_url", a, &a);
+            if (u.empty()) break;
+            if (u.size() > name.size() && _stricmp(u.substr(u.size() - name.size() - 1).c_str(), ("/" + name).c_str()) == 0) {
+                url = u;
+                break;
+            }
+        }
+        std::string data;
+        if (url.empty() || !SplitUrl(url, &host, &path) || !HttpGet(host, path, &data, 64u << 20) ||
+            static_cast<long long>(data.size()) != size || _stricmp(Sha256Hex(data).c_str(), sha.c_str()) != 0) {
+            failed += " " + name;
+            continue;
+        }
+        std::string neu = local + ".new", old = local + ".old";
+        if (!WriteTextFile(neu, data)) {
+            failed += " " + name;
+            continue;
+        }
+        DeleteFileA(old.c_str());
+        bool ok;
+        if (FileExists(local)) ok = MoveFileA(local.c_str(), old.c_str()) && MoveFileA(neu.c_str(), local.c_str());
+        else ok = MoveFileA(neu.c_str(), local.c_str()) != 0;
+        if (ok) {
+            refreshed += " " + name;
+            if (_stricmp(name.c_str(), "openvr_api.dll") != 0) DeleteFileA(old.c_str());  // la dll e' in uso
+        } else {
+            MoveFileA(old.c_str(), local.c_str());
+            DeleteFileA(neu.c_str());
+            failed += " " + name;
+        }
+    }
+    if (!refreshed.empty()) vr::log::Line("UPDATE: companion files refreshed:" + refreshed + ".");
+    if (!failed.empty()) vr::log::Line("UPDATE: companion files not refreshed:" + failed + ".");
 }
 
 void Run() {
@@ -223,15 +339,24 @@ void Run() {
     // Con la lista (canale beta) gli allegati cercati sono quelli della prima release.
     size_t nextRelease = json.find("\"tag_name\"", tagAt);
     if (nextRelease != std::string::npos) json = json.substr(0, nextRelease);
+    std::string dir = vr::log::Directory();
     if (revoked) {
         vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " was withdrawn; installing the recommended " + tag + ".");
     } else if (ParseVersion(tag) == ParseVersion(SPECOPSVR_VERSION)) {
         vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is up to date (" + std::string(beta ? "beta" : "stable") +
                       " channel).");
+        RefreshCompanions(json, dir);
         return;
     } else if (ParseVersion(tag) < ParseVersion(SPECOPSVR_VERSION)) {
         vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is newer than the latest " +
                       std::string(beta ? "beta" : "stable") + " release " + tag + " (test build?).");
+        return;
+    }
+    // Versione rimessa indietro dalla sentinella di avvio: non la si reinstalla.
+    std::string skip = ReadTextFile(dir + kSkipFile);
+    if (!skip.empty() && ParseVersion(skip) == ParseVersion(tag)) {
+        vr::log::Line("UPDATE: version " + tag + " was rolled back after failed starts; not reinstalling it "
+                      "(delete specopsvr_skip.txt to try again).");
         return;
     }
     // Allegato "d3d9.dll" della release.
@@ -286,7 +411,6 @@ void Run() {
     } else {
         vr::log::Line("UPDATE: the release gives no SHA-256 for d3d9.dll, size checked only.");
     }
-    std::string dir = vr::log::Directory();
     std::string cur = dir + "\\d3d9.dll", neu = dir + "\\d3d9.dll.new", old = dir + "\\d3d9.dll.old";
     HANDLE f = CreateFileA(neu.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     DWORD written = 0;
@@ -304,7 +428,12 @@ void Run() {
         vr::log::Line("UPDATE: cannot install the new dll.");
         return;
     }
+    // Sentinella per i primi avvii della nuova versione (vedi CheckPendingUpdate).
+    WriteTextFile(dir + kPendingFile, tag);
+    DeleteFileA((dir + kBootCountFile).c_str());
     vr::log::Line("UPDATE: version " + tag + " installed, active from the next game start.");
+    vr::toast::Notify("SpecOpsVR " + tag + " installed: active from the next start");
+    RefreshCompanions(json, dir);
 }
 
 }  // namespace
@@ -314,10 +443,14 @@ void Start() {
     // d3d9.dll.prev (rollback.bat la rimette al suo posto).
     std::string dir = vr::log::Directory();
     std::string old = dir + "\\d3d9.dll.old";
-    if (GetFileAttributesA(old.c_str()) != INVALID_FILE_ATTRIBUTES)
-        MoveFileExA(old.c_str(), (dir + "\\d3d9.dll.prev").c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (FileExists(old)) MoveFileExA(old.c_str(), (dir + "\\d3d9.dll.prev").c_str(), MOVEFILE_REPLACE_EXISTING);
     DeleteFileA((dir + "\\d3d9.dll.new").c_str());
+    old = dir + "\\openvr_api.dll.old";
+    if (FileExists(old)) DeleteFileA(old.c_str());
+    CheckPendingUpdate(dir);
     std::thread(Run).detach();
 }
+
+void OnCleanExit() { DeleteFileA((vr::log::Directory() + kBootCountFile).c_str()); }
 
 }  // namespace vr::updater

@@ -122,8 +122,25 @@ if (-not (Test-Path $prev)) { Write-Host 'No previous version found (d3d9.dll.pr
 if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
 Copy-Item -Force (Join-Path $dst 'd3d9.dll') (Join-Path $dst 'd3d9.dll.rolledback')
 Copy-Item -Force $prev (Join-Path $dst 'd3d9.dll')
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst 'specopsvr_update.pending'), (Join-Path $dst 'specopsvr_boot.count')
 Add-Content -Path (Join-Path $dst 'specopsvr.ini') -Value "`r`nautoupdate off  # set by rollback.bat; remove to get updates again"
 Write-Host 'The previous version is back. Automatic updates were turned off in specopsvr.ini.'
+"""
+
+RESET_PS1 = r"""
+. (Join-Path $PSScriptRoot 'find_game.ps1')
+$dst = Find-Game $args[0]
+if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
+# The old settings are kept next to the new ones, nothing else is touched.
+$ini = Join-Path $dst 'specopsvr.ini'
+if (Test-Path $ini) {
+  $bak = Join-Path $dst ('specopsvr.ini.bak-' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+  Move-Item -Force $ini $bak
+  Write-Host "Your settings were saved as $bak"
+}
+$shipped = Join-Path $PSScriptRoot 'specopsvr.ini'
+if (Test-Path $shipped) { Copy-Item -Force $shipped $ini; Write-Host 'The shipped specopsvr.ini is in place.' }
+else { Write-Host 'specopsvr.ini removed: the mod starts with its built-in defaults and recreates the file when you change a setting.' }
 """
 
 COLLECT_PS1 = r"""
@@ -192,7 +209,11 @@ UPDATES
   the next launch ("autoupdate off" in specopsvr.ini disables it). New
   versions first come out as test (pre-release) builds: "updatechannel beta"
   gets them too. If an update causes problems, close the game and run
-  rollback.bat to go back to the previous version.
+  rollback.bat to go back to the previous version. A version that dies twice
+  right after starting is put back automatically. The helper scripts and
+  openvr_api.dll are refreshed with the updates; your specopsvr.ini is only
+  migrated, never replaced (reset_settings.bat puts the defaults back,
+  keeping a copy of yours).
 
 CONTROLS (Touch layout; Index: A/B on each hand = A/B and X/Y, left trackpad
 click = pause; every button can be changed in SteamVR > Settings >
@@ -205,7 +226,8 @@ Controllers > Manage controller bindings > Spec Ops: The Line)
   X: reload                        Y: next weapon
   Stick clicks: LS / RS            Left menu button: Start (pause)
   Right stick held + direction: D-pad (secondary fire, grenade type)
-  Both sticks held for 1 second: recenter (stand straight, look ahead)
+  Both sticks held for 1 second: recenter (stand straight, look ahead);
+    keep holding for 3 seconds to also set and save your standing height
   You aim with the gun in your right hand: shots leave the barrel and land
   on the green marker. Put your left hand on the barrel to aim two-handed.
   Bring the gun up to your eye to aim down the sights.
@@ -219,7 +241,8 @@ GESTURES
     ("reload simple" in specopsvr.ini: left hand on the magazine, pull down.)
   Cover: duck quickly next to cover (not while already in cover).
   Weapon: right hand over your right shoulder + right grip = next weapon.
-  Melee: punch forward with the left hand at chest height.
+  Melee: punch forward with the left hand at chest height, or jab/strike
+    with the gun in your right hand.
   Cover: lean out sideways (or stand up) to pop out and aim.
 
 HAPTIC DEVICES (optional)
@@ -261,17 +284,33 @@ def main():
         "collect_logs.bat": bat("collect_logs.ps1", "Zips logs, configuration and crash dumps for a bug report."),
         "rollback.ps1": ROLLBACK_PS1,
         "rollback.bat": bat("rollback.ps1", "Puts back the version installed before the last automatic update."),
+        "reset_settings.ps1": RESET_PS1,
+        "reset_settings.bat": bat("reset_settings.ps1", "Puts the default specopsvr.ini back (your settings are kept as a .bak copy)."),
         "README.txt": README_TXT.format(version=version()),
     }
     for name, text in files.items():
         with open(os.path.join(DIST, name), "w", encoding="utf-8-sig" if name.endswith(".ps1") else "utf-8",
                   newline="" if name.endswith(".bat") else "\r\n") as f:
             f.write(text.lstrip("\n"))
+    # Manifesto dei file compagni per l'aggiornamento automatico (R-R4): la
+    # release deve avere come allegati, oltre al zip e a d3d9.dll, anche
+    # companions.json e ogni file elencato (vedi il comando stampato in fondo).
+    import hashlib
+    companions = [n for n in sorted(os.listdir(DIST)) if n not in ("d3d9.dll", "specopsvr.ini")]
+    entries = []
+    for n in companions:
+        data = open(os.path.join(DIST, n), "rb").read()
+        entries.append({"name": n, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    import json
+    with open(os.path.join(DIST, "companions.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"version": version(), "files": entries}, f, indent=1)
     zip_path = os.path.join(ROOT, "dist", NAME + ".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for name in sorted(os.listdir(DIST)):
             z.write(os.path.join(DIST, name), os.path.join(NAME, name))
     print(zip_path, os.path.getsize(zip_path), "bytes, version", version())
+    assets = " ".join('"%s"' % os.path.join(DIST, n) for n in ["d3d9.dll", "companions.json"] + companions)
+    print("release assets:  gh release create v%s \"%s\" %s" % (version(), zip_path, assets))
 
 
 if __name__ == "__main__":

@@ -275,6 +275,11 @@ extern std::atomic<float> g_forcedMotion;
 extern std::atomic<bool> g_heightAuto;
 extern std::atomic<bool> g_seated;
 extern std::atomic<float> g_eyeHeightAuto;  // calcolata (unita' sopra il centro del Pawn), <0 = non ancora
+// "height <metri>": altezza della testa in piedi fissa (R-B6), <=0 = misurata.
+extern std::atomic<float> g_heightFixedM;
+// Entrambi gli stick tenuti 3 s: l'altezza attuale della testa diventa quella
+// in piedi e viene salvata nell'ini.
+extern std::atomic<bool> g_heightCalibRequested;
 // Room-scale: il Pawn segue gli spostamenti fisici oltre 15 cm ("roomscale on|off").
 extern std::atomic<bool> g_roomScale;
 // Rotazioni del corpo fatte con lo stick destro (continua o a scatti), unita'
@@ -286,6 +291,13 @@ extern std::atomic<bool> g_keepFocus;
 extern std::atomic<bool> g_configLoaded;
 // Diagnostica dei nemici davanti alla vista ma non disegnati ("vischeck on", predefinito off).
 extern std::atomic<bool> g_visCheck;
+// "roomstep <unita'>": passo room-scale diagnostico lungo l'avanti del corpo (L8).
+extern std::atomic<float> g_roomStepRequest;
+extern std::atomic<bool> g_roomStepRaw;  // "roomstep N raw": senza correzione della base
+// Ricentramento di direzione e posizione sotto il nero alla fine dello schermo virtuale.
+extern std::atomic<bool> g_cinemaAlign;
+// Avvisi brevi nel visore ("toasts on|off", predefinito on; R-U1).
+extern std::atomic<bool> g_toasts;
 // Ini mai caricato (eseguibile non supportato, avvio lento): legge dall'ini
 // solo autoupdate, updatechannel e updaterepo. Thread dell'aggiornamento.
 void ReadUpdateSettingsFromIni();
@@ -379,6 +391,8 @@ extern std::atomic<float> g_armOffsetCm[3];
 std::string ArmControlName(int i);
 extern std::atomic<int> g_armDebugFrames;
 extern std::atomic<bool> g_armBonesRequested;
+// "weaponbones": ossa del modello dell'arma in mano nel log (R-W7).
+extern std::atomic<bool> g_weaponBonesRequested;
 // "bodysize": altezza dello scheletro di Walker (ossa piu' alta e piu' bassa) nel log.
 extern std::atomic<bool> g_bodySizeRequested;
 // "camlog N": per N frame, posizione di base della vista (gioco) e finale (6DOF) nel log.
@@ -401,6 +415,7 @@ extern std::atomic<float> g_synthHandCm[3];
 // fucile) la mira va dalla mano destra alla sinistra. synthleft = mano
 // sinistra finta per i test (cm, come synthhand; 0 0 0 = assente).
 extern std::atomic<bool> g_twoHand;
+extern std::atomic<float> g_twoHandCm;  // tolleranza della sinistra dalla linea dell'arma (cm)
 extern std::atomic<float> g_synthLeftCm[3];
 // Gesti (vr_input.cpp): lancio della granata con la mano sinistra (LB),
 // ricarica tirando giu' il caricatore (X), copertura abbassandosi (A).
@@ -411,6 +426,8 @@ extern std::atomic<bool> g_gestureMelee;
 // caricatore e tirarlo via, grip alla cintura per prenderne uno nuovo,
 // portarlo sotto l'arma per inserirlo (X). "simple" = tocca e tira giu'.
 extern std::atomic<bool> g_reloadPhysical;
+// "manualaction on": dopo la ricarica fisica l'arma va armata (gesto al castello) prima di sparare (R-W3).
+extern std::atomic<bool> g_manualAction;
 // Caricatore rispetto al controller destro: cm in avanti lungo la canna e sotto.
 extern std::atomic<float> g_magwellCm[2];
 // Spostamento del caricatore per il tipo d'arma in mano (cm, sommato a
@@ -419,6 +436,7 @@ extern std::atomic<float> g_magwellClassCm[2];
 // Ultimo lancio col gesto: direzione della mano (spazio di SteamVR, unitaria)
 // e istante (GetTickCount64): la granata lanciata parte in quella direzione.
 extern std::atomic<float> g_throwDir[3];
+extern std::atomic<float> g_throwSpeed;  // velocita' media della mano nel lancio (m/s), 0 = ignota
 extern std::atomic<unsigned long long> g_throwStamp;
 // Arma presa dalla spalla: grip destro con la mano sopra la spalla = Y (arma seguente).
 extern std::atomic<bool> g_gestureWeapon;

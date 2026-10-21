@@ -506,6 +506,136 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   hand is at the magwell or the grip belongs to the reload, the grip is not
   sent to the game as LB (grenade).
 
+## Review fixes (after 0.9.9, in progress)
+
+Work list from the multi-agent review in `docs/REVIEW_FULLVR.md` (item ids
+H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
+`tools/regress.py` PASS before every commit).
+
+- **Scenes and camera:** gun pose saved/restored around cinematics (H1),
+  special moves locked to the game with the neck following the animation
+  where it should (vault, cover, rope); head catch-up and stick turns keep
+  the pivot compensation consistent (H3); cinema/VR hysteresis, instant black
+  on scene settle, `cinemaalign` re-reference after a cutscene (R-B5).
+- **Ballistics (H2):** the game applies its cone *before* `CalcWeaponFire`
+  (caller `FUN_0093f510` -> `FUN_00f60300`, accuracy at arsenal+0x81C) around
+  the PlayerController rotation; the hook remaps the recovered deviation
+  around the barrel, scaled by `spread` and stance (two-hand 0.6, ADS 0.5,
+  one-handed long gun 1.5), and keeps the advanced start of pass-through
+  shots. Game recoil values are saved per weapon and restored when the arms
+  are released (L11).
+- **Rendering:** aim marker and target box sized in degrees from the eye
+  projection (R-C2); scope mask taken from the frame tag of the eye being
+  presented (L4); worker thread holds references on the eye textures (M7);
+  VR output retried with back-off after a failure (L22); fence timeouts and
+  `Canvas.Project` calls per tick counted in the log (L2, M19: hook on
+  `UCanvas::execProject` @0x00A15D90; measured 0.0 calls per tick in
+  gameplay with the HUD on, so the canvas remap has nothing to double-shift
+  and no projection fix-up is needed); vignette from forced motion only
+  (M20).
+- **Input and gestures:** melee intent independent from Y, B gesture delayed
+  one poll, reload state frozen on pose loss (M14), honest reload only in
+  gameplay, D-pad modifier with release suppression, turns blocked in locked
+  scenes, neutral pad on XInput errors (M16), turret stick pitch and
+  time-based turret gain (L17, L18), grenade direction kept while the grip
+  is held and refreshed at release (L21), support-hand `aimpitch` as a
+  rotation about the controller's right axis (L20), haptics by physical
+  hand (L19), lateral gun offsets mirrored for left-handed play (M17).
+- **Arms:** `KeepGoodBones` state reset on acquire/release (L9), IK controls
+  retried every second on a mesh where they were missing (L10), squad
+  pointing traces only candidates near the ray (L13), object-scan time per
+  tick in the `PROFILE` line (L12). Two-hand grip tolerance `twohand on <cm>`
+  (12 cm, was 8; a tester's left hand sat 9-10 cm under the barrel and the
+  grip never engaged) with a log line saying how far the hand is.
+- **Room-scale (L8, and a bigger find):** `UObject::ProcessEvent`
+  (0x005AAF20) silently ignores any UFunction whose `iNative` (UFunction
+  +0x98) is non-zero, i.e. every `native(N)` function dispatched by opcode:
+  `Move`, `MoveSmooth`, `SetLocation`, `SetPhysics`... `CallFunction`
+  "succeeded" on them without doing anything, so the room-scale Pawn
+  catch-up (R-B4, with `Move` and then `MoveSmooth`) never moved Walker;
+  the view only kept the head offset. The Pawn is now moved by calling the
+  C++ `AActor::moveSmooth` (0x0088FB70, `__thiscall(actor, const FVector*)`
+  -> UBOOL, the function `execMoveSmooth` calls after clearing
+  `bJustTeleported` at Actor+0xA4 bit 0x400) directly under SEH.
+  `CallFunction` and `ucall` now log "is an opcode native (iNative N)" and
+  refuse such functions instead of pretending. L8 itself: the game's POV
+  comes from the tick, before the Draw in which the Pawn moves, so after a
+  step the view base lagged the Pawn by one frame; the step made in the
+  tick is added to the base of that tick. `roomstep <units> [raw]` makes a
+  diagnostic step (`raw` = without the correction) and `camlog` shows
+  base-pawn per tick.
+- **View state (L5):** when the engine recreates `LocalPlayer.ViewState`
+  (two owner changes per regress session: menu and level load) the mod's
+  right-eye state is destroyed first through vtable slot 0
+  (`FSceneViewStateInterface::Destroy`, as `FUN_00c60790` does for the
+  engine's own), instead of leaking it with its occlusion queries.
+- **Vive wands (L28):** explicit `dpadleft`/`dpadright` actions (right
+  trackpad east/west zones = D-pad) and `sticky` dpad zones, so sliding the
+  thumb from the centre click no longer presses A/B.
+- **Grenade (R-W6):** the throw speed is the hand's mean speed over the
+  60 ms sample; the redirected grenade keeps the game's speed scaled by
+  `clamp(hand / 4 m/s, 0.4, 1.3)` (`GRENADE:` line shows the factor).
+  `gesturesim throw` now moves the hand at 4 m/s (the 3 m/s of the old
+  simulation was below the 3.2 m/s threshold raised on 18/10).
+- **Gun-hand melee (R-I3):** the gesture sample carries the gun hand's
+  velocity; a jab along the barrel or a downward strike over 3.5 m/s with
+  the gun below the eyes presses B (`gesturesim jab|strike`).
+- **Manual action (R-W3):** `manualaction on` adds a `Mag::Chamber` state
+  after the magazine is inserted: the honest-reload gate keeps the trigger
+  off until the left hand grips within 15 cm of the receiver (10 cm ahead
+  of the gun hand, 3 cm up) and pulls back 8 cm along the barrel. Off by
+  default (the game's weapons are all self-loading); `gesturesim reload`
+  racks the action when the option is on.
+- **Cinema on the GPU path (R-C5):** the virtual screen frame now goes
+  through the same shared surface as the eyes (StretchRect into the shared
+  surface, `CopySubresourceRegion` into the overlay texture, which is now
+  B8G8R8A8 with `VROverlayFlags_IgnoreTextureAlpha`) instead of a ~5.7 MB
+  CPU readback per tick; the letterbox rows are read from a staging copy
+  every 15 frames (copied one frame, mapped the next). The CPU path remains
+  the fallback when shared surfaces are unavailable. *Needs a headset (or
+  null-driver) check of menus and Bink movies.*
+- **Covered by existing code:** R-U4 (world-locked squad marker: the orange
+  target box is already projected per eye from `g_squadTargetLoc` with the
+  eye's own projection, and M19 showed no `Canvas.Project` traffic to fix);
+  R-R1 (identity guards: `StillAlive`/`ObjClass` checks on every captured
+  pointer, `LivePlayerController()`, presence pruning of the projectile list
+  - the generation counter was not needed once every use re-validates).
+- **Headset notices (R-U1):** `src/vr_toast.cpp` draws short messages with
+  GDI into a head-locked SteamVR overlay (`specopsvr.status`, 22 cm below
+  the gaze at 1 m, 3.5 s each, queue of 4, identical text once per 10 s,
+  recreated on a new SteamVR connection): update installed, recentered,
+  standing height saved, gunstock calibrated, VR output paused, ProTube /
+  bHaptics disconnected, SteamVR reconnected. `toasts off` disables them.
+- **Standing height (R-B6):** `height <metres>` fixes the standing head
+  height (the automatic one keeps the highest head position seen); both
+  sticks held 3 s (recenter fires at 1 s) take the current head height as
+  the standing one and save it with `SaveIniValue`.
+- **Recenter (R-C3):** 150 ms of instant black on recenter, like the
+  cutscene settle. **Submit watchdog (R-R3):** a compositor `Submit` over
+  100 ms is logged (at most every 5 s). **Special moves (R-T3):**
+  `SPECIALMOVE` lines carry the `YE_SpecialMove` names.
+- **Robustness:** engine crash filter `FUN_00827770` hooked so a game crash
+  writes the mod's CRASH line and minidump (R-R2); script calls that throw
+  are disabled by name (L25); `openvr_api.dll` delay-loaded with failure
+  stubs and the minimized window restored, so a missing dll leaves the game
+  playable (M6, H4); asynchronous logger (queue + writer thread, ERROR/CRASH
+  written synchronously, log order verified, R-R5).
+- **Updates (R-R4):** boot sentinel - a freshly installed dll leaves
+  `specopsvr_update.pending`; `specopsvr_boot.count` grows at every start
+  and is cleared on a clean exit or after 90 s of life past the ini; at the
+  third start after two early deaths `d3d9.dll.prev` is put back, the dll
+  kept as `d3d9.dll.bad` and the tag written to `specopsvr_skip.txt` (never
+  reinstalled while it exists). Companion files: `package.py` writes
+  `companions.json` (name, size, SHA-256 of `openvr_api.dll`, scripts and
+  README) and prints the `gh release create` line with every asset; the
+  updater downloads the ones missing or different (never `specopsvr.ini`).
+  `reset_settings.bat` restores the shipped ini keeping a dated copy.
+- **Tests:** `src/pure_utils.h` holds the pure functions of the updater and
+  the ini parser (versions, JSON, revocation, companions, line normalization,
+  migrations) covered by `tests/unit_tests.cpp` (R-T2); `regress.py` runs
+  them first and gained the `gestures` (simulated physical reload) and
+  `cinema` (SetCinematicMode on/off) phases (R-T1).
+
 ## Audit fixes and first full-VR features (0.9.9)
 
 Audit of 20/10 (work list in `docs/ROADMAP_0.9.9.md`) and a tester report
@@ -756,7 +886,14 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
 - `ue3.py` - engine object browser.
 - `hmdwindow.py` - captures the SteamVR null driver window for headset-free
   tests.
-- `package.py` - builds the release zip.
+- `package.py` - builds the release zip, `companions.json` and prints the
+  release command with every asset the updater may fetch.
+- `regress.py` - release gate: unit tests, then stand / sweep / move /
+  checkpoint / fire / gestures / cinema phases on the game in synthetic-pose
+  mode (kills the game; never run two game tests at once).
+- `tests/unit_tests.cpp` - offline tests of `src/pure_utils.h`
+  (`cmake --build build --config Release --target unit_tests`, then
+  `build\Release\unit_tests.exe`).
 - `native_names.py` - extracts the UE3 native registration table (4054
   `AClass::execName` functions, records {name pointer, function pointer} in
   `.data`) as `0xaddress<TAB>function<TAB>name` lines (Ghidra/REA seed format).

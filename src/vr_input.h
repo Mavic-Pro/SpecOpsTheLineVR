@@ -29,5 +29,8 @@ void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, un
 
 // Letture del pad 0 servite dalla mod finora (diagnostica: quante per tick).
 unsigned PadPolls();
+// Riscrive manifest e binding di SteamVR Input (specopsvr_input/) e ritorna il
+// percorso del manifest ("" se fallisce): comando "inputfiles" per i test.
+std::string WriteActionFiles();
 
 }  // namespace vr::input

@@ -2,6 +2,7 @@
 #include "control.h"
 #include "logger.h"
 #include "vr_session.h"
+#include "vr_toast.h"
 #include "hooks.h"
 
 #include <windows.h>
@@ -33,7 +34,7 @@ namespace {
 // Ora: copia via CPU in una texture D3D11 creata sulla STESSA scheda video a
 // cui e' collegato il visore (GetDXGIOutputInfo), il percorso principale di
 // OpenVR. D3D11 non ha affinita' di thread.
-bool g_disabled = false;  // errore permanente: il gioco continua sul monitor
+bool g_disabled = false;  // errore dell'uscita VR: sospesa fino a g_disabledUntil (vedi Disable)
 ID3D11Device* g_d3d11 = nullptr;
 ID3D11DeviceContext* g_d3d11Ctx = nullptr;
 ID3D11Texture2D* g_eyeTexture[2] = {};
@@ -70,6 +71,10 @@ uint32_t g_slotTick[2][kSlots] = {};
 // coppia valida sono presentati uno dopo l'altro.
 uint32_t g_presentSeq = 0;
 uint32_t g_slotSeq[2][kSlots] = {};
+// Attese sulle fence scadute (copia D3D9 StretchRect 8 ms, copia D3D11 10 ms):
+// lo slot viene consegnato lo stesso; se capita, un frame puo' mescolare due
+// tick (L2). Contate nella riga VR-OUTPUT.
+std::atomic<unsigned> g_fenceTimeout9{0}, g_fenceTimeout11{0};
 vr::HmdMatrix34_t g_renderPose[2] = {};
 bool g_slotGpu[2][kSlots] = {};     // slot nella texture condivisa (niente LockRect)
 // Percorso GPU (device D3D9Ex): texture render target condivise con D3D11,
@@ -158,9 +163,24 @@ std::string Hex(unsigned long v) {
     return b;
 }
 
+// Errore dell'uscita VR: si riprova con attesa crescente (5, 10, 20, 40, 60 s)
+// invece di spegnere l'uscita per tutta la partita (L22: un errore D3D11
+// passeggero lasciava il visore nero fino al riavvio).
+ULONGLONG g_disabledUntil = 0;
+unsigned g_disableBackoffMs = 5000;
 void Disable(const std::string& why) {
-    vr::log::Line("VR-OUTPUT disabled: " + why);
+    g_disabledUntil = GetTickCount64() + g_disableBackoffMs;
+    vr::log::Line("VR-OUTPUT disabled for " + std::to_string(g_disableBackoffMs / 1000) + " s: " + why);
+    vr::toast::Notify("VR output paused for " + std::to_string(g_disableBackoffMs / 1000) + " s after an error");
+    if (g_disableBackoffMs < 60000) g_disableBackoffMs *= 2;
     g_disabled = true;
+}
+bool OutputDisabled() {
+    if (!g_disabled) return false;
+    if (GetTickCount64() < g_disabledUntil) return true;
+    g_disabled = false;
+    vr::log::Line("VR-OUTPUT: retrying after the error.");
+    return false;
 }
 
 bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
@@ -358,6 +378,14 @@ ID3D11Texture2D* g_blackTex = nullptr;    // inviata agli occhi durante il cinem
 UINT g_cinemaTexW = 0, g_cinemaTexH = 0;
 vr::VROverlayHandle_t g_cinemaOverlay = vr::k_ulOverlayHandleInvalid;
 bool g_cinemaShown = false;
+// Percorso GPU dello schermo virtuale (R-C5): il frame arriva nella texture
+// condivisa come per gli occhi e viene copiato GPU -> GPU nella texture
+// dell'overlay; le righe con contenuto (bande nere) si leggono dalla CPU da
+// una copia di staging ogni 15 frame (prima tutto il frame, ~5,7 MB, passava
+// dalla CPU a ogni tick: menu e filmati a meta' frequenza).
+ID3D11Texture2D* g_cinemaStage = nullptr;
+bool g_cinemaStagePending = false;
+unsigned g_cinemaFrames = 0;
 
 bool EnsureCinemaTextures(UINT w, UINT h) {
     if (!g_blackTex) {
@@ -377,21 +405,54 @@ bool EnsureCinemaTextures(UINT w, UINT h) {
     if (!g_cinemaTex || g_cinemaTexW != w || g_cinemaTexH != h) {
         if (g_cinemaTex) g_cinemaTex->Release();
         g_cinemaTex = nullptr;
+        if (g_cinemaStage) g_cinemaStage->Release();
+        g_cinemaStage = nullptr;
+        g_cinemaStagePending = false;
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = w;
         td.Height = h;
         td.MipLevels = td.ArraySize = 1;
-        // Senza alfa: il back buffer del gioco ha un alfa qualsiasi e l'overlay
-        // lo userebbe come trasparenza (immagine scura, cielo nero).
-        td.Format = DXGI_FORMAT_B8G8R8X8_UNORM;
+        // Stesso formato della texture condivisa (copia GPU -> GPU, R-C5); il
+        // back buffer del gioco ha un alfa qualsiasi e l'overlay lo userebbe
+        // come trasparenza (immagine scura, cielo nero): l'overlay ha il flag
+        // IgnoreTextureAlpha (prima: formato X8 senza alfa).
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(g_d3d11->CreateTexture2D(&td, nullptr, &g_cinemaTex))) return false;
         g_cinemaTexW = w;
         g_cinemaTexH = h;
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(g_d3d11->CreateTexture2D(&sd, nullptr, &g_cinemaStage))) g_cinemaStage = nullptr;
     }
     return true;
+}
+
+void DetectContentRows(const uint8_t* bits, UINT pitch, UINT w, UINT h, UINT* top, UINT* bottom);
+// Righe con contenuto sul percorso GPU: copia di staging ogni 15 frame, letta
+// al frame seguente (la Map non aspetta la GPU). Ritorna true con top/bottom nuovi.
+bool DetectContentRowsGpu(UINT* top, UINT* bottom) {
+    if (!g_cinemaStage) return false;
+    ++g_cinemaFrames;
+    if (g_cinemaStagePending) {
+        g_cinemaStagePending = false;
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (SUCCEEDED(g_d3d11Ctx->Map(g_cinemaStage, 0, D3D11_MAP_READ, 0, &m))) {
+            DetectContentRows(static_cast<const uint8_t*>(m.pData), m.RowPitch, g_cinemaTexW, g_cinemaTexH, top, bottom);
+            g_d3d11Ctx->Unmap(g_cinemaStage, 0);
+            return true;
+        }
+        return false;
+    }
+    if (g_cinemaFrames % 15 == 0) {
+        g_d3d11Ctx->CopyResource(g_cinemaStage, g_cinemaTex);
+        g_cinemaStagePending = true;
+    }
+    return false;
 }
 
 // Mostra lo schermo davanti alla direzione in cui guarda il giocatore
@@ -408,6 +469,7 @@ void ShowCinemaOverlay() {
             g_cinemaOverlay = vr::k_ulOverlayHandleInvalid;
             return;
         }
+        ov->SetOverlayFlag(g_cinemaOverlay, vr::VROverlayFlags_IgnoreTextureAlpha, true);  // alfa del back buffer qualsiasi
     }
     vr::TrackedDevicePose_t pose;
     sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, &pose, 1);
@@ -622,13 +684,16 @@ void SaveMirrorShot(vr::IVRCompositor* compositor, const std::string& path) {
 // erano netti). Richieste da qualsiasi thread, eseguite qui sotto.
 std::atomic<float> g_blinkRequest{0.0f};
 std::atomic<bool> g_holdBlack{false};
+std::atomic<bool> g_holdInstant{false};
 
 void ApplyFades(vr::IVRCompositor* compositor) {
     static bool held = false;
     bool hold = g_holdBlack.load();
     float blink = g_blinkRequest.exchange(0.0f);
     if (hold && !held) {
-        compositor->FadeToColor(0.08f, 0.0f, 0.0f, 0.0f, 1.0f);
+        // Alla fine dello schermo virtuale il nero deve esserci dal primo frame
+        // in 3D (R-C4); alla morte resta la dissolvenza breve.
+        compositor->FadeToColor(g_holdInstant.load() ? 0.0f : 0.08f, 0.0f, 0.0f, 0.0f, 1.0f);
         held = true;
     } else if (!hold && held) {
         compositor->FadeToColor(0.25f, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -658,7 +723,7 @@ void WorkerLoop() {
         if (g_workerStop) break;
         vr::session::Shared vrLock;
         vr::IVRCompositor* compositor = vr::session::IsScene() ? vr::VRCompositor() : nullptr;
-        if (!compositor || g_disabled) {
+        if (!compositor || (g_disabled && GetTickCount64() < g_disabledUntil)) {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_frameReady = false;  // niente compositor (Background): coppia scartata
             g_cv.notify_all();
@@ -693,18 +758,46 @@ void WorkerLoop() {
             tex[1] = g_eyeTexture[1];
             bounds[0] = pk[0].slot >= 0 ? pk[0].bounds : g_eyeBounds[0];
             bounds[1] = pk[1].slot >= 0 ? pk[1].bounds : g_eyeBounds[1];
+            // Riferimenti propri finche' questo giro non ha finito (copia e
+            // Submit): il thread di rendering puo' liberare texture e
+            // superfici condivise allo scadere dei 5 s di attesa (M7).
+            for (int e = 0; e < 2; ++e) {
+                if (tex[e]) tex[e]->AddRef();
+                if (pk[e].gpuSrc) pk[e].gpuSrc->AddRef();
+            }
         }
+        struct HeldRefs {
+            ID3D11Texture2D* t[4];
+            ~HeldRefs() {
+                for (ID3D11Texture2D* x : t)
+                    if (x) x->Release();
+            }
+        } held = {{tex[0], tex[1], pk[0].gpuSrc, pk[1].gpuSrc}};
         g_cv.notify_all();  // il thread di rendering puo' preparare il frame seguente
         double tc = QpcMs();
         bool cinema = pk[0].cinema;
         UINT cinemaTop = 0, cinemaBottom = pk[0].h;
         if (cinema) {
             // Schermo virtuale: l'immagine 16:9 va nella texture dell'overlay.
-            if (pk[0].bits && EnsureCinemaTextures(pk[0].w, pk[0].h)) {
+            bool fed = false;
+            UINT top = 0, bottom = pk[0].h;
+            bool rowsKnown = false;
+            if (pk[0].gpuSrc && EnsureCinemaTextures(pk[0].w, pk[0].h)) {
+                D3D11_BOX box = {0, 0, 0, pk[0].w, pk[0].h, 1};
+                g_d3d11Ctx->CopySubresourceRegion(g_cinemaTex, 0, 0, 0, 0, pk[0].gpuSrc, 0, &box);  // GPU -> GPU
+                fed = true;
+                rowsKnown = DetectContentRowsGpu(&top, &bottom);
+                if (!rowsKnown) {  // nessuna lettura nuova: ritaglio invariato
+                    top = g_cropSession ? g_cropTop : 0;
+                    bottom = g_cropSession ? g_cropBottom : pk[0].h;
+                }
+            } else if (pk[0].bits && EnsureCinemaTextures(pk[0].w, pk[0].h)) {
                 D3D11_BOX box = {0, 0, 0, pk[0].w, pk[0].h, 1};
                 g_d3d11Ctx->UpdateSubresource(g_cinemaTex, 0, &box, pk[0].bits, pk[0].pitch, 0);
-                UINT top = 0, bottom = pk[0].h;
                 DetectContentRows(pk[0].bits, pk[0].pitch, pk[0].w, pk[0].h, &top, &bottom);
+                fed = true;
+            }
+            if (fed) {
                 // Ritaglio stabile: cambia solo se il nuovo resta uguale per 30
                 // frame (scene scure e dissolvenze lo facevano saltare a ogni
                 // frame) o all'inizio di ogni passaggio allo schermo virtuale.
@@ -746,7 +839,7 @@ void WorkerLoop() {
         // Le CopyResource dalle superfici condivise sono solo accodate: lo slot
         // torna al thread di rendering (che ci riscrive con StretchRect) solo a
         // copia finita, altrimenti un frame poteva mescolare due tick.
-        if (!cinema && (pk[0].gpuSrc || pk[1].gpuSrc)) {
+        if (pk[0].gpuSrc || pk[1].gpuSrc) {  // anche la copia nello schermo virtuale
             static ID3D11Query* copyDone = nullptr;
             if (!copyDone) {
                 D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
@@ -758,6 +851,7 @@ void WorkerLoop() {
                 BOOL doneQ = FALSE;
                 while (g_d3d11Ctx->GetData(copyDone, &doneQ, sizeof(doneQ), 0) != S_OK && QpcMs() - tq < 10.0)
                     YieldProcessor();
+                if (g_d3d11Ctx->GetData(copyDone, &doneQ, sizeof(doneQ), 0) != S_OK) ++g_fenceTimeout11;  // L2: contati
             }
         }
         copyMs += QpcMs() - tc;
@@ -807,6 +901,7 @@ void WorkerLoop() {
             HideCinemaOverlay();
             g_cropSession = false;
         }
+        vr::toast::Tick();  // avvisi nel visore (R-U1)
         if (!tex[0] || !tex[1]) {
             endBusy();
             continue;
@@ -857,7 +952,18 @@ void WorkerLoop() {
             errL = compositor->Submit(vr::Eye_Left, &texL, cinema ? &full : &bounds[0]);
             errR = compositor->Submit(vr::Eye_Right, &texR, cinema ? &full : &bounds[1]);
         }
-        submitMs += QpcMs() - ts;
+        {
+            double took = QpcMs() - ts;
+            submitMs += took;
+            // Un Submit oltre 100 ms (compositor bloccato, SteamVR che si
+            // riavvia) finisce nel log, al massimo una volta ogni 5 s (R-R3).
+            static double lastSlowLog = 0.0;
+            if (took > 100.0 && QpcMs() - lastSlowLog > 5000.0) {
+                lastSlowLog = QpcMs();
+                vr::log::Line("VR-OUTPUT: Submit took " + std::to_string(static_cast<int>(took)) + " ms (L=" +
+                              std::to_string(static_cast<int>(errL)) + " R=" + std::to_string(static_cast<int>(errR)) + ").");
+            }
+        }
         endBusy();
         ++submits;
         // Ritardo reale testa -> fotoni di questo frame: dal campionamento della
@@ -893,9 +999,10 @@ void WorkerLoop() {
             std::snprintf(b, sizeof(b),
                           "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
                           "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d; mismatched pairs skipped %d; stale pairs "
-                          "dropped %d",
+                          "dropped %d; fence timeouts d3d9=%u d3d11=%u",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
-                          copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs, g_pairsDropped);
+                          copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs, g_pairsDropped,
+                          g_fenceTimeout9.load(), g_fenceTimeout11.load());
             vr::log::Line(b);
             windowStart = now;
             copyMs = waitMs = submitMs = 0.0;
@@ -1022,7 +1129,7 @@ int g_sameTickOk = 0, g_sameTickMissed = 0;
 
 void OnPresent(IDirect3DDevice9* device, int eye) {
     if (vr::control::g_exiting) return;
-    if (g_disabled || !vr::control::g_vrOutput) return;
+    if (OutputDisabled() || !vr::control::g_vrOutput) return;
     ++g_presentSeq;
     // Solo da applicazione Scene (visore indossato, vedi vr_session.h).
     if (!vr::session::IsScene()) return;
@@ -1163,6 +1270,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             double tq = QpcMs();
             while (g_shQuery[e][g]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE && QpcMs() - tq < 8.0)
                 YieldProcessor();
+            if (g_shQuery[e][g]->GetData(nullptr, 0, 0) == S_FALSE) ++g_fenceTimeout9;  // consegnato lo stesso (L2: contati)
             DeliverGpuSlot(e, g);
         } else if (g >= 0) {
             D3DLOCKED_RECT lr;
@@ -1223,11 +1331,11 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         if (sh > texH) sh = texH;
         RECT dst = {0, 0, static_cast<LONG>(sw), static_cast<LONG>(sh)};
         vr::VRTextureBounds_t texBounds = {0.0f, 0.0f, float(sw) / texW, float(sh) / texH};
-        bool gpu = g_gpuReady && !cinema && vr::control::g_gpuCopy;
+        bool gpu = g_gpuReady && vr::control::g_gpuCopy;  // anche lo schermo virtuale (R-C5)
         if (gpu) {
             // Percorso GPU: ritaglio direttamente nella texture condivisa.
             if (FAILED(device->StretchRect(backBuffer, &src, g_shSurf9[e][s], &dst,
-                                           scale < 0.999f ? D3DTEXF_LINEAR : D3DTEXF_NONE))) {
+                                           cinema || scale < 0.999f ? D3DTEXF_LINEAR : D3DTEXF_NONE))) {
                 if (frame % 300 == 1) vr::log::Line("VR-OUTPUT: StretchRect into the shared surface failed.");
                 continue;
             }
@@ -1236,7 +1344,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotGpu[e][s] = true;
             g_slotW[e][s] = sw;
             g_slotH[e][s] = sh;
-            g_slotCinema[e][s] = false;
+            g_slotCinema[e][s] = cinema;
             g_slotPoseValid[e][s] = g_renderPoseValid[e];
             g_slotBounds[e][s] = texBounds;
             g_slotPose[e][s] = g_renderPose[e];
@@ -1282,8 +1390,10 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     // (g_sameTickWaitMs > 0, deciso da hooks.cpp); la coppia va consegnata
     // intera o per niente: con un occhio solo si unirebbero due tick diversi.
     float waitBudget = g_sameTickWaitMs;
+    // Solo se i due slot sono dello stesso tick (L3: l'occhio sinistro del
+    // tick prima con il destro di questo univa due tick).
     if (eye == 1 && waitBudget > 0.0f && g_gpuSlot[0] >= 0 && g_gpuSlot[1] >= 0 && g_slotGpu[0][g_gpuSlot[0]] &&
-        g_slotGpu[1][g_gpuSlot[1]]) {
+        g_slotGpu[1][g_gpuSlot[1]] && g_slotTick[0][g_gpuSlot[0]] == g_slotTick[1][g_gpuSlot[1]]) {
         double tq = QpcMs();
         bool done = false;
         while (true) {
@@ -1325,6 +1435,9 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
 void Blink(float seconds) {
     if (seconds > g_blinkRequest.load()) g_blinkRequest = seconds;
 }
-void HoldBlack(bool hold) { g_holdBlack = hold; }
+void HoldBlack(bool hold, bool instant) {
+    if (hold) g_holdInstant = instant;
+    g_holdBlack = hold;
+}
 
 }  // namespace vr::output

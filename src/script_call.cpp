@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace vr::script {
@@ -89,6 +90,7 @@ std::string g_console;
 std::string g_call;
 
 constexpr uintptr_t kOffChildren = 0x4C, kOffNext = 0x40;
+constexpr uintptr_t kOffFuncINative = 0x98;  // UFunction::iNative (WORD), FunctionFlags a +0x94
 constexpr uintptr_t kOffPropFlags = 0x4C, kOffPropOffset = 0x64, kOffBoolMask = 0x84;
 constexpr uintptr_t kOffParmsSize = 0xA6;
 constexpr uint32_t kCpfParm = 0x80, kCpfReturn = 0x400;
@@ -238,6 +240,13 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
     if (!func) {
         vr::log::Line("UCALL: " + ClassName(obj) + "." + tok[1] + " not found.");
         return;
+    }
+    {
+        uint16_t iNative = 0;
+        std::memcpy(&iNative, static_cast<char*>(func) + kOffFuncINative, 2);
+        if (iNative != 0)
+            vr::log::Line("UCALL: " + tok[1] + " is an opcode native (iNative " + std::to_string(iNative) +
+                          "): ProcessEvent will ignore it.");
     }
     static uint8_t parms[1024];
     static wchar_t strings[8][256];
@@ -440,10 +449,37 @@ std::string NameFromIndex(int32_t idx) { return NameText(idx); }
 bool CallFunction(void* obj, const char* name, void* parms) {
     if (!obj) return false;
     static std::map<std::pair<uint32_t, std::string>, void*> cache;
+    static std::set<std::string> faulted;  // funzioni che hanno sollevato un'eccezione: mai piu' (L25)
     auto key = std::make_pair(Field(obj, kOffClass), std::string(name));
+    if (!faulted.empty() && faulted.count(name)) return false;
     auto it = cache.find(key);
     void* func = it != cache.end() ? it->second : (cache[key] = FindMethod(obj, name));
-    return func && CallProcessEvent(obj, func, parms);
+    if (!func) return false;
+    // Funzioni "native(N)" con opcode (Move, MoveSmooth, SetLocation,
+    // SetPhysics...): UObject::ProcessEvent (0x005AAF20) le ignora in silenzio
+    // se iNative (UFunction+0x98) != 0. Meglio saperlo che credere di averle
+    // chiamate (21/10: la room-scale non muoveva Walker).
+    uint16_t iNative = 0;
+    std::memcpy(&iNative, static_cast<char*>(func) + kOffFuncINative, 2);
+    if (iNative != 0) {
+        if (!faulted.count(name)) {
+            faulted.insert(name);
+            char b[200];
+            std::snprintf(b, sizeof(b), "SCRIPT: %s.%s is an opcode native (iNative %u), ProcessEvent ignores it: call disabled",
+                          ClassName(obj).c_str(), name, iNative);
+            vr::log::Line(b);
+        }
+        return false;
+    }
+    if (CallProcessEvent(obj, func, parms)) return true;
+    // Prima l'eccezione veniva inghiottita in silenzio e la chiamata ripetuta
+    // a ogni tick: ora una riga nel log e quella funzione resta disattivata.
+    faulted.insert(name);
+    char b[200];
+    std::snprintf(b, sizeof(b), "SCRIPT: exception calling %s.%s on %s (func %p); that call is disabled for this session",
+                  ClassName(obj).c_str(), name, FullName(obj).c_str(), func);
+    vr::log::Line(b);
+    return false;
 }
 
 void QueueCall(const std::string& line) {

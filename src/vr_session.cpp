@@ -1,5 +1,6 @@
 #include "vr_session.h"
 #include "control.h"
+#include "vr_toast.h"
 #include "logger.h"
 
 #include <windows.h>
@@ -35,6 +36,7 @@ SRWLOCK g_lock = SRWLOCK_INIT;
 std::atomic<bool> g_ready{false};
 std::atomic<bool> g_scene{false};
 std::atomic<unsigned> g_generation{0};
+std::atomic<bool> g_reconnectPending{false};
 
 const char* TypeName(vr::EVRApplicationType t) { return t == vr::VRApplication_Scene ? "Scene" : "Background"; }
 
@@ -74,6 +76,7 @@ bool InitAs(vr::EVRApplicationType type) {
     ++g_generation;
     g_scene = (type == vr::VRApplication_Scene);
     vr::log::Line(std::string("OpenVR initialised as ") + TypeName(type) + ".");
+    if (g_reconnectPending.exchange(false)) vr::toast::Notify("SteamVR reconnected");
     return true;
 }
 
@@ -182,8 +185,13 @@ void ConfigureReprojection() {
             WriteFile(f, c, static_cast<DWORD>(strlen(c)), &put, nullptr);
             CloseHandle(f);
         }
+        // Apostrofi nei percorsi raddoppiati (stringa PowerShell a virgolette singole; L26).
+        auto psq = [](std::string s) {
+            for (size_t i = 0; (i = s.find('\'', i)) != std::string::npos; i += 2) s.insert(i, "'");
+            return s;
+        };
         std::string ps = "powershell -NoProfile -WindowStyle Hidden -Command \"Wait-Process -Id " +
-                         std::to_string(GetCurrentProcessId()) + "; & '" + odt + "' -f '" + restore + "'\"";
+                         std::to_string(GetCurrentProcessId()) + "; & '" + psq(odt) + "' -f '" + psq(restore) + "'\"";
         STARTUPINFOA si = {sizeof(si)};
         si.dwFlags = STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
@@ -323,6 +331,7 @@ void MonitorLoop() {
         {
             Shared s;
             quit = !PollEvents();
+            if (!quit) vr::toast::Tick();  // avvisi anche senza il worker dell'uscita (app Background)
             // Lo stato della dashboard viene dagli eventi, ma un evento perso
             // (cambio Background/Scene, focus preso da un'altra app) lasciava
             // la mod convinta che fosse aperta, con tutti i comandi bloccati:
@@ -362,6 +371,7 @@ void MonitorLoop() {
             g_scene = false;
             ++g_generation;
             ReleaseSRWLockExclusive(&g_lock);
+            g_reconnectPending = true;  // al ritorno di SteamVR: avviso nel visore (R-U1)
             vr::control::g_vrDashboard = false;
             // Stato del visore da rifare da capo: con il vecchio "indossato"
             // e la Scene che non si lascia piu', al ritorno di SteamVR col
@@ -447,14 +457,10 @@ void MonitorLoop() {
                 Switch(vr::VRApplication_Scene);
             }
             if (g_scene) ConfigureReprojection();
-        } else if (g_scene) {
-            if (!inactiveSince) inactiveSince = now;
-            if (now - inactiveSince > 20000) {
-                vr::log::Line("OpenVR: headset idle for 20 s.");
-                Switch(vr::VRApplication_Background);
-                inactiveSince = 0;
-            }
         }
+        // (Il ritorno a Background dopo 20 s di inattivita' non esiste piu':
+        // wantScene include g_scene, "una volta in Scene si resta in Scene"; L23.)
+        (void)inactiveSince;
     }
 }
 

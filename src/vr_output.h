@@ -57,6 +57,8 @@ RECT EyeCropRect(int eye);
 // teletrasporto, cambio di schermo, snap turn). HoldBlack: nero finche' resta
 // vero (camera del gioco lontana da Walker prima dello schermo virtuale).
 void Blink(float seconds);
-void HoldBlack(bool hold);
+// instant: nero subito (0 s) invece della dissolvenza di 0,08 s all'inizio del
+// fermo (dopo lo schermo virtuale la scena non deve apparire per qualche frame).
+void HoldBlack(bool hold, bool instant = false);
 
 }  // namespace vr::output

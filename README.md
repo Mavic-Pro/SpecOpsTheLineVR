@@ -20,11 +20,14 @@ virtual cinema screen.
   view; cuts, checkpoints and death fade from black.
 - **First person** with Walker's body: his arms follow your controllers
   (inverse kinematics on the game's own skeleton), the gun stays in his hand,
-  and the body turns with you when you turn around.
+  and the body turns with you when you turn around (`fpbody off` in
+  `specopsvr.ini` if you prefer floating hands).
 - **Aim with the gun**: shots, rockets and grenade-launcher rounds leave the
   barrel of the gun you hold and land on the green marker (verified for every
   campaign weapon, within 0.15 degrees). Two-handed aiming with the left hand
-  on the barrel. **Aim down the sights** by bringing the gun to your eye.
+  on the barrel (within 12 cm of the gun line, `twohand on <cm>` to widen it;
+  the log says when it engages). **Aim down the sights** by bringing the gun
+  to your eye.
   Gamepad aim assist is disabled while aiming by hand.
 - **Gunstock support**: one-button calibration of the gun angle.
 - **VR cover**: the world does not spin when Walker takes cover; lean out
@@ -33,7 +36,7 @@ virtual cinema screen.
 - **Squad orders** target the enemy you point your gun at (or look at); the
   target stays locked until you release the button.
 - **Executions**: press B next to a downed enemy and Walker turns to him.
-- **Gestures**: throw grenades, punch (melee), physical two-handed reload (pull the magazine, take a new one from your belt, push it in),
+- **Gestures**: throw grenades (harder throw = faster grenade), punch or hit with the gun (melee), physical two-handed reload (pull the magazine, take a new one from your belt, push it in; `manualaction on` also asks you to rack the gun),
   duck into cover, grab the next weapon from your shoulder.
 - **Haptics**: controller rumble on the gun hand, **ProTubeVR**
   (ForceTube / ProVolver) recoil and **bHaptics** vest and sleeves.
@@ -50,7 +53,8 @@ virtual cinema screen.
   and low-latency frame submission. Works with canted-display headsets
   (Pimax and similar).
 - **Automatic updates** from the GitHub releases (stable or beta channel,
-  withdrawn versions replaced automatically, `rollback.bat`).
+  withdrawn versions replaced automatically, automatic rollback of a version
+  that fails to start, `rollback.bat`, `reset_settings.bat`).
 - Detailed **logs and crash dumps** for bug reports.
 
 ## Requirements
@@ -86,7 +90,12 @@ The mod checks GitHub at start-up and installs new versions for the next
 launch. New versions can first come out as test builds (GitHub
 pre-releases): add `updatechannel beta` to `specopsvr.ini` to get them too.
 If an update causes problems, close the game and run `rollback.bat` to go
-back to the previous version (it also turns automatic updates off).
+back to the previous version (it also turns automatic updates off). A new
+version that dies twice right after starting is put back automatically
+(`d3d9.dll.bad` is kept, the version is skipped while `specopsvr_skip.txt`
+exists). Updates also refresh the helper scripts and `openvr_api.dll` when
+the release lists them; your `specopsvr.ini` is migrated, never replaced
+(`reset_settings.bat` restores the defaults and keeps a copy of yours).
 `autoupdate off` disables updates.
 
 ## Controls
@@ -103,6 +112,7 @@ back to the previous version (it also turns automatic updates off).
 | Left menu button | Pause (hold 0.6 s: Back / objectives) |
 | Right stick held + direction | D-pad (secondary fire, grenade type) |
 | Both sticks held for 1 s | Recenter (stand straight and look ahead) |
+| Both sticks held for 3 s | Also set and save your standing height (`height` in the ini) |
 
 When the game says **RB** it means the **right grip**. Chapter 1, sniper on the
 billboard ("While holding RB target the enemy, then release"): hold the right
