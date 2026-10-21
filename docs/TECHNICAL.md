@@ -338,9 +338,20 @@ Useful offsets (`ue3.py props`):
   barrel axis and its direction follows the body: without this, shots went
   to the left of the marker and sometimes stopped on obstacles the barrel
   does not "see".
-- Spread: `YArsenalManager.m_accuracy` (+0x81C, 0 = perfect, rises while
-  firing) is applied inside `CalcWeaponFire`. Kept by default (`spread on`);
-  `spread off` zeroes it for the duration of the player's shot.
+- Spread (21/10, Ghidra): the cone is applied by the caller `FUN_0093f510`
+  **before** `CalcWeaponFire`, by `FUN_00f60300` rotating `End - Start`; the
+  angle is `lerp(min, max, YArsenalManager.m_accuracy +0x81C)` per weapon
+  (another pair of values while aiming). The nominal direction is the
+  PlayerController rotation (measured over 15 shots: 0.02 degrees mean
+  deviation; `YGamePawn.m_aimAtPosition` +0x140C is the same ray's end). The
+  hook measures the deviation between the nominal ray (`m_aimAtPosition -
+  Start`) and the received ray, and applies it around the barrel axis, scaled
+  by `spread` (0..2, on = 1, off = 0) and by stance (two hands 0.6, ADS 0.5,
+  one-handed long gun 1.5). Pass-through: the caller loops with the same End
+  and a Start advanced past penetrable actors; a call with the same End within
+  100 ms keeps the advanced Start and the corrected End (restarting from the
+  muzzle made it hit the same actor and stop). Zeroing `m_accuracy` inside the
+  hook (0.9.x) was a no-op: too late and only the minimum of the lerp.
 - Projectiles (`YWeapon_Launcher`: RPG, Milkor) do not use `CalcWeaponFire`:
   the game launches them along the body direction. While the trigger is held
   (or the magazine drops) the mod looks for new projectiles of the player
@@ -731,7 +742,9 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
 - `console <command>` - `PlayerController.ConsoleCommand`; missions load with
   `open TheLine_P?mission=SP_Gorge01_P?game=SRAssets.YGameInfo_SP_Content`.
 - `armdebug`, `armbones`, `firelog on`, `inputlog N`, `gesturelog N`,
-  `dumpcam`, `shot <name>` - diagnostics in the log.
+  `dumpcam`, `shot <name>`, `vischeck on` (enemies in front of the view but
+  not drawn, every 0.5 s), `gesturesim melee|throw|reload|reloadlost|duck|weapon`
+  - diagnostics in the log.
 
 ## Test tools (`tools/`)
 

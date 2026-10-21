@@ -172,6 +172,9 @@ bool IsRevoked(const std::string& manifest, const std::string& version) {
 
 void Run() {
     vr::control::WaitForConfig(120000, 5000);  // dopo la lettura dell'ini e l'avvio del gioco
+    // Ini mai caricato dai hook (eseguibile non supportato, primo EndScene
+    // oltre 120 s): "autoupdate off", canale e repository valevano zero (M5).
+    if (!vr::control::g_configLoaded) vr::control::ReadUpdateSettingsFromIni();
     if (!vr::control::g_autoUpdate) {
         vr::log::Line("UPDATE: disabled (autoupdate off).");
         return;

@@ -2093,27 +2093,45 @@ int32_t RadiansToUnreal(float rad);
 // dalla linea (isteresi). Mentre e' attiva la mira va dalla destra alla
 // sinistra, come imbracciando un fucile. (17/10: la versione precedente, con un
 // cono di 40 gradi, scattava sempre e il fucile puntava verso la mano sinistra.)
-void ApplyTwoHandAim(const float* right, const float* left) {
-    static bool wasActive = false;
-    // Passaggio graduale tra una e due mani (~100 ms): prima l'arma scattava
-    // di colpo dalla direzione del polso a quella tra le mani.
-    static float blend = 0.0f;
-    static float twoYaw = 0.0f, twoPitch = 0.0f;
-    static double lastT = 0.0;
+// Stato della mira a due mani (thread di gioco).
+bool g_thWasActive = false;
+float g_thBlend = 0.0f, g_thYaw = 0.0f, g_thPitch = 0.0f;
+double g_thLastT = 0.0;
+
+// Passaggio graduale tra una e due mani (~100 ms): prima l'arma scattava
+// di colpo dalla direzione del polso a quella tra le mani. Una chiamata per
+// tick: mescola la direzione di mira corrente con quella tra le mani.
+void TwoHandBlend(bool target) {
     double now = ProfMs() * 0.001;
-    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
-    lastT = now;
+    float dt = g_thLastT > 0.0 ? static_cast<float>(now - g_thLastT) : 0.0f;
+    g_thLastT = now;
     if (dt > 0.2f) dt = 0.2f;
-    auto applyBlend = [&](bool target) {
-        blend += (target ? 1.0f : -1.0f) * dt / 0.1f;
-        blend = blend < 0.0f ? 0.0f : (blend > 1.0f ? 1.0f : blend);
-        if (blend <= 0.0f) return;
-        float ry = static_cast<float>(g_aimDeltaYaw.load()) * (6.28318530718f / 65536.0f);
-        float rp = static_cast<float>(g_aimDeltaPitch.load()) * (6.28318530718f / 65536.0f);
-        float dy = std::remainder(twoYaw - ry, 6.28318530718f);
-        g_aimDeltaYaw = RadiansToUnreal(ry + dy * blend);
-        g_aimDeltaPitch = RadiansToUnreal(rp + (twoPitch - rp) * blend);
-    };
+    g_thBlend += (target ? 1.0f : -1.0f) * dt / 0.1f;
+    g_thBlend = g_thBlend < 0.0f ? 0.0f : (g_thBlend > 1.0f ? 1.0f : g_thBlend);
+    if (g_thBlend <= 0.0f) return;
+    float ry = static_cast<float>(g_aimDeltaYaw.load()) * (6.28318530718f / 65536.0f);
+    float rp = static_cast<float>(g_aimDeltaPitch.load()) * (6.28318530718f / 65536.0f);
+    float dy = std::remainder(g_thYaw - ry, 6.28318530718f);
+    g_aimDeltaYaw = RadiansToUnreal(ry + dy * g_thBlend);
+    g_aimDeltaPitch = RadiansToUnreal(rp + (g_thPitch - rp) * g_thBlend);
+}
+
+// Mano sinistra non valida (tracciamento perso): la presa a due mani finisce
+// con la stessa dissolvenza, e al ritorno gli scarti vengono ripresi da capo.
+// Prima lo stato restava "agganciato": la mira saltava alla sola destra e
+// poi tornava di colpo con uno scarto vecchio (M12).
+void ReleaseTwoHandAim() {
+    g_thWasActive = false;
+    g_twoHandActive = false;
+    vr::control::g_twoHandEngaged = false;
+    TwoHandBlend(false);
+}
+
+void ApplyTwoHandAim(const float* right, const float* left) {
+    bool& wasActive = g_thWasActive;
+    float& twoYaw = g_thYaw;
+    float& twoPitch = g_thPitch;
+    auto applyBlend = [](bool target) { TwoHandBlend(target); };
     g_twoHandActive = false;
     vr::control::g_twoHandEngaged = false;
     if (!vr::control::g_twoHand) {
@@ -2763,7 +2781,7 @@ public:
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
-        VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        if (vr::control::g_visCheck) VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         // Mirino del gioco: al centro dello schermo segue la testa e non l'arma;
         // con la mira dalla canna lo sostituisce il mirino verde.
         // YHUD.m_hideCrosshair (+0x480, bit 0x40) sull'HUD del PlayerController (+0x3EC).
@@ -3601,6 +3619,7 @@ void UpdateHeadTracking() {
             lastNotReady = GetTickCount64();
             vr::log::Line("UpdateHeadTracking: OpenVR not ready (logged once a minute).");
         }
+        vr::control::g_coverPeek = false;  // niente LT bloccato senza posa (L6)
         return;
     }
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
@@ -3624,6 +3643,7 @@ void UpdateHeadTracking() {
     }
     if (!hmdPose.bPoseIsValid) {
         if (shouldLog) vr::log::Line("UpdateHeadTracking: invalid HMD pose.");
+        vr::control::g_coverPeek = false;  // niente LT bloccato senza posa (L6)
         return;
     }
     const vr::HmdMatrix34_t& m = hmdPose.mDeviceToAbsoluteTracking;
@@ -4035,11 +4055,17 @@ void UpdateHeadTracking() {
                 g_leftValid = true;
                 ApplyTwoHandAim(right, left);
             } else {
+                // Sinistra persa: niente direzione per "movedir hand" (prima
+                // restava l'ultima, M11) e presa a due mani chiusa (M12).
                 g_leftValid = false;
+                vr::control::g_leftYawValid = false;
+                ReleaseTwoHandAim();
             }
         } else {
             g_aimValid = false;
             g_handValid = false;
+            vr::control::g_leftYawValid = false;
+            ReleaseTwoHandAim();
         }
     }
     // Torretta: il PlayerController (e con lui la torretta) ruota verso il
@@ -6979,8 +7005,6 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
 // dove punta la canna del fucile visibile, qualunque calcolo faccia lo script
 // prima (17/10: i colpi andavano a sinistra del mirino).
 constexpr uintptr_t kCalcWeaponFireAddr = 0x004A3D50;
-constexpr uintptr_t kOffPawnArsenalMgr = 0x1590;   // YGamePawn.m_arsenalManager
-constexpr uintptr_t kOffArsenalAccuracy = 0x81C;   // YArsenalManager.m_accuracy, m_oldAccuracy
 struct FVec3 {
     float x, y, z;
 };
@@ -6988,46 +7012,121 @@ typedef void(__thiscall* CalcWeaponFire_t)(void* self, FVec3 start, FVec3 end, v
 bool GunBarrel(void* pawn, float* origin, float* axis);
 CalcWeaponFire_t g_CalcWeaponFire_Original = nullptr;
 
+// Base ortonormale attorno a una direzione (destra e su rispetto alla
+// verticale del mondo), per riportare la deviazione del cono da una
+// direzione all'altra.
+void DirBasis(const float* f, float* r, float* u) {
+    float up[3] = {0.0f, 0.0f, 1.0f};
+    if (std::fabs(f[2]) > 0.99f) up[0] = 1.0f, up[2] = 0.0f;
+    r[0] = up[1] * f[2] - up[2] * f[1];
+    r[1] = up[2] * f[0] - up[0] * f[2];
+    r[2] = up[0] * f[1] - up[1] * f[0];
+    float n = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    if (n < 1e-6f) n = 1.0f;
+    for (int i = 0; i < 3; ++i) r[i] /= n;
+    u[0] = f[1] * r[2] - f[2] * r[1];
+    u[1] = f[2] * r[0] - f[0] * r[2];
+    u[2] = f[0] * r[1] - f[1] * r[0];
+}
+
+// Ultimo colpo corretto (thread di gioco): per riconoscere le chiamate
+// successive dello stesso colpo (passaggio attraverso un ostacolo).
+struct LastShot {
+    ULONGLONG ms = 0;
+    FVec3 inStart{}, inEnd{};
+    FVec3 outEnd{};
+    bool valid = false;
+};
+LastShot g_lastShot;
+// YGamePawn: fine nominale del raggio (punto trovato dal raggio della camera,
+// +0x140c) usata dal gioco prima del cono (FUN_0093f510, Ghidra).
+constexpr uintptr_t kOffPawnAimTargetEnd = 0x140C;
+
 void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FVec3 end, void* impact) {
     char* cam = static_cast<char*>(g_cameraPtr.load());
     void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
     uint32_t weapon = 0;
     bool mine = pawn && TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnCurrentWeapon, &weapon) &&
                 reinterpret_cast<void*>(weapon) == self;
-    FVec3 origEnd = end;
+    FVec3 origEnd = end, origStart = start;
     float bo[3], bd[3];
+    float coneDeg = 0.0f;
+    bool passThrough = false;
+    ULONGLONG nowMs = GetTickCount64();
     if (mine && vr::control::g_muzzleAim && g_muzzleAimValid && g_armsActive && GunBarrel(pawn, bo, bd)) {
-        // Il raggio del colpo diventa quello della canna, lo stesso del mirino:
-        // il gioco lo fa partire 25-30 unita' fuori dall'asse (17/10, misurato
-        // col punto d'impatto) e verso il bersaglio passava da un'altra parte,
-        // fermandosi a volte su ostacoli che la canna non "vede". Origine =
-        // punto dell'asse della canna piu' vicino all'origine del gioco.
         float range = std::sqrt((end.x - start.x) * (end.x - start.x) + (end.y - start.y) * (end.y - start.y) +
                                 (end.z - start.z) * (end.z - start.z));
-        if (range > 1.0f) {
+        // Stesso colpo, chiamata successiva (il gioco riparte da poco oltre
+        // l'ostacolo attraversabile, con lo stesso End): l'inizio resta quello
+        // avanzato (sta sul nostro raggio) e la fine quella gia' corretta.
+        // Prima si ripartiva dalla volata: stesso attore colpito, fine del
+        // ciclo, niente attraversamento (H2).
+        bool sameEnd = g_lastShot.valid && nowMs - g_lastShot.ms < 100 && end.x == g_lastShot.inEnd.x &&
+                       end.y == g_lastShot.inEnd.y && end.z == g_lastShot.inEnd.z;
+        bool sameStart = sameEnd && start.x == g_lastShot.inStart.x && start.y == g_lastShot.inStart.y &&
+                         start.z == g_lastShot.inStart.z;
+        if (sameEnd && !sameStart) {
+            passThrough = true;
+            end = g_lastShot.outEnd;
+        } else if (range > 1.0f) {
+            // Il raggio del colpo diventa quello della canna, lo stesso del
+            // mirino: il gioco lo fa partire 25-30 unita' fuori dall'asse
+            // (17/10) e verso il bersaglio passava da un'altra parte. Origine =
+            // punto dell'asse della canna piu' vicino all'origine del gioco.
+            // Il cono di dispersione del gioco (applicato a End prima di
+            // questa chiamata: FUN_0093f510 -> FUN_00f60300, lerp(min, max,
+            // accuracy) attorno a End-Start) viene misurato come rotazione tra
+            // la direzione nominale (verso il punto del raggio della camera,
+            // Pawn+0x140c) e quella ricevuta, e riportato sull'asse della
+            // canna, scalato dalla postura: prima andava perso del tutto
+            // ("spread" non faceva nulla, pallini su una riga sola).
+            float dir[3] = {bd[0], bd[1], bd[2]};
+            float scale = vr::control::g_spreadScale.load();
+            float nomEnd[3];
+            if (scale > 0.0f && SafeCopy(nomEnd, static_cast<char*>(pawn) + kOffPawnAimTargetEnd, 12)) {
+                float nom[3] = {nomEnd[0] - start.x, nomEnd[1] - start.y, nomEnd[2] - start.z};
+                float act[3] = {end.x - start.x, end.y - start.y, end.z - start.z};
+                float nn = std::sqrt(nom[0] * nom[0] + nom[1] * nom[1] + nom[2] * nom[2]);
+                float na = std::sqrt(act[0] * act[0] + act[1] * act[1] + act[2] * act[2]);
+                if (nn > 1.0f && na > 1.0f && std::isfinite(nn)) {
+                    for (int i = 0; i < 3; ++i) nom[i] /= nn, act[i] /= na;
+                    float r1[3], u1[3], r2[3], u2[3];
+                    DirBasis(nom, r1, u1);
+                    DirBasis(bd, r2, u2);
+                    // Postura: due mani 0.6, tacche all'occhio 0.5, arma lunga
+                    // con una mano sola 1.5 (R-W1).
+                    float k = scale;
+                    if (g_twoHandActive) k *= 0.6f;
+                    if (vr::control::g_adsActive) k *= 0.5f;
+                    const std::string& cls = CurrentWeaponInfo(self).cls;
+                    bool pistol = cls.find("DesertEagle") != std::string::npos || cls.find("M9A1") != std::string::npos ||
+                                  cls.find("Python") != std::string::npos || cls.find("MicroUzi") != std::string::npos ||
+                                  cls.find("Pistol") != std::string::npos;
+                    if (!g_twoHandActive && !vr::control::g_adsActive && !pistol) k *= 1.5f;
+                    float b = (act[0] * r1[0] + act[1] * r1[1] + act[2] * r1[2]) * k;
+                    float c = (act[0] * u1[0] + act[1] * u1[1] + act[2] * u1[2]) * k;
+                    float lat2 = b * b + c * c;
+                    if (lat2 > 0.9999f) {
+                        float s = std::sqrt(0.9999f / lat2);
+                        b *= s, c *= s, lat2 = 0.9999f;
+                    }
+                    float a = std::sqrt(1.0f - lat2);
+                    for (int i = 0; i < 3; ++i) dir[i] = a * bd[i] + b * r2[i] + c * u2[i];
+                    coneDeg = std::acos(std::fmax(-1.0f, std::fmin(1.0f, a))) * 57.2957795f;
+                }
+            }
             float ms[3];
             MuzzleStart(pawn, bo, bd, ms);
             start = {ms[0], ms[1], ms[2]};
-            end = {start.x + bd[0] * range, start.y + bd[1] * range, start.z + bd[2] * range};
+            end = {start.x + dir[0] * range, start.y + dir[1] * range, start.z + dir[2] * range};
+            g_lastShot.ms = nowMs;
+            g_lastShot.inStart = origStart;
+            g_lastShot.inEnd = origEnd;
+            g_lastShot.outEnd = end;
+            g_lastShot.valid = true;
         }
     }
-    // Dispersione: l'arsenale tiene l'imprecisione del giocatore (0 = colpo
-    // perfetto, sale fino a 1 sparando) e CalcWeaponFire la applica attorno al
-    // raggio. Con la mira dalla canna (spread off) vale 0 durante il colpo:
-    // i colpi vanno dove punta la canna, come chiede la VR.
-    float savedAcc[2] = {0, 0};
-    char* arsenal = nullptr;
-    uint32_t arsenalPtr = 0;
-    bool zeroSpread = mine && !vr::control::g_spread && vr::control::g_muzzleAim && g_armsActive &&
-                      TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnArsenalMgr, &arsenalPtr) && arsenalPtr;
-    if (zeroSpread) {
-        arsenal = reinterpret_cast<char*>(arsenalPtr);
-        static const float zero2[2] = {0, 0};
-        if (!SafeCopy(savedAcc, arsenal + kOffArsenalAccuracy, 8) || !SafeCopy(arsenal + kOffArsenalAccuracy, zero2, 8))
-            zeroSpread = false;
-    }
     g_CalcWeaponFire_Original(self, start, end, impact);
-    if (zeroSpread) SafeCopy(arsenal + kOffArsenalAccuracy, savedAcc, 8);
     if (mine) {
         vr::haptics::Shot(CurrentWeaponInfo(self).cls, g_twoHandActive);
         if (g_armsActive) GunKick(CurrentWeaponInfo(self).cls);
@@ -7040,13 +7139,23 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
         TrySafeReadUint32(impact, &hitActor);
         std::string hitName = hitActor ? vr::script::ClassName(reinterpret_cast<void*>(hitActor)) : "none";
         if (!GunBarrel(pawn, bo, bd)) bo[0] = bo[1] = bo[2] = bd[0] = bd[1] = bd[2] = 0.0f;
-        char b[600];
+        float aimAt[3] = {0, 0, 0}, fireStart[3] = {0, 0, 0};
+        SafeCopy(aimAt, static_cast<char*>(pawn) + kOffPawnAimTargetEnd, 12);
+        SafeCopy(fireStart, static_cast<char*>(pawn) + 0x17F8, 12);
+        int32_t pcRot[3] = {0, 0, 0}, pawnRot[3] = {0, 0, 0};
+        SafeCopy(pcRot, cam - 0x77C + 0x60, 12);
+        SafeCopy(pawnRot, static_cast<char*>(pawn) + 0x60, 12);
+        char b[800];
         snprintf(b, sizeof(b),
                  "SHOT: from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f), game wanted (%.1f, %.1f, %.1f), barrel -> (%.1f, %.1f, %.1f), "
-                 "barrel origin (%.1f, %.1f, %.1f) axis (%.3f, %.3f, %.3f), impact (%.1f, %.1f, %.1f) on %s",
+                 "barrel origin (%.1f, %.1f, %.1f) axis (%.3f, %.3f, %.3f), impact (%.1f, %.1f, %.1f) on %s, cone %.2f deg%s, "
+                 "game start (%.1f, %.1f, %.1f) aimat (%.1f, %.1f, %.1f) firestart (%.1f, %.1f, %.1f) view (%.1f, %.1f, %.1f) "
+                 "pcrot (%d, %d) pawnrot (%d, %d)",
                  start.x, start.y, start.z, end.x, end.y, end.z, origEnd.x, origEnd.y, origEnd.z, g_muzzleTarget[0],
                  g_muzzleTarget[1], g_muzzleTarget[2], bo[0], bo[1], bo[2], bd[0], bd[1], bd[2], hit[0], hit[1], hit[2],
-                 hitName.c_str());
+                 hitName.c_str(), coneDeg, passThrough ? " (pass-through continuation)" : "", origStart.x, origStart.y,
+                 origStart.z, aimAt[0], aimAt[1], aimAt[2], fireStart[0], fireStart[1], fireStart[2], g_lastViewLoc[0],
+                 g_lastViewLoc[1], g_lastViewLoc[2], pcRot[0], pcRot[1], pawnRot[0], pawnRot[1]);
         vr::log::Line(b);
     }
 }

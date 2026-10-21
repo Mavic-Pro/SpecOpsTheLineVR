@@ -21,8 +21,29 @@ std::atomic<unsigned> g_generation{0};
 
 const char* TypeName(vr::EVRApplicationType t) { return t == vr::VRApplication_Scene ? "Scene" : "Background"; }
 
+// openvr_api.dll e' caricata a richiesta (/DELAYLOAD): se manca o e' stata
+// messa in quarantena il gioco parte lo stesso e il mod resta inattivo, invece
+// di non avviarsi affatto per un import mancante (M6). Si carica dalla
+// cartella del mod prima della prima chiamata a OpenVR.
+bool OpenVrDllAvailable() {
+    static int state = 0;  // 0 non provato, 1 ok, -1 mancante
+    if (state) return state > 0;
+    std::string path = vr::control::GameDirectory() + "\\openvr_api.dll";
+    HMODULE h = LoadLibraryA(path.c_str());
+    if (!h) h = LoadLibraryA("openvr_api.dll");
+    state = h ? 1 : -1;
+    if (!h) vr::log::Line("ERROR: openvr_api.dll not found next to d3d9.dll (error " + std::to_string(GetLastError()) +
+                          "): no VR, the game runs normally. Reinstall the mod.");
+    return h != nullptr;
+}
+
 // Da chiamare con il lock esclusivo (o prima che esistano altri utenti).
 bool InitAs(vr::EVRApplicationType type) {
+    if (!OpenVrDllAvailable()) {
+        g_ready = false;
+        g_scene = false;
+        return false;
+    }
     vr::EVRInitError err = vr::VRInitError_None;
     vr::VR_Init(&err, type);
     if (err != vr::VRInitError_None) {

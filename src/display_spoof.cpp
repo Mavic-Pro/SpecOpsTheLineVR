@@ -151,7 +151,10 @@ bool HeadsetInUse() { return vr::session::IsScene() && vr::session::HmdPresent()
 
 BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
     BOOL ok = g_GetClientRect_Real(h, r);
-    if (ok && r && h == g_gameWindow && g_wantedWidth > 0 && (!IsIconic(h) || HeadsetInUse())) {
+    // Anche ridotta a icona e senza visore: il rettangolo vero 0x0 faceva
+    // ridurre la viewport a 0x0 e il video del menu (binkw32) scriveva oltre
+    // il suo buffer, "Fatal error" (visto il 21/10 col mod senza OpenVR).
+    if (ok && r && h == g_gameWindow && g_wantedWidth > 0) {
         r->left = r->top = 0;
         r->right = g_wantedWidth;
         r->bottom = g_wantedHeight;
@@ -195,6 +198,28 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
             return 0;
         }
+    }
+    // Diagnostica: attivazione e riduzione a icona (chi la chiede: stack).
+    if (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE || msg == WM_KILLFOCUS || msg == WM_SETFOCUS ||
+        (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_MINIMIZE) || msg == WM_SHOWWINDOW) {
+        static int budget = 24;
+        if (budget-- > 0) {
+            char b[120];
+            std::snprintf(b, sizeof(b), "DISPLAY: msg 0x%04X wp=0x%X lp=0x%X foreground=%s", msg, (unsigned)wp, (unsigned)lp,
+                          GetForegroundWindow() == hwnd ? "game" : "other");
+            vr::log::Line(b);
+        }
+    }
+    if (msg == WM_SIZE && wp == SIZE_MINIMIZED) {
+        void* frames[12] = {};
+        USHORT n = CaptureStackBackTrace(0, 12, frames, nullptr);
+        std::string s = "DISPLAY: minimized, call stack:";
+        for (USHORT i = 0; i < n; ++i) {
+            char a[16];
+            std::snprintf(a, sizeof(a), " %p", frames[i]);
+            s += a;
+        }
+        vr::log::Line(s);
     }
     LRESULT r = CallWindowProcW(g_originalWndProc, hwnd, msg, wp, lp);
     if (msg == WM_SIZE) {

@@ -767,6 +767,14 @@ public:
         if (!Gameplay()) {
             m_gripWasDown = s.rightValid && s.rightGrip;
             m_leftGripWas = s.leftGrip;
+            // Ricarica fisica interrotta da scena, menu o mossa del gioco:
+            // si ricomincia (col caricatore "fuori" il grilletto restava
+            // bloccato e il timeout non correva, M15).
+            if (m_mag != Mag::In) {
+                vr::log::Line("GESTURE: physical reload reset (cinematic, menu or game move)");
+                m_mag = Mag::In;
+                m_magGrab = m_leftLatch = false;
+            }
             return;
         }
         // Direzione del lancio = velocita' media della mano nei 60 ms dopo il
@@ -877,11 +885,27 @@ private:
         if (m_mag != Mag::In || m_magGrab || m_leftLatch) m_reloadActiveT = s.t;
         bool gripDown = s.leftGrip && !m_leftGripWas;
         m_leftGripWas = s.leftGrip;
-        if (!s.leftValid || !s.rightValid || !vr::control::g_gestureReload) {
+        if (!vr::control::g_gestureReload) {
             m_mag = Mag::In;
             m_magGrab = m_leftLatch = false;
             return;
         }
+        if (!s.leftValid || !s.rightValid) {
+            // Posa persa per un attimo (mano coperta): lo stato resta com'e'.
+            // Prima si tornava a "caricatore dentro" al primo campione non
+            // valido: grilletto sbloccato a meta' ricarica e X ripetuta alla
+            // presa successiva (M14). Oltre 12 s senza finire si ricomincia.
+            if (m_mag != Mag::In && s.t - m_magT > 12.0) {
+                vr::log::Line("GESTURE: physical reload not finished in 12 s (controller lost), reset");
+                m_mag = Mag::In;
+                m_magGrab = m_leftLatch = false;
+            } else if (m_mag != Mag::In && !m_poseLostLogged) {
+                vr::log::Line("GESTURE: controller lost during the physical reload, state kept");
+            }
+            m_poseLostLogged = m_mag != Mag::In;
+            return;
+        }
+        m_poseLostLogged = false;
         if (!vr::control::g_reloadPhysical) {
             m_mag = Mag::In;
             float d = Dist(s.left, s.right);
@@ -1019,6 +1043,7 @@ private:
     bool m_magGrab = false, m_leftLatch = false, m_leftBusy = false, m_leftGripWas = false;
     bool m_lbAllowed = false, m_lbGripWas = false, m_stickMoving = false;
     bool m_onGun = false;
+    bool m_poseLostLogged = false;
     uint32_t m_weapon = 0;
     int32_t m_ejectAmmo = -1;
     double m_reloadActiveT = -10.0, m_throwSampleUntil = 0.0;
@@ -1115,7 +1140,10 @@ void RunGestureSim(const std::string& which) {
             s.left[1] = 1.2f;
             s.left[2] = -0.1f - 0.5f * u;
             s.leftVel[2] = (k > 10 && k < 20) ? -3.2f : -0.2f;
-        } else if (which == "reload" && vr::control::g_reloadPhysical) {
+        } else if ((which == "reload" || which == "reloadlost") && vr::control::g_reloadPhysical) {
+            // "reloadlost": come "reload", ma con la mano sinistra non
+            // tracciata per 3 campioni dopo l'espulsione (M14: lo stato resta).
+            if (which == "reloadlost" && k >= 5 && k < 8) s.leftValid = false;
             // Fucile davanti al petto che punta a -Z: caricatore 10 cm sotto
             // la mano destra. Grip sul caricatore, via, grip alla cintura,
             // ritorno al caricatore.
@@ -1174,7 +1202,7 @@ WORD ApplyGestures(XGamepad* pad) {
     // (pad vero o input finto) il grip non c'e' e LB passa com'e'.
     if (g_gestures.SuppressLeftGrip() && s.leftValid) pad->wButtons &= ~kLB;
     if (g_gestures.SuppressRightGrip()) pad->wButtons &= ~kRB;
-    if (vr::control::g_honestReload && g_gestures.MagazineOut()) pad->bRightTrigger = 0;
+    if (vr::control::g_honestReload && g_gestures.MagazineOut() && GestureDetector::Gameplay()) pad->bRightTrigger = 0;
     return g;
 }
 
@@ -1193,10 +1221,17 @@ bool SafeAddYaw(void* pc, int32_t delta) {
 // Croce direzionale (fuoco secondario, tipo di granata): tenendo premuto lo
 // stick destro, la sua direzione diventa la croce (e lo stick non ruota). Un
 // clic senza direzione resta il clic dello stick (lato della camera).
-void ApplyDpadModifier(XGamepad* pad) {
+// rawClick: stick destro premuto davvero (prima del cancello delle
+// combinazioni, che lo trattiene 120 ms: nel frattempo l'inclinazione
+// passava come rotazione e una pressione-e-spinta rapida perdeva la
+// direzione, M13). combo: i due stick insieme (ricentramento), niente clic.
+void ApplyDpadModifier(XGamepad* pad, bool rawClick, bool combo) {
     static bool held = false, usedAsDpad = false, stickLocked = false;
-    static ULONGLONG pulseUntil = 0;
-    bool click = (pad->wButtons & kRThumb) != 0;
+    static ULONGLONG pulseUntil = 0, suppressUntil = 0;
+    bool click = rawClick;
+    // Finche' e' premuto (e per 150 ms dopo un uso come croce) il clic non
+    // arriva al gioco, nemmeno quello lasciato passare dal cancello.
+    if (click || GetTickCount64() < suppressUntil) pad->wButtons &= ~kRThumb;
     // Dopo la croce lo stick resta inclinato per un attimo oltre il rilascio
     // del clic: finche' non torna al centro non ruota (prima partiva una
     // rotazione a scatti o continua; audit 20/10).
@@ -1228,8 +1263,9 @@ void ApplyDpadModifier(XGamepad* pad) {
         pad->sThumbRX = pad->sThumbRY = 0;
     } else if (held) {
         held = false;
-        if (!usedAsDpad) pulseUntil = GetTickCount64() + 120;  // clic semplice
+        if (!usedAsDpad && !combo) pulseUntil = GetTickCount64() + 120;  // clic semplice
         else {
+            suppressUntil = GetTickCount64() + 150;
             stickLocked = true;
             pad->sThumbRX = pad->sThumbRY = 0;
         }
@@ -1353,14 +1389,13 @@ void ApplyVrStickRules(XGamepad* pad) {
         gestureBHeld = gestureB;
     }
     ApplyRecenterCombo(pad);
-    {
-        static ComboGate sticks, calib;
-        GateCombo(pad, kLThumb, kRThumb, sticks);
-        GateCombo(pad, kB, kY, calib);
-    }
+    bool rThumbRaw = (pad->wButtons & kRThumb) != 0;
+    static ComboGate sticks, calib;
+    GateCombo(pad, kLThumb, kRThumb, sticks);
+    GateCombo(pad, kB, kY, calib);
     // Gesti dopo il cancello: arrivano subito e per tutta la loro durata.
     pad->wButtons |= gestureButtons;
-    ApplyDpadModifier(pad);
+    ApplyDpadModifier(pad, rThumbRaw, sticks.combo);
     // Schermo virtuale (cinematiche, veicoli, menu): lo stick destro torna
     // quello del pad (anche su/giu'), senza rotazione a scatti.
     if (menu) {

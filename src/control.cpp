@@ -73,6 +73,7 @@ std::atomic<bool> g_roomScale{true};
 std::atomic<int32_t> g_stickYawUnits{0};
 std::atomic<bool> g_keepFocus{true};
 std::atomic<bool> g_configLoaded{false};
+std::atomic<bool> g_visCheck{false};
 std::atomic<bool> g_weaponNeedsAim{false};
 std::atomic<bool> g_handPredictAuto{false};
 std::atomic<bool> g_crouchViewReal{true};
@@ -155,6 +156,7 @@ std::atomic<float> g_armStretch{1.25f};
 std::atomic<bool> g_muzzleAim{true};
 std::atomic<bool> g_noAimAssist{true};
 std::atomic<bool> g_spread{true};
+std::atomic<float> g_spreadScale{1.0f};
 std::atomic<bool> g_fireLog{false};
 std::atomic<int> g_projLogSeconds{0};
 std::atomic<bool> g_rightTriggerHeld{false};
@@ -323,6 +325,10 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         int n = 10;
         in >> n;
         g_audioLog = n;
+    } else if (cmd == "vischeck") {
+        std::string v;
+        in >> v;
+        g_visCheck = OnOff(cmd, v, false);
     } else if (cmd == "honestreload") {
         std::string v;
         in >> v;
@@ -541,9 +547,22 @@ void ExecuteNormalized(const std::string& line) {
         in >> v;
         g_fireLog = OnOff(cmd, v, true);
     } else if (cmd == "spread") {
+        // on = 1 (come il gioco), off = 0 (lungo la canna), oppure una scala 0..2.
         std::string v;
         in >> v;
-        g_spread = OnOff(cmd, v, false);
+        float s = 1.0f;
+        if (v == "off" || v == "0" || v == "false" || v == "no") s = 0.0f;
+        else if (v == "on" || v == "1" || v == "true" || v == "yes" || v.empty()) s = 1.0f;
+        else {
+            char* endp = nullptr;
+            s = std::strtof(v.c_str(), &endp);
+            if (endp == v.c_str() || !(s >= 0.0f) || s > 2.0f) {
+                vr::log::Line("CONFIG: spread " + v + " ignored (on, off or 0..2).");
+                s = g_spreadScale.load();
+            }
+        }
+        g_spreadScale = s;
+        g_spread = s > 0.0f;
     } else if (cmd == "aimassist") {
         std::string v;
         in >> v;
@@ -1084,6 +1103,27 @@ void ApplyDefaultsMissingFrom(const std::vector<std::string>& lines) {
 void WaitForConfig(unsigned maxMs, unsigned extraMs) {
     for (unsigned waited = 0; !g_configLoaded && waited < maxMs; waited += 250) Sleep(250);
     Sleep(extraMs);
+}
+
+void ReadUpdateSettingsFromIni() {
+    std::ifstream f(ModuleDirectory() + "\\specopsvr.ini");
+    if (!f) return;
+    std::string line;
+    int applied = 0;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);
+        std::istringstream in(line);
+        std::string key;
+        in >> key;
+        for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (key == "autoupdate" || key == "updatechannel" || key == "updaterepo") {
+            Execute(line);
+            ++applied;
+        }
+    }
+    vr::log::Line("UPDATE: settings read directly from specopsvr.ini (" + std::to_string(applied) +
+                  " lines; the ini was not loaded by the game hooks).");
 }
 
 void LoadConfigFile() {

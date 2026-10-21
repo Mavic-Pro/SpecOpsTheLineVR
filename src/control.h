@@ -157,6 +157,9 @@ extern std::atomic<bool> g_muzzleAim;
 extern std::atomic<bool> g_noAimAssist;
 // Dispersione dei colpi del gioco (off = i colpi vanno esattamente dove punta la canna).
 extern std::atomic<bool> g_spread;
+// Scala del cono di dispersione del gioco riportato sulla canna: 0 = colpi
+// esattamente lungo la canna, 1 = come il gioco ("spread on|off|<0..2>").
+extern std::atomic<float> g_spreadScale;
 // Diagnostica: riga COLPO per ogni colpo del giocatore.
 extern std::atomic<bool> g_fireLog;
 // Diagnostica: "projlog N" registra per N secondi i proiettili sparati (PROJECTILE ...).
@@ -281,6 +284,11 @@ extern std::atomic<int32_t> g_stickYawUnits;
 extern std::atomic<bool> g_keepFocus;
 // specopsvr.ini letto (i thread di aggiornamento e aptica lo aspettano).
 extern std::atomic<bool> g_configLoaded;
+// Diagnostica dei nemici davanti alla vista ma non disegnati ("vischeck on", predefinito off).
+extern std::atomic<bool> g_visCheck;
+// Ini mai caricato (eseguibile non supportato, avvio lento): legge dall'ini
+// solo autoupdate, updatechannel e updaterepo. Thread dell'aggiornamento.
+void ReadUpdateSettingsFromIni();
 // Attende la lettura dell'ini (al massimo maxMs) e poi altri extraMs.
 void WaitForConfig(unsigned maxMs, unsigned extraMs);
 // Arma in mano che spara solo mirando (RPG): LT tenuto col grilletto (vr_input).
