@@ -744,6 +744,15 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
 - `hmdwindow.py` - captures the SteamVR null driver window for headset-free
   tests.
 - `package.py` - builds the release zip.
+- `native_names.py` - extracts the UE3 native registration table (4054
+  `AClass::execName` functions, records {name pointer, function pointer} in
+  `.data`) as `0xaddress<TAB>function<TAB>name` lines (Ghidra/REA seed format).
+- `ghq.py` - queries a persistent Ghidra project of the exe: decompiled code and
+  callers by address or name pattern in ~6 s. Setup once (Ghidra 12.1.x, JDK
+  21): `analyzeHeadless <dir> SpecOps -import SpecOpsTheLine.exe` (~6 min),
+  then `-process SpecOpsTheLine.exe -noanalysis -postScript ApplyNames.java
+  natives.tsv` (the native functions are only referenced from the table, so
+  Ghidra does not find 2293 of them by itself).
 
 Loading levels writes checkpoints over the Steam Cloud saves: the test tools
 back them up and restore them.
