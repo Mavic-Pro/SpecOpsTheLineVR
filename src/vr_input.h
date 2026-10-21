@@ -32,5 +32,7 @@ unsigned PadPolls();
 // Riscrive manifest e binding di SteamVR Input (specopsvr_input/) e ritorna il
 // percorso del manifest ("" se fallisce): comando "inputfiles" per i test.
 std::string WriteActionFiles();
+// Ricarica fisica: caricatore estratto o in mano (l'osso "Magazine" dell'arma va nascosto, R-W7).
+bool MagazineRemoved();
 
 }  // namespace vr::input

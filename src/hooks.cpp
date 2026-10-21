@@ -2672,6 +2672,7 @@ double ProfMs() {
 
 void UpdateFirstPersonBody(void* pawn);
 void UpdateSquadCommandAim(char* cam, void* pawn);
+void InteractionScan(void* pawn);
 void VisibilityCheck(void* pawn);
 // Ultima vista dell'occhio sinistro (posizione e rotazione, per VisibilityCheck).
 float g_lastViewLoc[3] = {0, 0, 0};
@@ -2945,6 +2946,7 @@ public:
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        InteractionScan(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // fase 0 (interactlog)
         if (vr::control::g_visCheck) VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         // Mirino del gioco: al centro dello schermo segue la testa e non l'arma;
         // con la mira dalla canna lo sostituisce il mirino verde.
@@ -4097,12 +4099,49 @@ void UpdateHeadTracking() {
     if (turnThr > 0.0f && pcForTurn && !vr::control::g_cinemaActive && !inCover && !g_gameLockedScene &&
         !TurretAimActive()) {
         float ex = std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f);
+        float thr = turnThr;
+        // "bodyfacing hands" (R-B3): il busto stimato da testa (0,5), linea tra
+        // le mani (0,3; la perpendicolare piu' vicina alla testa) e mano
+        // dell'arma (0,2), media circolare; zona morta di 20 gradi al posto
+        // della soglia della testa.
+        if (vr::control::g_bodyFacingHands && vrsys) {
+            vr::TrackedDeviceIndex_t ri = vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
+            vr::TrackedDeviceIndex_t li = vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::SupportRole());
+            bool rOk = ri < vr::k_unMaxTrackedDeviceCount && handPoses[ri].bPoseIsValid;
+            bool lOk = li < vr::k_unMaxTrackedDeviceCount && handPoses[li].bPoseIsValid;
+            if (rOk && lOk) {
+                const vr::HmdMatrix34_t& rm = handPoses[ri].mDeviceToAbsoluteTracking;
+                const vr::HmdMatrix34_t& lm = handPoses[li].mDeviceToAbsoluteTracking;
+                float headY = ex;
+                float gunY = std::remainder(YawFromOpenVrPose(rm) - g_hmdYawReference, 6.28318530718f);
+                // Linea sinistra -> destra (orizzontale): il busto guarda
+                // perpendicolarmente; delle due perpendicolari quella vicina alla testa.
+                float dx = rm.m[0][3] - lm.m[0][3], dz = rm.m[2][3] - lm.m[2][3];
+                float yawL = 0.0f;
+                bool lineOk = dx * dx + dz * dz > 0.05f * 0.05f;
+                if (lineOk) {
+                    // Yaw OpenVR come YawFromOpenVrPose: avanti = -z -> atan2(-x, -z) della direzione
+                    float a = std::atan2(-dx, -dz);  // direzione sinistra->destra
+                    float p1 = a + 1.57079633f, p2 = a - 1.57079633f;
+                    float r1 = std::remainder(p1 - g_hmdYawReference, 6.28318530718f);
+                    float r2 = std::remainder(p2 - g_hmdYawReference, 6.28318530718f);
+                    yawL = std::fabs(std::remainder(r1 - headY, 6.28318530718f)) <
+                                   std::fabs(std::remainder(r2 - headY, 6.28318530718f))
+                               ? r1
+                               : r2;
+                }
+                float wx = 0.5f * std::cos(headY) + 0.2f * std::cos(gunY) + (lineOk ? 0.3f * std::cos(yawL) : 0.0f);
+                float wy = 0.5f * std::sin(headY) + 0.2f * std::sin(gunY) + (lineOk ? 0.3f * std::sin(yawL) : 0.0f);
+                ex = std::atan2(wy, wx);
+                thr = 20.0f * 0.01745329252f;
+            }
+        }
         static double lastTurnT = 0.0;
         double nowTurn = ProfMs() * 0.001;
         float dtTurn = lastTurnT > 0.0 ? static_cast<float>(nowTurn - lastTurnT) : 0.0f;
         lastTurnT = nowTurn;
-        if (std::fabs(ex) > turnThr) {
-            float shift = ex - std::copysign(turnThr, ex);
+        if (std::fabs(ex) > thr) {
+            float shift = ex - std::copysign(thr, ex);
             // Al massimo 180 gradi/s: uscendo dalla copertura o da una scena
             // con la testa girata il corpo scattava tutto in un frame.
             float maxStep = 3.14159265f * (dtTurn > 0.0f && dtTurn < 0.1f ? dtTurn : 0.011f);
@@ -4683,6 +4722,7 @@ void ReleaseGun() {
 // spostamento dell'occhio: si usa il punto medio, applicato col secondo occhio.
 std::atomic<bool> g_armsActive{false};
 
+void UpdateMagazineVisual(void* comp);
 void UpdateGunInHand(const float* base, int32_t bodyYaw) {
     if (g_armsActive) {
         ReleaseGun();
@@ -4698,6 +4738,7 @@ void UpdateGunInHand(const float* base, int32_t bodyYaw) {
     // morto. Prima le braccia venivano rilasciate all'animazione ma il fucile
     // restava inchiodato al controller: "corpo deforme" sulla corda (21/10).
     bool gameplay = !g_gameLockedScene && !vr::control::g_cinemaActive && pawn && PawnAlive(pawn);
+    vr::toast::HintsTick(gameplay);  // suggerimenti sui controller nelle prime sessioni (R-U2)
     void* comp = (vr::control::g_gunInHand && hand && fp && gameplay) ? CurrentGunComponent(pawn) : nullptr;
     if (comp != g_gunComp) ReleaseGun();
     if (!comp) return;
@@ -4734,6 +4775,41 @@ void UpdateGunInHand(const float* base, int32_t bodyYaw) {
         g_gunCompCls = ObjClass(comp);
     } else {
         g_gunComp = nullptr;
+    }
+}
+
+// Ricarica fisica: con il caricatore estratto o in mano l'osso "Magazine"
+// dell'arma viene nascosto (HideBoneByName, come la testa), rimesso
+// all'inserimento o al cambio d'arma (R-W7 passo 1; i modelli hanno l'osso
+// "Magazine": M4, AA12, Desert Eagle, SCAR, M9A1; Milkor no).
+void UpdateMagazineVisual(void* comp) {
+    static void* lastComp = nullptr;
+    static uint32_t lastCls = 0;
+    static bool hidden = false;
+    bool want = vr::input::MagazineRemoved();
+    if (comp != lastComp) {
+        if (hidden && lastComp && StillAlive(lastComp, lastCls)) {
+            struct {
+                int32_t name[2];
+                uint8_t physBodyOption;
+                uint8_t pad[3];
+            } p = {{vr::script::NameIndex("Magazine"), 0}, 0, {0, 0, 0}};
+            if (p.name[0] >= 0) vr::script::CallFunction(lastComp, "UnHideBoneByName", &p);
+        }
+        lastComp = comp;
+        lastCls = ObjClass(comp);
+        hidden = false;
+    }
+    if (!comp || want == hidden) return;
+    struct {
+        int32_t name[2];
+        uint8_t physBodyOption;
+        uint8_t pad[3];
+    } p = {{vr::script::NameIndex("Magazine"), 0}, 0, {0, 0, 0}};
+    if (p.name[0] < 0) return;
+    if (vr::script::CallFunction(comp, want ? "HideBoneByName" : "UnHideBoneByName", &p)) {
+        hidden = want;
+        vr::log::Line(want ? "MAGAZINE: bone hidden (magazine out)" : "MAGAZINE: bone shown");
     }
 }
 
@@ -5512,8 +5588,16 @@ void DisableGameRecoil(void* weapon) {
     if (!g_savedRecoil.count(weapon)) {
         SavedRecoil s = {ObjClass(weapon), {}};
         if (SafeCopy(s.bytes, static_cast<char*>(weapon) + kOffWeaponRecoilRange, sizeof(s.bytes)) &&
-            std::memcmp(s.bytes, zero, sizeof(zero)) != 0)
+            std::memcmp(s.bytes, zero, sizeof(zero)) != 0) {
             g_savedRecoil[weapon] = s;
+            // Valori del gioco nel log (R-W4: da qui il contraccolpo per classe).
+            float f[6];
+            std::memcpy(f, s.bytes, sizeof(f));
+            char b[200];
+            std::snprintf(b, sizeof(b), "RECOIL: %s game range (%.3f %.3f %.3f %.3f %.3f %.3f)",
+                          vr::script::ClassName(weapon).c_str(), f[0], f[1], f[2], f[3], f[4], f[5]);
+            vr::log::Line(b);
+        }
     }
     SafeCopy(static_cast<char*>(weapon) + kOffWeaponRecoilRange, zero, sizeof(zero));
 }
@@ -5857,12 +5941,20 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         }
     }
     if (vr::control::g_armBonesRequested.exchange(false)) LogBones(g_rig.mesh);
-    if (vr::control::g_weaponBonesRequested.exchange(false)) {
-        if (g_gunComp && StillAlive(g_gunComp, g_gunCompCls)) {
-            vr::log::Line("BONES: weapon " + g_weaponInfo.cls);
-            LogBones(g_gunComp);
-        } else {
-            vr::log::Line("BONES: no weapon mesh in hand.");
+    {
+        // Modello dell'arma in mano (indipendente dalla posa dell'arma): osso
+        // del caricatore durante la ricarica fisica (R-W7) e "weaponbones".
+        char* camB = static_cast<char*>(g_cameraPtr.load());
+        void* pawnB = HasCameraSignature(camB) ? PlayerPawnIfViewTarget(camB) : nullptr;
+        void* gc = pawnB && PawnAlive(pawnB) ? CurrentGunComponent(pawnB) : nullptr;
+        UpdateMagazineVisual(gc);
+        if (vr::control::g_weaponBonesRequested.exchange(false)) {
+            if (gc) {
+                vr::log::Line("BONES: weapon " + g_weaponInfo.cls);
+                LogBones(gc);
+            } else {
+                vr::log::Line("BONES: no weapon mesh in hand.");
+            }
         }
     }
     if (vr::control::g_bodySizeRequested.exchange(false)) LogBodySize(g_rig.mesh);
@@ -7089,6 +7181,56 @@ constexpr uintptr_t kOffPcSelectedMarkable = 0xE98;  // m_currentSelectedTactica
 // La lista dei Pawn non li contiene: si cercano in GObjects (classe e
 // sottoclassi), ogni 2 s mentre il tasto squadra e' tenuto.
 constexpr uint32_t kOffCheapShooterHealth = 0x264;  // YCheapShooter.m_health (float)
+// Censimento delle interazioni fisiche del livello (fase 0 del piano, R-T4,
+// "interactlog on"): ogni 2 s gli attori YTrigger_*Interaction (torrette,
+// corde, zipline) in GObjects, con posizione, distanza da Walker, icona
+// (GetCurrentIconPosition) e abilitazione (IsEnabledForTacView) nel log.
+// Diagnostica: serve a costruire la tabella {tipo, posizione, comando} per
+// le fasi successive (presa per usare).
+void InteractionScan(void* pawn) {
+    if (!vr::control::g_interactLog || !pawn) return;
+    static ULONGLONG nextScan = 0;
+    if (GetTickCount64() < nextScan) return;
+    nextScan = GetTickCount64() + 2000;
+    ScanTimer scanTimer;  // L12
+    uint32_t data = 0, num = 0;
+    if (!TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data) ||
+        !TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num) || !data || num > 2000000)
+        return;
+    float pl[3] = {0, 0, 0};
+    SafeCopy(pl, static_cast<char*>(pawn) + 0x54, 12);
+    int found = 0;
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
+        void* obj = reinterpret_cast<void*>(o);
+        std::string cls = vr::script::ClassName(obj);
+        if (cls.find("Interaction") == std::string::npos || cls.rfind("YTrigger_", 0) != 0) continue;
+        if (cls == "Class") continue;
+        std::string name = vr::script::ObjectName(obj);
+        if (name.rfind("Default__", 0) == 0) continue;  // oggetti predefiniti delle classi
+        float loc[3] = {0, 0, 0};
+        if (!SafeCopy(loc, static_cast<char*>(obj) + 0x54, 12)) continue;
+        float d = std::sqrt((loc[0] - pl[0]) * (loc[0] - pl[0]) + (loc[1] - pl[1]) * (loc[1] - pl[1]) +
+                            (loc[2] - pl[2]) * (loc[2] - pl[2]));
+        struct {
+            float ret[3];
+        } icon = {{0, 0, 0}};
+        bool iconOk = vr::script::CallFunction(obj, "GetCurrentIconPosition", &icon);
+        struct {
+            uint32_t ret;
+        } en = {0};
+        bool enOk = vr::script::CallFunction(obj, "IsEnabledForTacView", &en);
+        char b[300];
+        std::snprintf(b, sizeof(b), "INTERACT: %s %s at (%.0f, %.0f, %.0f) dist %.0f icon %s(%.0f, %.0f, %.0f) enabled %s",
+                      cls.c_str(), vr::script::ObjectName(obj).c_str(), loc[0], loc[1], loc[2], d, iconOk ? "" : "?",
+                      icon.ret[0], icon.ret[1], icon.ret[2], enOk ? (en.ret ? "yes" : "no") : "?");
+        vr::log::Line(b);
+        if (++found >= 40) break;
+    }
+    if (!found) vr::log::Line("INTERACT: no YTrigger_*Interaction actors in this level.");
+}
+
 std::vector<void*> CheapShooters() {
     ScanTimer scanTimer;  // L12
     static uint32_t cls = 0;

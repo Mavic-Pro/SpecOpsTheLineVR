@@ -149,4 +149,46 @@ void Tick() {
     Show(next);
 }
 
+void HintsTick(bool gameplay) {
+    static ULONGLONG gameplaySince = 0, lastHint = 0;
+    static size_t next = 0;
+    static bool done = false, counted = false;
+    if (done) return;
+    int mode = vr::control::g_hints.load();  // 0 off, 1 on, 2 auto
+    if (mode == 0 || (mode == 2 && vr::control::g_hintsShown.load() >= 3)) {
+        done = true;
+        return;
+    }
+    ULONGLONG now = GetTickCount64();
+    if (!gameplay) {
+        gameplaySince = 0;
+        return;
+    }
+    if (!gameplaySince) gameplaySince = now;
+    if (now - gameplaySince < 15000 || now - lastHint < 7000) return;
+    static const char* const kHints[] = {
+        "Aim with the gun in your right hand; left hand on the barrel = two-handed",
+        "Right trigger: fire. Left trigger or gun to the eye: aim down the sights",
+        "A: action / cover. B: melee (or punch / hit with the gun). X: reload. Y: next weapon",
+        "Left grip: grenade (quick throw with the left hand). Right grip: squad orders",
+        "Reload by hand: grip the magazine under the gun, pull it, grip at your belt, push it in",
+        "Right stick held + direction: D-pad. Both sticks held 1 s: recenter (3 s: standing height)",
+        "Gunstock: aim at something far, look at it, hold B + Y for 1 s",
+    };
+    if (next < sizeof(kHints) / sizeof(kHints[0])) {
+        Notify(kHints[next++]);
+        lastHint = now;
+        if (!counted) {
+            counted = true;
+            if (mode == 2) {
+                int n = vr::control::g_hintsShown.load() + 1;
+                vr::control::g_hintsShown = n;
+                vr::control::SaveIniValue("hintsshown", std::to_string(n));
+            }
+        }
+    } else {
+        done = true;
+    }
+}
+
 }  // namespace vr::toast

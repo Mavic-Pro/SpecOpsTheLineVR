@@ -606,6 +606,29 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   recreated on a new SteamVR connection): update installed, recentered,
   standing height saved, gunstock calibrated, VR output paused, ProTube /
   bHaptics disconnected, SteamVR reconnected. `toasts off` disables them.
+- **Interaction census (physical interaction plan, stage 0 / R-T4):**
+  `interactlog on` lists every `YTrigger_*Interaction` actor of the level
+  every 2 s (`INTERACT:` lines: class, name, position, distance from
+  Walker, `GetCurrentIconPosition`, `IsEnabledForTacView`), the table the
+  grab-to-use stages need.
+- **Magazine visual (R-W7 step 1):** `weaponbones` lists the bones of the
+  weapon mesh in hand (M4/AA12/Desert Eagle/SCAR/M9A1 have `Magazine`,
+  `Slide`, `Muzzle`...; the Milkor has none); while the physical reload has
+  the magazine out or in hand, `HideBoneByName("Magazine")` hides it on the
+  weapon (`MAGAZINE:` lines), restored on insert or weapon change.
+- **Body facing from the hands (R-B3, experimental, `bodyfacing hands`):**
+  the yaw that drives the body turn is the circular mean of head (0.5),
+  the perpendicular to the left-right controller line nearest the head
+  (0.3) and the gun hand (0.2), with a 20 degree dead zone instead of
+  `turnwithhead`; default stays `head`. *Needs a headset check.*
+- **Recoil data (R-W4, first step):** the game's 24 recoil bytes saved per
+  weapon (L11) are logged as six floats (`RECOIL:` line) to derive the
+  visual kick per class from them.
+- **Controller hints (R-U2):** `HintsTick` queues seven short hints (aim,
+  triggers, buttons, grips, hand reload, D-pad/recenter, gunstock) one every
+  7 s after 15 s of 3D gameplay, in the first three play sessions
+  (`hints auto`, counted in `hintsshown`; `hints on|off`). They use the
+  R-U1 overlay, so they also appear in the log as `TOAST:` lines.
 - **Standing height (R-B6):** `height <metres>` fixes the standing head
   height (the automatic one keeps the highest head position seen); both
   sticks held 3 s (recenter fires at 1 s) take the current head height as

@@ -298,6 +298,15 @@ extern std::atomic<bool> g_roomStepRaw;  // "roomstep N raw": senza correzione d
 extern std::atomic<bool> g_cinemaAlign;
 // Avvisi brevi nel visore ("toasts on|off", predefinito on; R-U1).
 extern std::atomic<bool> g_toasts;
+// Suggerimenti sui controller: "hints off|on|auto" (0/1/2) e sessioni gia' fatte ("hintsshown N").
+extern std::atomic<int> g_hints;
+// "bodyfacing head|hands": il corpo segue la testa oltre turnwithhead (head), oppure
+// il busto stimato da testa (0,5), linea tra le mani (0,3) e mano dell'arma (0,2)
+// con zona morta di 20 gradi (hands, R-B3).
+extern std::atomic<bool> g_bodyFacingHands;
+// "interactlog on": censimento delle interazioni fisiche del livello nel log (fase 0, R-T4).
+extern std::atomic<bool> g_interactLog;
+extern std::atomic<int> g_hintsShown;
 // Ini mai caricato (eseguibile non supportato, avvio lento): legge dall'ini
 // solo autoupdate, updatechannel e updaterepo. Thread dell'aggiornamento.
 void ReadUpdateSettingsFromIni();

@@ -893,6 +893,8 @@ public:
     // Ricarica onesta: col caricatore fuori dall'arma (espulso o nuovo in mano)
     // il grilletto non spara ("honestreload off" per il comportamento di prima).
     bool MagazineOut() const { return m_mag != Mag::In; }
+    // Caricatore fisicamente fuori dall'arma (estratto o in mano): per nasconderne l'osso (R-W7).
+    bool MagazineRemoved() const { return m_mag == Mag::Out || m_mag == Mag::Held; }
     // Grip sinistro dell'arma o della ricarica: non arriva al gioco come LB
     // (granata). Deciso alla pressione (Update).
     bool SuppressLeftGrip() const { return !m_lbAllowed; }
@@ -1684,6 +1686,7 @@ bool PatchSlot(uintptr_t slot, const char* name, void* replacement, void** origi
 
 unsigned PadPolls() { return g_packet.load(); }
 std::string WriteActionFiles() { return act::WriteFiles(); }
+bool MagazineRemoved() { return g_gestures.MagazineRemoved(); }
 
 void InstallXInputHooks() {
     bool a = PatchSlot(kIatXInputGetState, "XInputGetState", reinterpret_cast<void*>(&Hooked_XInputGetState),

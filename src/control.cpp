@@ -82,6 +82,10 @@ std::atomic<float> g_roomStepRequest{0.0f};
 std::atomic<bool> g_roomStepRaw{false};
 std::atomic<bool> g_cinemaAlign{true};
 std::atomic<bool> g_toasts{true};
+std::atomic<int> g_hints{2};
+std::atomic<bool> g_bodyFacingHands{false};
+std::atomic<bool> g_interactLog{false};
+std::atomic<int> g_hintsShown{0};
 std::atomic<bool> g_weaponNeedsAim{false};
 std::atomic<bool> g_handPredictAuto{false};
 std::atomic<bool> g_crouchViewReal{true};
@@ -326,6 +330,22 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_toasts = OnOff(cmd, v, true);
+    } else if (cmd == "interactlog") {
+        std::string v;
+        in >> v;
+        g_interactLog = OnOff(cmd, v, false);
+    } else if (cmd == "bodyfacing") {
+        std::string v;
+        in >> v;
+        g_bodyFacingHands = (v == "hands");
+    } else if (cmd == "hints") {
+        std::string v;
+        in >> v;
+        g_hints = v == "auto" ? 2 : (OnOff(cmd, v, true) ? 1 : 0);
+    } else if (cmd == "hintsshown") {
+        int n = 0;
+        in >> n;
+        g_hintsShown = n;
     } else if (cmd == "toast") {
         // toast <testo>: avviso di prova nel visore
         std::string rest;
