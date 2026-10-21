@@ -657,7 +657,9 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   the ini parser (versions, JSON, revocation, companions, line normalization,
   migrations) covered by `tests/unit_tests.cpp` (R-T2); `regress.py` runs
   them first and gained the `gestures` (simulated physical reload) and
-  `cinema` (SetCinematicMode on/off) phases (R-T1).
+  `cinema` (SetCinematicMode on/off) phases (R-T1). `gesturesim` now feeds
+  one fake sample every two ticks (~0.7 s per gesture) instead of all 31
+  in one tick, so time-dependent states (magazine out, rack) really happen.
 
 ## Audit fixes and first full-VR features (0.9.9)
 

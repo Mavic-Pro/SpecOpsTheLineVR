@@ -1213,12 +1213,14 @@ bool ReadGestureSample(GestureSample* s) {
 }
 
 // Pose finte per "gesturesim": testa a 1,7 m che guarda verso -Z.
-void RunGestureSim(const std::string& which) {
-    double t0 = NowSec();  // pose da adesso in poi: le pressioni cadono nel futuro prossimo
-    vr::log::Line("GESTURESIM: " + which);
-    for (int k = 0; k <= 30; ++k) {
+// Un campione (k = 0..30) per chiamata: la simulazione avanza di un campione
+// ogni due tick (vedi ApplyGestures), come una mano vera, cosi' gli stati
+// che durano nel tempo (caricatore fuori, R-W7) si vedono davvero. Prima i
+// 31 campioni passavano tutti in un tick.
+void RunGestureSimStep(const std::string& which, int k) {
+    {
         GestureSample s = {};
-        s.t = t0 + k * 0.02;
+        s.t = NowSec();
         s.hmd[1] = 1.7f;
         s.fwd[2] = -1.0f;
         s.leftValid = s.rightValid = true;
@@ -1296,14 +1298,27 @@ void RunGestureSim(const std::string& which) {
 
 // Ritorna i tasti dei gesti: si aggiungono dopo GateCombo (vedi sotto).
 WORD ApplyGestures(XGamepad* pad) {
+    static std::string simWhich;
+    static int simK = -1, simTick = 0;
     std::string sim;
-    if (vr::control::TakeGestureSimRequest(&sim)) RunGestureSim(sim);
+    if (vr::control::TakeGestureSimRequest(&sim)) {
+        vr::log::Line("GESTURESIM: " + sim);
+        simWhich = sim;
+        simK = 0;
+        simTick = 0;
+    }
     {
         float lx = pad->sThumbLX / 32767.0f, ly = pad->sThumbLY / 32767.0f;
         g_gestures.SetStickMoving(lx * lx + ly * ly > 0.3f * 0.3f);
     }
     GestureSample s = {};
-    if (ReadGestureSample(&s)) g_gestures.Update(s);
+    if (simK >= 0) {
+        if (simTick++ % 2 == 0) RunGestureSimStep(simWhich, simK++);
+        if (simK > 30) simK = -1;
+        s.leftValid = true;  // la simulazione ha la sinistra: il grip simulato vale come quello vero
+    } else if (ReadGestureSample(&s)) {
+        g_gestures.Update(s);
+    }
     WORD g = g_gestures.Buttons(NowSec());
     static WORD lastLogged = 0;
     if (g && g != lastLogged) {
