@@ -3049,11 +3049,15 @@ public:
             last = now;
             if (++g_profCount >= 300) {
                 char b[300];
+                static unsigned lastPolls = 0;
+                unsigned polls = vr::input::PadPolls();
                 std::snprintf(b, sizeof(b), "PROFILE: tick %.2f ms (%.1f fps stereo), Draw left eye %.2f ms, right %.2f ms, "
-                              "VR output %.2f ms, monitor Present %.2f ms, rest %.2f ms",
+                              "VR output %.2f ms, monitor Present %.2f ms, rest %.2f ms, pad polls per tick %.2f",
                               g_profTick / g_profCount, 1000.0 * g_profCount / g_profTick, g_profDraw[0] / g_profCount,
                               g_profDraw[1] / g_profCount, g_profOutput / g_profCount, g_profPresent / g_profCount,
-                              (g_profTick - g_profDraw[0] - g_profDraw[1]) / g_profCount);
+                              (g_profTick - g_profDraw[0] - g_profDraw[1]) / g_profCount,
+                              static_cast<double>(polls - lastPolls) / g_profCount);
+                lastPolls = polls;
                 g_profOutput = g_profPresent = 0.0;
                 vr::log::Line(b);
                 std::snprintf(b, sizeof(b), "HITCHES: ticks over 20 ms=%d, longest %.1f ms", longTicks, maxTick);
@@ -6590,26 +6594,27 @@ void ExecutionAssist(void* pc, void* pawn) {
         vr::log::Line(d);
     }
     if (!pawn || !pc || !vr::control::g_execAssist) return;
-    static void* widenedFor = nullptr;
-    if (pawn != widenedFor) {
-        widenedFor = pawn;
+    {
+        // Riquadro di rilevamento dell'esecuzione: deciso dai valori a ogni
+        // tick, non una volta per Pawn (il gioco puo' rimetterlo; L16).
         float cur[6] = {};
         if (SafeCopy(cur, static_cast<char*>(pawn) + kOffPawnExecDetection, sizeof(cur)) && cur[1] > 0.0f &&
-            cur[1] < 400.0f) {
+            cur[1] < 400.0f && (cur[0] > -80.0f || cur[1] < 120.0f || cur[2] > -110.0f || cur[3] < 110.0f || cur[4] > -120.0f)) {
             float wide[6] = {(std::min)(cur[0], -80.0f), (std::max)(cur[1], 120.0f), (std::min)(cur[2], -110.0f),
                              (std::max)(cur[3], 110.0f), (std::min)(cur[4], -120.0f), cur[5]};
-            SafeCopy(static_cast<char*>(pawn) + kOffPawnExecDetection, wide, sizeof(wide));
-            char b[200];
-            snprintf(b, sizeof(b), "EXECUTE: detection box widened, forward %.0f..%.0f side %.0f..%.0f height %.0f..%.0f",
-                     wide[0], wide[1], wide[2], wide[3], wide[4], wide[5]);
-            vr::log::Line(b);
+            if (SafeCopy(static_cast<char*>(pawn) + kOffPawnExecDetection, wide, sizeof(wide))) {
+                char b[200];
+                snprintf(b, sizeof(b), "EXECUTE: detection box widened, forward %.0f..%.0f side %.0f..%.0f height %.0f..%.0f",
+                         wide[0], wide[1], wide[2], wide[3], wide[4], wide[5]);
+                vr::log::Line(b);
+            }
         }
     }
     static uint64_t handled = 0;
     uint64_t intent = vr::control::g_meleeIntentMs;
     if (intent == handled || GetTickCount64() - intent > 400) return;
     handled = intent;
-    if (vr::control::g_cinemaActive || g_gameLockedScene || TurretAimActive()) return;
+    if (vr::control::g_cinemaActive || g_gameLockedScene || TurretAimActive() || vr::control::g_gamePaused) return;
     int32_t myHealth = 0;
     float me[3];
     uint32_t worldInfo = 0, p = 0;
@@ -6618,8 +6623,14 @@ void ExecutionAssist(void* pc, void* pawn) {
         !TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo ||
         !TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + kOffWorldInfoPawnList, &p))
         return;
+    // Candidati: nemici a terra entro 2 m e entro 60 gradi da dove si guarda
+    // (prima il piu' vicino in qualunque direzione, anche alle spalle: il
+    // corpo scattava fino a 180 gradi, M4). Un nemico in piedi entro 1,5 m e
+    // 45 gradi davanti ha la precedenza: il pugno e' per lui, niente giro.
     char* best = nullptr;
     float bestD = 200.0f, bestLoc[3] = {};
+    bool standingInFront = false;
+    const int32_t viewYaw = g_bodyYaw.load() + g_deltaYaw.load();
     for (int guard = 0; p && guard < 512; ++guard) {
         char* other = reinterpret_cast<char*>(p);
         uint32_t next = 0, flags = 0;
@@ -6627,16 +6638,38 @@ void ExecutionAssist(void* pc, void* pawn) {
         int32_t health = 0;
         float loc[3];
         if (other != pawn && TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&health)) &&
-            health > 0 && TrySafeReadUint32(other + kOffPawnDbnoFlags, &flags) && (flags & kDbnoBits) &&
-            SafeCopy(loc, other + 0x54, 12) && std::fabs(loc[2] - me[2]) < 150.0f) {
+            health > 0 && TrySafeReadUint32(other + kOffPawnDbnoFlags, &flags) && SafeCopy(loc, other + 0x54, 12) &&
+            std::fabs(loc[2] - me[2]) < 150.0f) {
             float d = std::sqrt((loc[0] - me[0]) * (loc[0] - me[0]) + (loc[1] - me[1]) * (loc[1] - me[1]));
-            if (d < bestD && !IsFriendOrCivilian(vr::script::ClassName(other))) {
+            if (d >= 200.0f) {
+                p = next;
+                continue;
+            }
+            int32_t rel = static_cast<int16_t>(RadiansToUnreal(std::atan2(loc[1] - me[1], loc[0] - me[0])) - viewYaw);
+            bool downed = (flags & kDbnoBits) != 0;
+            if (!downed) {
+                if (d < 150.0f && std::abs(rel) <= 65536 / 8 && !IsFriendOrCivilian(vr::script::ClassName(other)))
+                    standingInFront = true;
+            } else if (d < bestD && std::abs(rel) <= 65536 / 6 && !IsFriendOrCivilian(vr::script::ClassName(other))) {
+                // Gia' preso da un'esecuzione o da un soccorso: non e' un bersaglio.
+                struct {
+                    uint32_t ret;
+                } busy = {0};
+                if (vr::control::g_headSampleOnDraw && vr::script::CallFunction(other, "IsBeingExecutedOrRevived", &busy) &&
+                    (busy.ret & 1)) {
+                    p = next;
+                    continue;
+                }
                 bestD = d;
                 best = other;
                 std::memcpy(bestLoc, loc, sizeof(loc));
             }
         }
         p = next;
+    }
+    if (standingInFront) {
+        if (best) vr::log::Line("EXECUTE: B with a standing enemy in front: no turn toward the downed one");
+        return;
     }
     if (!best) return;
     int32_t pcYaw = 0;

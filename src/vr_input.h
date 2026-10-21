@@ -27,4 +27,7 @@ void PulseHand(int hand, unsigned ms);
 
 void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons, unsigned durationMs);
 
+// Letture del pad 0 servite dalla mod finora (diagnostica: quante per tick).
+unsigned PadPolls();
+
 }  // namespace vr::input

@@ -1333,10 +1333,24 @@ void ApplyVrStickRules(XGamepad* pad) {
     if (vr::control::g_adsActive && !menu) pad->bLeftTrigger = 255;
     WORD gestureButtons = ApplyGestures(pad);
     {
+        // Intenzione di corpo a corpo (aiuto alle esecuzioni, hooks.cpp): al
+        // fronte di salita di B, non nel menu di pausa ne' nella combinazione
+        // B+Y della calibrazione (L15).
         static bool bWas = false;
         bool b = ((pad->wButtons | gestureButtons) & kB) != 0;
-        if (b && !bWas) vr::control::g_meleeIntentMs = GetTickCount64();
+        if (b && !bWas && !menu && !(pad->wButtons & kY)) vr::control::g_meleeIntentMs = GetTickCount64();
         bWas = b;
+    }
+    {
+        // Il B del gesto (pugno) arriva al gioco un sondaggio dopo (~1 tick):
+        // l'aiuto alle esecuzioni gira il corpo nel Draw di questo tick, e il
+        // gioco legge B gia' girato verso il nemico a terra. Prima B passava
+        // nello stesso tick e il colpo partiva nella direzione vecchia (M3).
+        // Il B fisico passa dal cancello B+Y (120 ms): e' gia' in ritardo.
+        static WORD gestureBHeld = 0;
+        WORD gestureB = gestureButtons & kB;
+        gestureButtons = (gestureButtons & ~kB) | gestureBHeld;
+        gestureBHeld = gestureB;
     }
     ApplyRecenterCombo(pad);
     {
@@ -1508,6 +1522,8 @@ bool PatchSlot(uintptr_t slot, const char* name, void* replacement, void** origi
 }
 
 }  // namespace
+
+unsigned PadPolls() { return g_packet.load(); }
 
 void InstallXInputHooks() {
     bool a = PatchSlot(kIatXInputGetState, "XInputGetState", reinterpret_cast<void*>(&Hooked_XInputGetState),
