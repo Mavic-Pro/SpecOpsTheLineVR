@@ -213,6 +213,21 @@ std::atomic<uint64_t> g_settleJumpMs{0};
 std::atomic<uint64_t> g_teleportMs{0};
 // Minigun dell'elicottero in mano (YWeapon_TurretMiniGunOnFlight).
 std::atomic<bool> g_flightGunHeld{false};
+// YGamePawn.m_specialMove (byte, YE_SpecialMove) e mossa animata dal gioco in corso.
+constexpr uintptr_t kOffPawnSpecialMove = 0x491;
+std::atomic<bool> g_pawnSpecialAnim{false};
+// Mosse in cui mani e corpo seguono l'animazione del gioco (valori di
+// YE_SpecialMove). Fuori: coperture, scatti, girate, colpi subiti, pugno.
+bool IsBodyAnimSpecialMove(uint8_t sm) {
+    return (sm >= 2 && sm <= 6) ||    // scavalcare / salire sulla copertura
+           (sm >= 23 && sm <= 34) ||  // rianimare, esecuzioni, intel, raccogliere armi e casse
+           sm == 35 || sm == 37 ||    // discesa, animazione personalizzata
+           sm == 41 || sm == 43 ||    // scivolata, mortaio
+           (sm >= 44 && sm <= 52) ||  // corda, zipline, scudo umano
+           (sm >= 54 && sm <= 57) ||  // atterrato / rialzarsi
+           (sm >= 59 && sm <= 64) ||  // torrette (entrata/uscita), inciampi nella sabbia
+           sm == 66 || sm == 67;      // adrenalina
+}
 bool SafeCopy(void* dst, const void* src, size_t n);
 // Giocatore bloccato da una scena (bCinematicMode), aggiornato dal thread di gioco.
 std::atomic<bool> g_gameLockedScene{false};
@@ -2776,8 +2791,27 @@ public:
             movie = lastMovie;
         }
         bool lockedScene = cinematicMode && (noWalker || !vr::control::g_cinemaWalker3D || movie);
-        g_gameLockedScene = cinematicMode;
-        vr::control::g_gameLocked = cinematicMode;
+        // Mosse speciali animate dal gioco per tutto il corpo (corda, zipline,
+        // scavalcare, raccogliere, scudo umano, torrette...): come le scene
+        // scriptate, mani e corpo all'animazione. Nella discesa con la corda
+        // del capitolo 1 le mani restavano sui controller e il corpo
+        // spostato/girato: "corpo deforme" (21/10).
+        bool specialAnim = false;
+        if (!noWalker) {
+            uint8_t sm = 0;
+            if (SafeCopy(&sm, static_cast<char*>(PlayerPawnIfViewTarget(cam)) + kOffPawnSpecialMove, 1))
+                specialAnim = IsBodyAnimSpecialMove(sm);
+            static uint8_t lastSm = 0;
+            if (sm != lastSm) {
+                char b[80];
+                snprintf(b, sizeof(b), "SPECIALMOVE: %u -> %u%s", lastSm, sm, specialAnim ? " (body animated by the game)" : "");
+                vr::log::Line(b);
+                lastSm = sm;
+            }
+        }
+        g_pawnSpecialAnim = specialAnim;
+        g_gameLockedScene = cinematicMode || specialAnim;
+        vr::control::g_gameLocked = cinematicMode || specialAnim;
         {
             // WorldInfo.Pauser (+0x46C) != None: menu di pausa (niente gesti).
             uint32_t wi = 0, pauser = 0;
@@ -5064,7 +5098,9 @@ void UpdateFirstPersonBody(void* pawn) {
         // Su un mezzo il corpo resta dove lo mette il gioco (niente corpo che
         // segue la testa ne' spostamento avanti/indietro): sull'elicottero
         // finiva fuori dalla porta.
-        bool onMount = !PawnOnFirmGround(pawn);
+        // Mossa animata dal gioco (corda, scavalcare...): il corpo resta dove
+        // lo mette l'animazione, come su un mezzo.
+        bool onMount = !PawnOnFirmGround(pawn) || g_pawnSpecialAnim;
         if (onMount) {
             xy[0] = g_fpSavedMeshX;
             xy[1] = g_fpSavedMeshY;
