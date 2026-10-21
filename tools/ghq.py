@@ -12,6 +12,7 @@ Setup (once): Ghidra 12.1.x + JDK 21, project created with
 import os
 import subprocess
 import sys
+import time
 
 GHIDRA = os.environ.get('GHIDRA_INSTALL_DIR', r'C:\Users\Matti\Tools\ghidra_12.1.4_PUBLIC')
 PROJECT_DIR = os.environ.get('SPECOPS_GHIDRA_PROJECT', r'C:\Users\Matti\Tools\ghidra_projects')
@@ -22,7 +23,13 @@ if len(sys.argv) < 2:
 cmd = [os.path.join(GHIDRA, 'support', 'analyzeHeadless.bat'), PROJECT_DIR, 'SpecOps', '-process',
        'SpecOpsTheLine.exe', '-noanalysis', '-readOnly', '-scriptPath', SCRIPTS, '-postScript', 'Decomp.java']
 cmd += sys.argv[1:]
-out = subprocess.run(cmd, capture_output=True, text=True, errors='replace').stdout
+# Ghidra apre il progetto per un processo alla volta: se e' occupato (altra
+# interrogazione in corso) si riprova a turno, fino a ~4 minuti.
+for attempt in range(60):
+    out = subprocess.run(cmd, capture_output=True, text=True, errors='replace').stdout
+    if 'Decomp.java> ' in out or 'lock' not in out.lower():
+        break
+    time.sleep(2 + (os.getpid() + attempt) % 5)
 keep = False
 for line in out.splitlines():
     if 'Decomp.java> ' in line:  # intestazioni "=== nome @ indirizzo" e "--- chiamata da"
