@@ -192,6 +192,10 @@ typedef HRESULT(WINAPI* SetTransform_t)(
 typedef HRESULT(WINAPI* SetVertexShaderConstantF_t)(
     IDirect3DDevice9* self, UINT StartRegister, const float* pConstantData, UINT Vector4fCount);
 
+typedef HRESULT(WINAPI* Clear_t)(IDirect3DDevice9* self, DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color,
+                                 float Z, DWORD Stencil);
+Clear_t g_Clear_Original = nullptr;
+
 CreateDevice_t g_CreateDevice_Original = nullptr;
 Present_t g_Present_Original = nullptr;
 Reset_t g_Reset_Original = nullptr;
@@ -445,6 +449,105 @@ void ApplyPostFxSettings() {
         *depthOfField = value;
         vr::log::Line(std::string("POSTFX: motion blur and depth of field ") + (value ? "on" : "off"));
     }
+}
+
+// --- Hidden-area mesh (R-C7) -------------------------------------------------
+//
+// Le zone dell'immagine fuori dalla lente non si vedono mai: SteamVR le
+// descrive con una mesh per occhio (GetHiddenAreaMesh). Quando il gioco
+// azzera lo Z-buffer della scena di un occhio, subito dopo si scrive
+// profondita' 0 in quelle zone (Clear con rettangoli: 2 per striscia, 48
+// strisce), cosi' il test di profondita' scarta i pixel prima dello shader.
+// La mesh viene rasterizzata una volta in una griglia 64x64 per occhio e
+// ridotta a intervalli per riga, ristretti di una cella (mai bordi visibili).
+extern std::atomic<int> g_drawEye;
+extern std::atomic<UINT> g_backBufferW, g_backBufferH;
+constexpr int kHamRows = 48, kHamGrid = 64;
+struct HamRows {
+    bool valid = false;
+    int triangles = 0;
+    float left[kHamRows], right[kHamRows];  // frazione nascosta da sinistra / da destra per riga
+};
+HamRows g_ham[2];
+unsigned g_hamGen = 0;
+
+void BuildHam(int eye) {
+    HamRows& h = g_ham[eye];
+    h = HamRows();
+    vr::IVRSystem* sys = vr::VRSystem();
+    if (!sys) return;
+    vr::HiddenAreaMesh_t m = sys->GetHiddenAreaMesh(eye == 0 ? vr::Eye_Left : vr::Eye_Right, vr::k_eHiddenAreaMesh_Standard);
+    if (!m.pVertexData || m.unTriangleCount == 0) return;
+    h.triangles = static_cast<int>(m.unTriangleCount);
+    static bool grid[kHamGrid][kHamGrid];
+    std::memset(grid, 0, sizeof(grid));
+    auto inside = [](float px, float py, const vr::HmdVector2_t* t) {
+        auto side = [](float ax, float ay, float bx, float by, float cx, float cy) {
+            return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        };
+        float s1 = side(t[0].v[0], t[0].v[1], t[1].v[0], t[1].v[1], px, py);
+        float s2 = side(t[1].v[0], t[1].v[1], t[2].v[0], t[2].v[1], px, py);
+        float s3 = side(t[2].v[0], t[2].v[1], t[0].v[0], t[0].v[1], px, py);
+        bool neg = s1 < 0 || s2 < 0 || s3 < 0, pos = s1 > 0 || s2 > 0 || s3 > 0;
+        return !(neg && pos);
+    };
+    for (uint32_t t = 0; t < m.unTriangleCount; ++t)
+        for (int gy = 0; gy < kHamGrid; ++gy)
+            for (int gx = 0; gx < kHamGrid; ++gx)
+                if (!grid[gy][gx] && inside((gx + 0.5f) / kHamGrid, (gy + 0.5f) / kHamGrid, m.pVertexData + 3 * t))
+                    grid[gy][gx] = true;
+    // Intervalli per striscia: celle nascoste consecutive dal bordo, tutte le
+    // righe della striscia (intersezione), meno una cella di margine.
+    for (int r = 0; r < kHamRows; ++r) {
+        int y0 = r * kHamGrid / kHamRows, y1 = (r + 1) * kHamGrid / kHamRows;
+        int l = kHamGrid, rr = kHamGrid;
+        for (int gy = y0; gy < y1; ++gy) {
+            int cl = 0;
+            while (cl < kHamGrid && grid[gy][cl]) ++cl;
+            int cr = 0;
+            while (cr < kHamGrid && grid[gy][kHamGrid - 1 - cr]) ++cr;
+            l = (std::min)(l, cl);
+            rr = (std::min)(rr, cr);
+        }
+        h.left[r] = l > 1 ? (l - 1) / static_cast<float>(kHamGrid) : 0.0f;
+        h.right[r] = rr > 1 ? (rr - 1) / static_cast<float>(kHamGrid) : 0.0f;
+    }
+    h.valid = true;
+    char b[96];
+    std::snprintf(b, sizeof(b), "HAM: eye %d mesh with %d triangles rasterized into %d strips.", eye, h.triangles, kHamRows);
+    vr::log::Line(b);
+}
+
+HRESULT WINAPI Hooked_Clear(IDirect3DDevice9* self, DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z,
+                            DWORD Stencil) {
+    HRESULT hr = g_Clear_Original(self, Count, pRects, Flags, Color, Z, Stencil);
+    int eye = g_drawEye.load();
+    if (!vr::control::g_ham || eye < 0 || eye > 1 || !(Flags & D3DCLEAR_ZBUFFER) || Count != 0 || Z < 0.5f) return hr;
+    D3DVIEWPORT9 vp;
+    if (FAILED(self->GetViewport(&vp)) || vp.Width < 256 || vp.Height < 256) return hr;
+    // Solo la scena dell'occhio (viewport grande): non le shadow map ne' i
+    // buffer piccoli dei post-processi.
+    if (vp.Width * 2 < g_backBufferW || vp.Height * 2 < g_backBufferH) return hr;
+    unsigned gen = vr::session::Generation();
+    if (gen != g_hamGen) {
+        g_hamGen = gen;
+        BuildHam(0);
+        BuildHam(1);
+    }
+    const HamRows& h = g_ham[eye];
+    if (!h.valid) return hr;
+    D3DRECT r[2 * kHamRows];
+    DWORD n = 0;
+    LONG vx = static_cast<LONG>(vp.X), vy = static_cast<LONG>(vp.Y), vw = static_cast<LONG>(vp.Width),
+         vh = static_cast<LONG>(vp.Height);
+    for (int i = 0; i < kHamRows; ++i) {
+        LONG y0 = vy + vh * i / kHamRows;
+        LONG y1 = vy + vh * (i + 1) / kHamRows;
+        if (h.left[i] > 0.0f) r[n++] = {vx, y0, vx + static_cast<LONG>(vw * h.left[i]), y1};
+        if (h.right[i] > 0.0f) r[n++] = {vx + static_cast<LONG>(vw * (1.0f - h.right[i])), y0, vx + vw, y1};
+    }
+    if (n) g_Clear_Original(self, n, r, D3DCLEAR_ZBUFFER, 0, 0.0f, 0);  // profondita' 0 = davanti a tutto
+    return hr;
 }
 
 HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
@@ -2478,6 +2581,7 @@ void ApplyFirstPerson(char* cam) {
 // "right" della camera, alternando l'occhio ad ogni frame.
 // Occhio del Draw in corso (stereo sincrono, thread di gioco), -1 = fuori.
 std::atomic<int> g_drawEye{-1};
+bool g_lastMovieSeen = false;  // filmato Bink a tutto schermo in corso (schermo virtuale piatto anche con cinema3d)
 
 // Posa della testa pubblicata in blocco da UpdateHeadTracking (thread di
 // rendering) e letta in blocco dal thread di gioco: rotazioni, spostamento e
@@ -2673,6 +2777,9 @@ double ProfMs() {
 void UpdateFirstPersonBody(void* pawn);
 void UpdateSquadCommandAim(char* cam, void* pawn);
 void InteractionScan(void* pawn);
+void InteractionAffordance();
+extern float g_handWorld[2][3];
+extern bool g_handWorldValid[2];
 void VisibilityCheck(void* pawn);
 // Ultima vista dell'occhio sinistro (posizione e rotazione, per VisibilityCheck).
 float g_lastViewLoc[3] = {0, 0, 0};
@@ -2947,6 +3054,7 @@ public:
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         InteractionScan(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // fase 0 (interactlog)
+        InteractionAffordance();                                                             // fase 1 (prossimita')
         if (vr::control::g_visCheck) VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         // Mirino del gioco: al centro dello schermo segue la testa e non l'arma;
         // con la mira dalla canna lo sostituisce il mirino verde.
@@ -3007,6 +3115,7 @@ public:
             movie = lastMovie;
         }
         bool lockedScene = cinematicMode && (noWalker || !vr::control::g_cinemaWalker3D || movie);
+        g_lastMovieSeen = movie;
         // Mosse speciali animate dal gioco per tutto il corpo (corda, zipline,
         // scavalcare, raccogliere, scudo umano, torrette...): come le scene
         // scriptate, mani e corpo all'animazione. Nella discesa con la corda
@@ -3148,6 +3257,37 @@ public:
             if (vr::control::g_fades) vr::output::Blink(0.3f);
         }
         UpdateDynamicResolution(cam, cinema || half <= 0 || !vr::control::g_syncStereo);
+        // Schermo virtuale in stereo (R-C6, "cinema3d on"): due disegni con la
+        // camera del gioco spostata di +-0,4 IPD lungo la sua destra (niente
+        // testa), uno per occhio, composti fianco a fianco sull'overlay. I
+        // filmati Bink restano piatti (un solo disegno).
+        if (cinema && vr::control::g_cinema3d && half > 0 && HasCameraSignature(cam) && !g_lastMovieSeen) {
+            float* loc = reinterpret_cast<float*>(cam + 0x10);
+            float base[3] = {loc[0], loc[1], loc[2]};
+            int32_t yawUnits = *reinterpret_cast<int32_t*>(cam + kCameraOffsetYaw);
+            float yaw = yawUnits * (6.28318530718f / 65536.0f);
+            float rx = -std::sin(yaw), ry = std::cos(yaw);  // destra della camera (UE3: X avanti, Y destra)
+            for (int eye = 0; eye < 2; ++eye) {
+                float d = (eye == 0 ? -1.0f : 1.0f) * half * 0.4f;
+                loc[0] = base[0] + rx * d;
+                loc[1] = base[1] + ry * d;
+                loc[2] = base[2];
+                g_drawEye = eye;
+                if (bShouldPresent) {
+                    FrameTag tag;
+                    tag.eye = eye;
+                    tag.tick = g_stereoDraws.load(std::memory_order_relaxed);
+                    PushFrameTag(tag);
+                }
+                g_ViewportDraw_Original(self, bShouldPresent);
+            }
+            g_stereoDraws.fetch_add(1, std::memory_order_relaxed);
+            g_drawEye = -1;
+            loc[0] = base[0];
+            loc[1] = base[1];
+            loc[2] = base[2];
+            return;
+        }
         if (cinema || half <= 0 || !vr::control::g_syncStereo || !HasCameraSignature(cam)) {
             if (bShouldPresent) PushFrameTag(FrameTag{});
             g_ViewportDraw_Original(self, bShouldPresent);
@@ -6022,6 +6162,9 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     HandTarget(0, center, bodyYaw, rOff, g_bodyPitch.load() + g_aimDeltaPitch.load(), g_bodyYaw.load() + g_aimDeltaYaw.load(),
                g_handRoll.load(), rPos, rAxes);
     WriteHand(0, rPos, rAxes, actorLoc, af, ar, au, scale, debug);
+    for (int i = 0; i < 3; ++i) g_handWorld[0][i] = rPos[i];
+    g_handWorldValid[0] = true;
+    g_handWorldValid[1] = false;
     // Mano sinistra: segue il controller; vicina all'astina si aggancia alla
     // presa del gioco rispetto alla mano destra (SupportGripRelation), con le
     // dita chiuse sull'arma, qualunque sia la rotazione del controller (calcio
@@ -6044,9 +6187,12 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
         float lOff[3] = {g_leftOffset[0], g_leftOffset[1], g_leftOffset[2]};
         float lPos[3] = {rPos[0], rPos[1], rPos[2]}, lAxes[3][3];
         std::memcpy(lAxes, rAxes, sizeof(lAxes));
-        if (leftCtrl)
+        if (leftCtrl) {
             HandTarget(1, center, bodyYaw, lOff, g_bodyPitch.load() + g_leftPitch.load(), g_bodyYaw.load() + g_leftYaw.load(),
                        g_leftRoll.load(), lPos, lAxes);
+            for (int i = 0; i < 3; ++i) g_handWorld[1][i] = lPos[i];
+            g_handWorldValid[1] = true;
+        }
         // Relazione della presa fissata per arma: si accetta quando resta
         // ferma 0,3 s e poi segue solo variazioni piccole (3 unita'). Le
         // animazioni del gioco che spostano IK_Hand_L (ricarica, corsa, lancio)
@@ -7187,19 +7333,33 @@ constexpr uint32_t kOffCheapShooterHealth = 0x264;  // YCheapShooter.m_health (f
 // (GetCurrentIconPosition) e abilitazione (IsEnabledForTacView) nel log.
 // Diagnostica: serve a costruire la tabella {tipo, posizione, comando} per
 // le fasi successive (presa per usare).
+// Mani nel mondo (bersagli IK scritti da UpdateArms): fase 1, prossimita'.
+float g_handWorld[2][3] = {{0, 0, 0}, {0, 0, 0}};
+bool g_handWorldValid[2] = {false, false};
+
+struct Interaction {
+    void* obj;
+    uint32_t cls;
+    std::string name;
+    float loc[3];
+    float grab[3];  // punto da afferrare: inizio della zipline, ingresso della torretta, se letti; altrimenti loc
+};
+std::vector<Interaction> g_interactions;
+
 void InteractionScan(void* pawn) {
-    if (!vr::control::g_interactLog || !pawn) return;
+    if (!pawn) return;
     static ULONGLONG nextScan = 0;
     if (GetTickCount64() < nextScan) return;
     nextScan = GetTickCount64() + 2000;
     ScanTimer scanTimer;  // L12
+    g_interactions.clear();
     uint32_t data = 0, num = 0;
     if (!TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data) ||
         !TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num) || !data || num > 2000000)
         return;
     float pl[3] = {0, 0, 0};
     SafeCopy(pl, static_cast<char*>(pawn) + 0x54, 12);
-    int found = 0;
+    bool log = vr::control::g_interactLog;
     for (uint32_t i = 0; i < num; ++i) {
         uint32_t o = 0;
         if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
@@ -7209,26 +7369,92 @@ void InteractionScan(void* pawn) {
         if (cls == "Class") continue;
         std::string name = vr::script::ObjectName(obj);
         if (name.rfind("Default__", 0) == 0) continue;  // oggetti predefiniti delle classi
-        float loc[3] = {0, 0, 0};
-        if (!SafeCopy(loc, static_cast<char*>(obj) + 0x54, 12)) continue;
-        float d = std::sqrt((loc[0] - pl[0]) * (loc[0] - pl[0]) + (loc[1] - pl[1]) * (loc[1] - pl[1]) +
-                            (loc[2] - pl[2]) * (loc[2] - pl[2]));
-        struct {
-            float ret[3];
-        } icon = {{0, 0, 0}};
-        bool iconOk = vr::script::CallFunction(obj, "GetCurrentIconPosition", &icon);
-        struct {
-            uint32_t ret;
-        } en = {0};
-        bool enOk = vr::script::CallFunction(obj, "IsEnabledForTacView", &en);
-        char b[300];
-        std::snprintf(b, sizeof(b), "INTERACT: %s %s at (%.0f, %.0f, %.0f) dist %.0f icon %s(%.0f, %.0f, %.0f) enabled %s",
-                      cls.c_str(), vr::script::ObjectName(obj).c_str(), loc[0], loc[1], loc[2], d, iconOk ? "" : "?",
-                      icon.ret[0], icon.ret[1], icon.ret[2], enOk ? (en.ret ? "yes" : "no") : "?");
-        vr::log::Line(b);
-        if (++found >= 40) break;
+        Interaction it;
+        it.obj = obj;
+        it.cls = ObjClass(obj);
+        it.name = cls;
+        if (!SafeCopy(it.loc, static_cast<char*>(obj) + 0x54, 12)) continue;
+        std::memcpy(it.grab, it.loc, sizeof(it.grab));
+        float d = std::sqrt((it.loc[0] - pl[0]) * (it.loc[0] - pl[0]) + (it.loc[1] - pl[1]) * (it.loc[1] - pl[1]) +
+                            (it.loc[2] - pl[2]) * (it.loc[2] - pl[2]));
+        // Punto di presa dalle native con parametro out (exec stub in Ghidra:
+        // GetRopeStart(out vector) -> bool, GetEntryPoint(out vector, out
+        // rotator) -> bool); solo per i trigger vicini.
+        if (d < 1500.0f) {
+            if (cls == "YTrigger_ZiplineInteraction") {
+                struct {
+                    float start[3];
+                    uint32_t ret;
+                } p = {{0, 0, 0}, 0};
+                if (vr::script::CallFunction(obj, "GetRopeStart", &p) && p.ret) std::memcpy(it.grab, p.start, sizeof(it.grab));
+            } else if (cls == "YTrigger_TurretInteraction") {
+                struct {
+                    float loc[3];
+                    int32_t rot[3];
+                    uint32_t ret;
+                } p = {{0, 0, 0}, {0, 0, 0}, 0};
+                if (vr::script::CallFunction(obj, "GetEntryPoint", &p) && p.ret) std::memcpy(it.grab, p.loc, sizeof(it.grab));
+            }
+        }
+        // GetCurrentIconPosition e IsEnabledForTacView (proposti dalla review)
+        // sollevano un'eccezione dentro il gioco sulle istanze dei trigger
+        // (componente nullo in +0x238; 21/10): non si usano.
+        if (log) {
+            char b[300];
+            std::snprintf(b, sizeof(b), "INTERACT: %s %s at (%.0f, %.0f, %.0f) dist %.0f grab (%.0f, %.0f, %.0f)", cls.c_str(),
+                          name.c_str(), it.loc[0], it.loc[1], it.loc[2], d, it.grab[0], it.grab[1], it.grab[2]);
+            vr::log::Line(b);
+        }
+        g_interactions.push_back(it);
+        if (g_interactions.size() >= 64) break;
     }
-    if (!found) vr::log::Line("INTERACT: no YTrigger_*Interaction actors in this level.");
+    if (log && g_interactions.empty()) vr::log::Line("INTERACT: no YTrigger_*Interaction actors in this level.");
+}
+
+// Fase 1 (affordance): una mano entro 25 cm dal punto di presa di
+// un'interazione -> impulso aptico, piu' fitto avvicinandosi; una riga nel
+// log all'ingresso nella zona (le fasi successive usano la stessa zona per
+// "grip = usa").
+void InteractionAffordance() {
+    static ULONGLONG lastPulse[2] = {0, 0};
+    static bool inZone[2] = {false, false};
+    float scale = vr::control::g_posScale;
+    if (scale <= 0.0f || g_interactions.empty()) return;
+    float zone = 0.25f * scale;
+    for (int h = 0; h < 2; ++h) {
+        if (!g_handWorldValid[h]) {
+            inZone[h] = false;
+            vr::control::g_interactZone[h] = false;
+            continue;
+        }
+        float best = zone;
+        const Interaction* nearest = nullptr;
+        for (const Interaction& it : g_interactions) {
+            float dx = it.grab[0] - g_handWorld[h][0], dy = it.grab[1] - g_handWorld[h][1], dz = it.grab[2] - g_handWorld[h][2];
+            float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (d < best) {
+                best = d;
+                nearest = &it;
+            }
+        }
+        if (!nearest) {
+            inZone[h] = false;
+            vr::control::g_interactZone[h] = false;
+            continue;
+        }
+        vr::control::g_interactZone[h] = true;
+        if (!inZone[h]) {
+            inZone[h] = true;
+            vr::log::Line(std::string("INTERACT: ") + (h ? "left" : "right") + " hand at " + nearest->name + " (" +
+                          std::to_string(static_cast<int>(best / scale * 100.0f)) + " cm)");
+        }
+        ULONGLONG now = GetTickCount64();
+        unsigned period = best < 0.10f * scale ? 120 : 300;
+        if (now - lastPulse[h] >= period) {
+            lastPulse[h] = now;
+            vr::input::PulseHand(h ? 0 : 1, 40);  // PulseHand: 0 sinistra, 1 destra
+        }
+    }
 }
 
 std::vector<void*> CheapShooters() {
@@ -7979,6 +8205,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
             {82, reinterpret_cast<void*>(&Hooked_DrawIndexedPrimitive), reinterpret_cast<void**>(&g_DrawIndexedPrimitive_Original)},
             {83, reinterpret_cast<void*>(&Hooked_DrawPrimitiveUP), reinterpret_cast<void**>(&g_DrawPrimitiveUP_Original)},
             {84, reinterpret_cast<void*>(&Hooked_DrawIndexedPrimitiveUP), reinterpret_cast<void**>(&g_DrawIndexedPrimitiveUP_Original)},
+            {43, reinterpret_cast<void*>(&Hooked_Clear), reinterpret_cast<void**>(&g_Clear_Original)},  // hidden-area mesh (R-C7)
         };
         for (auto& h : draws) {
             void* t = VTableEntry(device, h.index);

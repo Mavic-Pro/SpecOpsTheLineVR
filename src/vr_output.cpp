@@ -384,6 +384,7 @@ bool g_cinemaShown = false;
 // una copia di staging ogni 15 frame (prima tutto il frame, ~5,7 MB, passava
 // dalla CPU a ogni tick: menu e filmati a meta' frequenza).
 ID3D11Texture2D* g_cinemaStage = nullptr;
+bool g_cinemaSbs = false;  // overlay in stereo fianco a fianco (cinema3d)
 bool g_cinemaStagePending = false;
 unsigned g_cinemaFrames = 0;
 
@@ -779,23 +780,37 @@ void WorkerLoop() {
         UINT cinemaTop = 0, cinemaBottom = pk[0].h;
         if (cinema) {
             // Schermo virtuale: l'immagine 16:9 va nella texture dell'overlay.
+            // In stereo (cinema3d) i due occhi stanno fianco a fianco nella
+            // stessa texture (larghezza doppia, flag SideBySide dell'overlay).
             bool fed = false;
             UINT top = 0, bottom = pk[0].h;
             bool rowsKnown = false;
-            if (pk[0].gpuSrc && EnsureCinemaTextures(pk[0].w, pk[0].h)) {
+            bool sbs = vr::control::g_cinema3d && (pk[1].gpuSrc || pk[1].bits) && pk[1].w == pk[0].w && pk[1].h == pk[0].h;
+            UINT texW = sbs ? pk[0].w * 2 : pk[0].w;
+            if (pk[0].gpuSrc && EnsureCinemaTextures(texW, pk[0].h)) {
                 D3D11_BOX box = {0, 0, 0, pk[0].w, pk[0].h, 1};
                 g_d3d11Ctx->CopySubresourceRegion(g_cinemaTex, 0, 0, 0, 0, pk[0].gpuSrc, 0, &box);  // GPU -> GPU
+                if (sbs && pk[1].gpuSrc) g_d3d11Ctx->CopySubresourceRegion(g_cinemaTex, 0, pk[0].w, 0, 0, pk[1].gpuSrc, 0, &box);
                 fed = true;
                 rowsKnown = DetectContentRowsGpu(&top, &bottom);
                 if (!rowsKnown) {  // nessuna lettura nuova: ritaglio invariato
                     top = g_cropSession ? g_cropTop : 0;
                     bottom = g_cropSession ? g_cropBottom : pk[0].h;
                 }
-            } else if (pk[0].bits && EnsureCinemaTextures(pk[0].w, pk[0].h)) {
+            } else if (pk[0].bits && EnsureCinemaTextures(texW, pk[0].h)) {
                 D3D11_BOX box = {0, 0, 0, pk[0].w, pk[0].h, 1};
                 g_d3d11Ctx->UpdateSubresource(g_cinemaTex, 0, &box, pk[0].bits, pk[0].pitch, 0);
+                if (sbs && pk[1].bits) {
+                    D3D11_BOX box2 = {pk[0].w, 0, 0, pk[0].w * 2, pk[0].h, 1};
+                    g_d3d11Ctx->UpdateSubresource(g_cinemaTex, 0, &box2, pk[1].bits, pk[1].pitch, 0);
+                }
                 DetectContentRows(pk[0].bits, pk[0].pitch, pk[0].w, pk[0].h, &top, &bottom);
                 fed = true;
+            }
+            if (fed && vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid && g_cinemaSbs != sbs) {
+                g_cinemaSbs = sbs;
+                vr::VROverlay()->SetOverlayFlag(g_cinemaOverlay, vr::VROverlayFlags_SideBySide_Parallel, sbs);
+                vr::log::Line(sbs ? "CINEMA: stereo screen (side by side)." : "CINEMA: flat screen.");
             }
             if (fed) {
                 // Ritaglio stabile: cambia solo se il nuovo resta uguale per 30
@@ -881,6 +896,7 @@ void WorkerLoop() {
                 overlayGen = gen;
                 g_cinemaOverlay = vr::k_ulOverlayHandleInvalid;
                 g_cinemaShown = false;
+                g_cinemaSbs = false;  // il flag stereo va rimesso sull'overlay nuovo
             }
         }
         if (cinema && g_cinemaTex) {
@@ -1220,7 +1236,13 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         vr::log::Line("VR-OUTPUT: back from the cinema screen, pending eye images dropped.");
     }
     wasCinema = cinema;
-    if (cinema || vr::control::g_stereoHalfIpd <= 0) {
+    // Schermo virtuale in stereo (cinema3d): i due disegni arrivano con il
+    // loro occhio nell'etichetta e vanno in due slot; altrimenti una sola
+    // immagine (occhio -1).
+    bool cinema3d = cinema && vr::control::g_cinema3d && vr::control::g_cinemaActive && eye >= 0;
+    if (cinema3d) {
+        // tenuto l'occhio dell'etichetta
+    } else if (cinema || vr::control::g_stereoHalfIpd <= 0) {
         eye = -1;
     } else if (eye < 0) {
         // Stereo attivo ma occhio non riconosciuto, o pausa breve del gioco
@@ -1260,7 +1282,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     }
     for (int e = 0; e < 2; ++e) {
         if (eye >= 0 && e != eye) continue;
-        if (cinema && e == 1) continue;  // schermo virtuale: una sola immagine
+        if (cinema && e == 1 && !cinema3d) continue;  // schermo virtuale piatto: una sola immagine
         // 1) La lettura avviata al tick precedente e' pronta: la si blocca e
         //    la si consegna (sostituendo un'eventuale consegna non ancora presa).
         int g = g_gpuSlot[e];

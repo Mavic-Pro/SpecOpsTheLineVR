@@ -85,6 +85,11 @@ std::atomic<bool> g_toasts{true};
 std::atomic<int> g_hints{2};
 std::atomic<bool> g_bodyFacingHands{false};
 std::atomic<bool> g_interactLog{false};
+std::atomic<bool> g_interactZone[2]{false, false};
+std::atomic<bool> g_grabUse{true};
+std::atomic<bool> g_ham{false};
+std::atomic<bool> g_cinema3d{false};
+std::atomic<unsigned long long> g_interactSimUntil[2]{0, 0};
 std::atomic<int> g_hintsShown{0};
 std::atomic<bool> g_weaponNeedsAim{false};
 std::atomic<bool> g_handPredictAuto{false};
@@ -330,6 +335,24 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_toasts = OnOff(cmd, v, true);
+    } else if (cmd == "cinema3d") {
+        std::string v;
+        in >> v;
+        g_cinema3d = OnOff(cmd, v, false);
+    } else if (cmd == "ham") {
+        std::string v;
+        in >> v;
+        g_ham = OnOff(cmd, v, false);
+    } else if (cmd == "grabuse") {
+        std::string v;
+        in >> v;
+        g_grabUse = OnOff(cmd, v, true);
+    } else if (cmd == "interactsim") {
+        // interactsim right|left [ms]: finge la mano nella zona di presa (test di grabuse)
+        std::string v;
+        int ms = 2000;
+        in >> v >> ms;
+        g_interactSimUntil[v == "left" ? 1 : 0] = GetTickCount64() + ms;
     } else if (cmd == "interactlog") {
         std::string v;
         in >> v;

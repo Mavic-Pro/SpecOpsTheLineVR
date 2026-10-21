@@ -240,7 +240,10 @@ GESTURES
     grip at your belt to take a new one, push it into the gun.
     ("reload simple" in specopsvr.ini: left hand on the magazine, pull down.)
   Cover: duck quickly next to cover (not while already in cover).
-  Weapon: right hand over your right shoulder + right grip = next weapon.
+  Weapon: right hand over your right shoulder (or at your hip) + right grip
+    = next weapon.
+  Ropes, ziplines, turrets: the controller ticks when your hand is on the
+    grab point; close the grip to use it.
   Melee: punch forward with the left hand at chest height, or jab/strike
     with the gun in your right hand.
   Cover: lean out sideways (or stand up) to pop out and aim.

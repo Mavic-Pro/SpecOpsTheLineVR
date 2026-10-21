@@ -594,6 +594,21 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   every 15 frames (copied one frame, mapped the next). The CPU path remains
   the fallback when shared surfaces are unavailable. *Needs a headset (or
   null-driver) check of menus and Bink movies.*
+- **Stereo cutscene screen (R-C6, experimental, `cinema3d on`):** in-engine
+  cutscenes (not Bink movies) are drawn twice with the game camera moved
+  +-0.4 half-IPD along its own right vector (no head tracking), the two
+  frames go through the eye slots with their frame-tag eye and the output
+  worker composes them side by side in a double-width overlay texture with
+  `VROverlayFlags_SideBySide_Parallel` (`CINEMA: stereo screen` line).
+  *Needs a headset comfort check.*
+- **Hidden-area mesh (R-C7, experimental, `ham on`):** `IDirect3DDevice9::
+  Clear` (vtable 43) is hooked; after a full Z-buffer clear of an eye's
+  scene viewport (at least half the back buffer) the OpenVR hidden-area
+  mesh of that eye, rasterized once into a 64x64 grid and reduced to 48
+  horizontal strips (two rectangles each, one cell of margin), is written
+  at depth 0 with a rect `Clear`, so the depth test rejects those pixels
+  before shading. Off by default until measured in the headset (`HAM:`
+  lines show the mesh size; GPU time in the `PROFILE` line).
 - **Covered by existing code:** R-U4 (world-locked squad marker: the orange
   target box is already projected per eye from `g_squadTargetLoc` with the
   eye's own projection, and M19 showed no `Canvas.Project` traffic to fix);
@@ -606,11 +621,26 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   recreated on a new SteamVR connection): update installed, recentered,
   standing height saved, gunstock calibrated, VR output paused, ProTube /
   bHaptics disconnected, SteamVR reconnected. `toasts off` disables them.
-- **Interaction census (physical interaction plan, stage 0 / R-T4):**
-  `interactlog on` lists every `YTrigger_*Interaction` actor of the level
-  every 2 s (`INTERACT:` lines: class, name, position, distance from
-  Walker, `GetCurrentIconPosition`, `IsEnabledForTacView`), the table the
-  grab-to-use stages need.
+- **Interaction census and affordance (physical interaction plan, stages
+  0-1 / R-T4):** every 2 s the `YTrigger_*Interaction` actors of the level
+  (Zipline, FastRope, Turret, Effects, DP, GoldPoint, VP, InteractionHold,
+  InteractionSequence; class defaults skipped) are cached with their
+  position and a grab point (`GetRopeStart(out vector)` for ziplines,
+  `GetEntryPoint(out vector, out rotator)` for turrets, read through
+  ProcessEvent; `GetCurrentIconPosition`/`IsEnabledForTacView` throw inside
+  the game on trigger instances and are not used). `interactlog on` prints
+  them (`INTERACT:` lines). Stage 1: the hands' IK world targets are
+  published (`g_handWorld`); a hand within 25 cm of a grab point gets a
+  40 ms haptic tick every 300 ms (120 ms under 10 cm) and the entry is
+  logged. Stage 2 (`grabuse on`): a grip closing while the hand is in the
+  zone presses A (the game's use button) for 150 ms and that grip is not
+  a grenade/squad press; `interactsim right|left [ms]` fakes the zone for
+  the test. *Needs a headset check at a rope/zipline/turret.*
+- **Hip holster (R-W5):** the game has two weapon slots that Y alternates,
+  so a second grab zone at the hip (right grip 55-100 cm below the head, to
+  the side, not in front, not during a reload) does the same as the
+  shoulder grab (`gesturesim holster`). Direct slot selection would need a
+  script function that was not found; cycling is what the game offers.
 - **Magazine visual (R-W7 step 1):** `weaponbones` lists the bones of the
   weapon mesh in hand (M4/AA12/Desert Eagle/SCAR/M9A1 have `Magazine`,
   `Slide`, `Muzzle`...; the Milkor has none); while the physical reload has
@@ -653,6 +683,22 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   README) and prints the `gh release create` line with every asset; the
   updater downloads the ones missing or different (never `specopsvr.ini`).
   `reset_settings.bat` restores the shipped ini keeping a dated copy.
+- **Headset checklist for this batch** (everything above passed the
+  headless gate; these need eyes and hands): toasts and the first-session
+  hints (`TOAST:` lines); menus and Bink movies on the GPU cinema path
+  (`gpucopy`); `cinema3d on` comfort in an in-engine cutscene; `ham on`
+  (no visible corners, GPU time in `PROFILE`); `bodyfacing hands`;
+  `manualaction on`; gun jab/strike and the hip holster; grenade speed
+  factor (`GRENADE:` line); magazine bone during a hand reload; rope /
+  zipline / turret: haptic tick near the grab point and `grabuse`; both
+  sticks 3 s for the standing height; `submitpose on` (R-C1); left-handed
+  play (`hand left`: lateral offsets mirrored, haptics swapped).
+- **Not done, with the reason:** R-I2 extra controller profiles (Pico,
+  Focus 3, Pimax) need the SteamVR `controller_type` strings from a log of
+  those headsets; R-U3 wrist HUD and R-U5 quick menu/laser are larger UI
+  projects left for a later milestone; stages 3-4 of the interaction plan
+  (gaze-chosen executions, pick-ups, QTE gestures) depend on playtests of
+  stages 0-2.
 - **Tests:** `src/pure_utils.h` holds the pure functions of the updater and
   the ini parser (versions, JSON, revocation, companions, line normalization,
   migrations) covered by `tests/unit_tests.cpp` (R-T2); `regress.py` runs

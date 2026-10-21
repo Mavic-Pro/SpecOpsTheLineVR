@@ -306,6 +306,15 @@ extern std::atomic<int> g_hints;
 extern std::atomic<bool> g_bodyFacingHands;
 // "interactlog on": censimento delle interazioni fisiche del livello nel log (fase 0, R-T4).
 extern std::atomic<bool> g_interactLog;
+// Fase 1/2: mano (0 destra, 1 sinistra) dentro la zona di presa di un'interazione
+// (scritto dal thread di gioco) e "grabuse on|off": grip chiuso nella zona = A.
+extern std::atomic<bool> g_interactZone[2];
+extern std::atomic<bool> g_grabUse;
+// "ham on|off": profondita' 0 nelle zone fuori lente all'azzeramento dello Z-buffer (R-C7).
+extern std::atomic<bool> g_ham;
+// "cinema3d on|off": schermo virtuale in stereo (due disegni a 0,4 IPD, overlay fianco a fianco; R-C6).
+extern std::atomic<bool> g_cinema3d;
+extern std::atomic<unsigned long long> g_interactSimUntil[2];  // "interactsim": zona finta fino a (ms)
 extern std::atomic<int> g_hintsShown;
 // Ini mai caricato (eseguibile non supportato, avvio lento): legge dall'ini
 // solo autoupdate, updatechannel e updaterepo. Thread dell'aggiornamento.

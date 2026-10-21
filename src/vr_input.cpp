@@ -873,6 +873,14 @@ public:
                 Press(kY, s.t, 0.12, "arma presa dalla spalla", 0.0f);
                 m_gripIsSwap = true;
                 m_hapticPending = true;
+            } else if (rel[1] < -0.55f && rel[1] > -1.0f && side > 0.12f && ahead < 0.15f && !m_magGrab &&
+                       m_mag == Mag::In) {
+                // Fondina al fianco (R-W5): grip con la mano all'altezza
+                // dell'anca (55-100 cm sotto la testa), di lato e non davanti:
+                // stessa azione della spalla (il gioco ha due armi, Y le alterna).
+                Press(kY, s.t, 0.12, "arma presa dalla fondina", 0.0f);
+                m_gripIsSwap = true;
+                m_hapticPending = true;
             }
         }
         if (!s.rightGrip) m_gripIsSwap = false;
@@ -895,6 +903,8 @@ public:
     bool MagazineOut() const { return m_mag != Mag::In; }
     // Caricatore fisicamente fuori dall'arma (estratto o in mano): per nasconderne l'osso (R-W7).
     bool MagazineRemoved() const { return m_mag == Mag::Out || m_mag == Mag::Held; }
+    // Pressione di un tasto da fuori (grabuse): stessa coda dei gesti.
+    void PressButton(WORD button, double t, double dur, const char* what) { Press(button, t, dur, what, 0.0f); }
     // Grip sinistro dell'arma o della ricarica: non arriva al gioco come LB
     // (granata). Deciso alla pressione (Update).
     bool SuppressLeftGrip() const { return !m_lbAllowed; }
@@ -1217,6 +1227,7 @@ bool ReadGestureSample(GestureSample* s) {
 // ogni due tick (vedi ApplyGestures), come una mano vera, cosi' gli stati
 // che durano nel tempo (caricatore fuori, R-W7) si vedono davvero. Prima i
 // 31 campioni passavano tutti in un tick.
+GestureSample g_simLast = {};  // ultimo campione simulato (grip letti anche da grabuse)
 void RunGestureSimStep(const std::string& which, int k) {
     {
         GestureSample s = {};
@@ -1291,7 +1302,14 @@ void RunGestureSimStep(const std::string& which, int k) {
             s.rightGrip = k > 10;
         } else if (which == "rest") {  // braccia lungo i fianchi, testa ferma: nessun gesto
             s.left[1] = 0.9f; s.right[1] = 0.9f;
+        } else if (which == "holster") {  // mano destra all'anca, di lato, poi grip (R-W5)
+            s.right[0] = 0.25f; s.right[1] = 1.0f; s.right[2] = 0.0f;
+            s.rightGrip = k > 10;
+        } else if (which == "grab") {  // mani ferme, grip sinistro chiuso a meta' (con interactsim left = usa)
+            s.left[1] = 0.9f; s.right[1] = 0.9f;
+            s.leftGrip = k > 10;
         }
+        g_simLast = s;
         g_gestures.Update(s);
     }
 }
@@ -1315,9 +1333,28 @@ WORD ApplyGestures(XGamepad* pad) {
     if (simK >= 0) {
         if (simTick++ % 2 == 0) RunGestureSimStep(simWhich, simK++);
         if (simK > 30) simK = -1;
-        s.leftValid = true;  // la simulazione ha la sinistra: il grip simulato vale come quello vero
+        s = g_simLast;  // grip e validita' dal campione simulato (grabuse, LB)
     } else if (ReadGestureSample(&s)) {
         g_gestures.Update(s);
+    }
+    // Fase 2 (grabuse): grip che si chiude con la mano nella zona di presa di
+    // un'interazione (corda, zipline, torretta) = A, il tasto d'uso del gioco;
+    // quel grip non vale come granata (LB) o ordine (RB).
+    {
+        static bool gripWas[2] = {false, false};
+        bool grip[2] = {s.rightGrip, s.leftGrip};  // 0 destra, 1 sinistra come g_interactZone
+        for (int h = 0; h < 2; ++h) {
+            bool zone = vr::control::g_grabUse && GestureDetector::Gameplay() &&
+                        (vr::control::g_interactZone[h].load() || GetTickCount64() < vr::control::g_interactSimUntil[h].load());
+            if (zone && grip[h]) {
+                pad->wButtons &= static_cast<WORD>(~(h ? kLB : kRB));
+                if (!gripWas[h]) {
+                    g_gestures.PressButton(kA, NowSec(), 0.15, h ? "presa con la sinistra (usa)" : "presa con la destra (usa)");
+                    vr::haptics::GrenadeThrow();
+                }
+            }
+            gripWas[h] = grip[h];
+        }
     }
     WORD g = g_gestures.Buttons(NowSec());
     static WORD lastLogged = 0;
