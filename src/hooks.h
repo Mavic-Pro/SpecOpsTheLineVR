@@ -7,6 +7,8 @@ namespace vr::hooks {
 // device D3D9Ex, risorse MANAGED convertite, ritaglio degli occhi condiviso
 // con D3D11 senza passare dalla CPU.
 bool GpuShareRequested();
+// PlayerController del giocatore verificato vivo (GObjects), oppure null.
+void* PlayerControllerAlive();
 extern bool g_d3d9ex;
 
 // Aggancia IDirect3D9::CreateDevice sull'oggetto appena creato dal vero d3d9.dll.

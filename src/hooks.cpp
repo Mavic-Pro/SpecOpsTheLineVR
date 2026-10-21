@@ -247,6 +247,12 @@ bool IsNeckFollowSpecialMove(uint8_t sm) {
     return sm == 26 || (sm >= 44 && sm <= 48) || sm == 50 || sm == 52 || (sm >= 54 && sm <= 57);
 }
 bool SafeCopy(void* dst, const void* src, size_t n);
+uint32_t ObjClass(void* obj);
+bool StillAlive(void* obj, uint32_t cls);
+// PlayerController vivo (camera di questo tick o puntatore catturato, entrambi
+// verificati in GObjects), oppure null: niente scritture su memoria riusata
+// dopo un cambio di livello o una ripartenza (H4).
+void* LivePlayerController();
 // Giocatore bloccato da una scena (bCinematicMode) o da una mossa animata dal
 // gioco, aggiornato dal thread di gioco.
 std::atomic<bool> g_gameLockedScene{false};
@@ -1766,6 +1772,7 @@ void ArmPageWatch(void* targetAddr, size_t exactRangeBytes = 4) {
 
 void* g_pawnPtr = nullptr;
 void* g_playerControllerPtr = nullptr;
+uint32_t g_playerControllerCls = 0;  // classe al momento della cattura (StillAlive)
 std::atomic<bool> g_openVrReady{false};
 
 typedef void(__thiscall* ExecGetPawnViewLocation_t)(void* self, void* stack, void* result);
@@ -1815,6 +1822,7 @@ public:
         void* self = this;
         if (g_playerControllerPtr != self) {
             g_playerControllerPtr = self;
+            g_playerControllerCls = ObjClass(self);
             char buf[32];
             std::snprintf(buf, sizeof(buf), "%p", self);
             vr::log::Line(std::string("PlayerController pointer captured: 0x") + buf);
@@ -3602,7 +3610,7 @@ void UpdateHeadTracking() {
         {
             // Aiuto alle esecuzioni anche con le pose finte (test senza visore).
             uint32_t ctrlPawn = 0;
-            void* pc = g_playerControllerPtr;
+            void* pc = LivePlayerController();
             if (pc && TrySafeReadUint32(static_cast<char*>(pc) + 0x1F8, &ctrlPawn) && ctrlPawn)
                 ExecutionAssist(pc, reinterpret_cast<void*>(ctrlPawn));
         }
@@ -3734,7 +3742,7 @@ void UpdateHeadTracking() {
     // corpo (rotazione del PlayerController) e il riferimento si sposta della
     // stessa quantita', cosi' la vista non cambia.
     float turnThr = vr::control::g_turnWithHeadDeg * 0.01745329252f;
-    void* pcForTurn = g_playerControllerPtr;
+    void* pcForTurn = LivePlayerController();
     // In copertura (YGamePawn.m_coverFaceState +0x498 != 0) il gioco orienta
     // Walker verso il riparo: niente rotazione del corpo con la testa.
     bool inCover = false, specialMove = false;
@@ -4078,15 +4086,17 @@ void UpdateHeadTracking() {
     {
         static bool wasTurret = false;
         bool turret = TurretAimActive();
-        if (wasTurret && !turret && g_playerControllerPtr && !vr::control::g_stickPitch) {
+        void* pcT = LivePlayerController();
+        if (wasTurret && !turret && pcT && !vr::control::g_stickPitch) {
             int32_t zero = 0;
-            SafeCopy(static_cast<char*>(g_playerControllerPtr) + 0x60, &zero, 4);
+            SafeCopy(static_cast<char*>(pcT) + 0x60, &zero, 4);
             vr::log::Line("TURRET: left, PlayerController pitch reset to 0.");
         }
         wasTurret = turret;
     }
-    if (TurretAimActive() && g_aimValid && g_playerControllerPtr) {
-        char* pc = static_cast<char*>(g_playerControllerPtr);
+    void* pcTurret = LivePlayerController();
+    if (TurretAimActive() && g_aimValid && pcTurret) {
+        char* pc = static_cast<char*>(pcTurret);
         int32_t dy = static_cast<int32_t>(g_aimDeltaYaw.load() * 0.35f);
         if (dy != 0 && AddControllerYaw(pc, dy)) g_turretYawUnits.fetch_add(dy);
         uint32_t pitchNow = 0;
@@ -4214,6 +4224,18 @@ bool StillAlive(void* obj, uint32_t cls) {
         !TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * idx), &slot))
         return false;
     return slot == reinterpret_cast<uint32_t>(obj) && ObjClass(obj) == cls;
+}
+
+void* LivePlayerController() {
+    uint32_t cls = g_playerControllerCls;
+    char* cam = static_cast<char*>(g_cameraPtr.load());
+    if (HasCameraSignature(cam)) {
+        void* pc = cam - 0x77C;
+        if (!cls || StillAlive(pc, cls)) return pc;
+    }
+    void* pc = g_playerControllerPtr;
+    if (pc && cls && StillAlive(pc, cls)) return pc;
+    return nullptr;
 }
 
 
@@ -5427,11 +5449,16 @@ void RedirectNewProjectiles(void* pawn) {
     uint32_t data = 0, num = 0;
     TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data);
     TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num);
+    // Proiettili vivi visti in questa scansione: alla fine la lista di quelli
+    // gia' reindirizzati tiene solo questi. Un proiettile nuovo allo stesso
+    // indirizzo di uno distrutto non veniva piu' reindirizzato (M18).
+    std::vector<void*> seen;
     for (uint32_t i = 0; i < num; ++i) {
         uint32_t o = 0, inst = 0;
         if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
         void* obj = reinterpret_cast<void*>(o);
         if (!IsProjectile(obj)) continue;
+        if (std::find(g_projRedirected.begin(), g_projRedirected.end(), obj) != g_projRedirected.end()) seen.push_back(obj);
         // Del giocatore: Instigator = Walker, oppure Owner = arma in mano o Walker
         // (il razzo dell'RPG e' la testata caricata nel tubo, di proprieta'
         // dell'arma, che al lancio viene staccata e accelerata).
@@ -5485,7 +5512,12 @@ void RedirectNewProjectiles(void* pawn) {
                      vr::script::ClassName(obj).c_str(), v[0], v[1], v[2], nv[0], nv[1], nv[2], bd[0], bd[1], bd[2]);
             vr::log::Line(b);
         }
+        seen.push_back(obj);
     }
+    // Solo i proiettili ancora vivi restano "gia' reindirizzati" (M18).
+    g_projRedirected.erase(std::remove_if(g_projRedirected.begin(), g_projRedirected.end(),
+                                          [&](void* p) { return std::find(seen.begin(), seen.end(), p) == seen.end(); }),
+                           g_projRedirected.end());
 }
 
 // Arma in mano = postazione fissa (torretta, minigun dell'elicottero): la mira
@@ -7775,6 +7807,8 @@ bool InstallIDirect3D9Hook(IDirect3D9* realD3D9) {
 namespace vr::hooks {
 
 bool g_d3d9ex = false;
+
+void* PlayerControllerAlive() { return LivePlayerController(); }
 
 bool GpuShareRequested() {
     char path[MAX_PATH] = {};

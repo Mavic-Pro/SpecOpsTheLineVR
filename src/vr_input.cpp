@@ -3,6 +3,7 @@
 #include "control.h"
 #include "haptics_ext.h"
 #include "vr_session.h"
+#include "hooks.h"
 #include "vr_output.h"
 
 #include <windows.h>
@@ -1458,7 +1459,7 @@ void ApplyVrStickRules(XGamepad* pad) {
         carry += (x > 0 ? 1.0f : -1.0f) * k * k * speed * dt / 360.0f * 65536.0f;
         int32_t delta = static_cast<int32_t>(carry);
         carry -= static_cast<float>(delta);
-        void* pc = vr::control::g_playerController;
+        void* pc = vr::hooks::PlayerControllerAlive();  // verificato vivo (H4)
         if (delta && pc && SafeAddYaw(pc, delta)) {
             vr::control::g_ownYawUnits.fetch_add(delta);
             vr::control::g_stickYawUnits.fetch_add(delta);
@@ -1470,7 +1471,7 @@ void ApplyVrStickRules(XGamepad* pad) {
     pad->sThumbRX = 0;
     if (armed && (x > 0.7f || x < -0.7f)) {
         armed = false;
-        void* pc = vr::control::g_playerController;
+        void* pc = vr::hooks::PlayerControllerAlive();  // verificato vivo (H4)
         int32_t delta = static_cast<int32_t>((x > 0 ? snap : -snap) / 360.0f * 65536.0f);
         if (pc && SafeAddYaw(pc, delta)) {
             vr::control::g_ownYawUnits.fetch_add(delta);

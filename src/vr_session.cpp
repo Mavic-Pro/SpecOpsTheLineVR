@@ -4,11 +4,28 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <delayimp.h>
 #include <openvr.h>
 
 #include <atomic>
 #include <string>
 #include <thread>
+
+// openvr_api.dll caricata a richiesta (/DELAYLOAD). Se manca, ogni funzione
+// esportata (anche VR_GetInitToken, chiamata dagli accessori inline di
+// openvr.h come VRSystem()) diventa uno stub che restituisce 0/null: i
+// chiamanti vedono "OpenVR assente" come con una sessione mai aperta. Senza
+// questo gancio il delay-load sollevava un'eccezione SEH e il gioco mostrava
+// "Fatal error" ~5 s dopo l'avvio (21/10, retry del collegamento).
+extern "C" uintptr_t __cdecl SpecOpsOpenVrStub() { return 0; }
+
+extern "C" FARPROC WINAPI SpecOpsDelayLoadFailure(unsigned notify, PDelayLoadInfo info) {
+    if (!info || !info->szDll || _stricmp(info->szDll, "openvr_api.dll") != 0) return nullptr;
+    if (notify == dliFailLoadLib) return reinterpret_cast<FARPROC>(GetModuleHandleA("kernel32.dll"));
+    if (notify == dliFailGetProc) return reinterpret_cast<FARPROC>(&SpecOpsOpenVrStub);
+    return nullptr;
+}
+extern "C" const PfnDliHook __pfnDliFailureHook2 = SpecOpsDelayLoadFailure;
 
 namespace vr::session {
 
@@ -218,6 +235,7 @@ std::atomic<bool> g_present{false};
 //   gioco) e si riprova a collegarsi ogni 5 s finche' SteamVR non torna.
 // Ritorna false se la sessione va chiusa.
 bool PollEvents() {
+    if (!g_ready) return true;
     vr::IVRSystem* sys = vr::VRSystem();
     if (!sys) return true;
     vr::VREvent_t ev;

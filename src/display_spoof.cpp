@@ -18,6 +18,8 @@ constexpr uintptr_t kIatSystemParametersInfoW = 0x01109664;
 constexpr uintptr_t kIatSetWindowPos = 0x011096C4;
 constexpr uintptr_t kIatMoveWindow = 0x01109570;
 constexpr uintptr_t kIatGetClientRect = 0x01109614;
+constexpr uintptr_t kIatShowWindow = 0x0110963C;
+constexpr uintptr_t kIatSetWindowPlacement = 0x0110968C;
 
 // Desktop minimo riportato al gioco. La finestra reale puo' uscire dallo
 // schermo: conta solo la dimensione del back buffer.
@@ -165,6 +167,35 @@ BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
 WNDPROC g_originalWndProc = nullptr;
 LONG volatile g_wndMessages = 0;
 
+// Diagnostica (21/10): senza OpenVR la finestra del gioco finiva ridotta a
+// icona (viewport 0x0, crash del video del menu) mentre senza mod no. Si
+// registrano ShowWindow/SetWindowPlacement del gioco con lo stack.
+typedef BOOL(WINAPI* ShowWindow_t)(HWND, int);
+typedef BOOL(WINAPI* SetWindowPlacement_t)(HWND, const WINDOWPLACEMENT*);
+ShowWindow_t g_ShowWindow_Real = nullptr;
+SetWindowPlacement_t g_SetWindowPlacement_Real = nullptr;
+
+void LogStack(const char* what, int arg) {
+    void* frames[10] = {};
+    USHORT n = CaptureStackBackTrace(1, 10, frames, nullptr);
+    char b[260];
+    int len = std::snprintf(b, sizeof(b), "DISPLAY: %s(%d) called from", what, arg);
+    for (USHORT i = 0; i < n && len < 240; ++i) len += std::snprintf(b + len, sizeof(b) - len, " %p", frames[i]);
+    vr::log::Line(b);
+}
+
+BOOL WINAPI Hooked_ShowWindow(HWND h, int cmd) {
+    static int budget = 4;
+    if (budget-- > 0 || cmd == SW_MINIMIZE || cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE || cmd == SW_FORCEMINIMIZE)
+        LogStack("ShowWindow", cmd);
+    return g_ShowWindow_Real(h, cmd);
+}
+
+BOOL WINAPI Hooked_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* p) {
+    LogStack("SetWindowPlacement", p ? static_cast<int>(p->showCmd) : -1);
+    return g_SetWindowPlacement_Real(h, p);
+}
+
 LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     InterlockedIncrement(&g_wndMessages);
     if (msg == WM_CLOSE || msg == WM_DESTROY || (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE)) {
@@ -249,6 +280,23 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void KeepSubclass() {
     HWND h = g_gameWindow;
     if (!h || !g_originalWndProc || vr::control::g_exiting) return;
+    {
+        // Stato della finestra, una volta al secondo per i primi 30 s.
+        static ULONGLONG last = 0, first = 0;
+        ULONGLONG now = GetTickCount64();
+        if (!first) first = now;
+        if (now - first < 30000 && now - last >= 1000) {
+            last = now;
+            RECT r = {};
+            GetWindowRect(h, &r);
+            LONG style = static_cast<LONG>(GetWindowLongPtrW(h, GWL_STYLE));
+            char b[200];
+            std::snprintf(b, sizeof(b), "DISPLAY: window iconic=%d visible=%d rect=(%ld,%ld)-(%ld,%ld) style=0x%08lX foreground=%s",
+                          IsIconic(h), IsWindowVisible(h), r.left, r.top, r.right, r.bottom, style,
+                          GetForegroundWindow() == h ? "game" : "other");
+            vr::log::Line(b);
+        }
+    }
     WNDPROC cur = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_WNDPROC));
     if (!cur || cur == &UnclampedWndProc) return;
     // Solo procedure dell'exe del gioco: un altro programma che sottoclassa
@@ -307,6 +355,15 @@ void UnclampWindow(HWND window, int clientWidth, int clientHeight) {
     g_gameWindow = window;
     g_wantedWidth = clientWidth;
     g_wantedHeight = clientHeight;
+    // Il gioco crea la finestra ridotta a icona (ShowWindow(SW_SHOWMINIMIZED)
+    // in FUN_00de8b00) e la mostra con SW_SHOW, che non la ripristina; con
+    // le dimensioni riportate dal mod il ripristino del gioco non scattava e
+    // senza visore il video del menu andava in crash con la viewport 0x0
+    // (21/10). Qui la viewport c'e': la finestra torna normale.
+    if (IsIconic(window)) {
+        ShowWindowAsync(window, SW_SHOWNOACTIVATE);
+        vr::log::Line("DISPLAY: game window was minimized at viewport creation, restored.");
+    }
 
     RECT client;
     GetClientRect(window, &client);
@@ -334,6 +391,10 @@ void InstallDesktopSizeSpoof() {
           reinterpret_cast<void**>(&g_SetWindowPos_Real));
     Patch(kIatMoveWindow, "MoveWindow", reinterpret_cast<void*>(&Hooked_MoveWindow),
           reinterpret_cast<void**>(&g_MoveWindow_Real));
+    Patch(kIatShowWindow, "ShowWindow", reinterpret_cast<void*>(&Hooked_ShowWindow),
+          reinterpret_cast<void**>(&g_ShowWindow_Real));
+    Patch(kIatSetWindowPlacement, "SetWindowPlacement", reinterpret_cast<void*>(&Hooked_SetWindowPlacement),
+          reinterpret_cast<void**>(&g_SetWindowPlacement_Real));
     vr::log::Line(std::string("DISPLAY: desktop reported to the game >= ") + std::to_string(kMinWidth) + "x" +
                   std::to_string(kMinHeight) + (a && b ? " (active)" : " (NOT active)"));
 }
