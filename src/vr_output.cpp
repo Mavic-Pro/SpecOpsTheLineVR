@@ -4,6 +4,7 @@
 #include "vr_session.h"
 #include "vr_toast.h"
 #include "vr_menu.h"
+#include "vr_wrist.h"
 #include "hooks.h"
 
 #include <windows.h>
@@ -20,6 +21,10 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+
+namespace vr::display {
+HWND GameWindow();
+}
 
 namespace vr::output {
 
@@ -455,6 +460,70 @@ bool DetectContentRowsGpu(UINT* top, UINT* bottom) {
         g_cinemaStagePending = true;
     }
     return false;
+}
+
+// Laser sullo schermo virtuale (R-U5): il raggio del controller dell'arma
+// (-Z della posa, spazio standing) interseca l'overlay dello schermo; il
+// punto UV diventa un pixel della fascia mostrata e quindi un punto della
+// finestra del gioco: cursore di Windows li' (i menu UIScene del gioco
+// seguono il cursore e mostrano il loro), grilletto = clic sinistro. Niente
+// input focus di SteamVR sull'overlay: i tasti restano al gioco (oggi un
+// overlay interattivo aveva "spento" i tasti, 21/10). Non con il menu del mod aperto.
+void CinemaLaserTick(bool cinema) {
+    static bool triggerWas = false, hitWas = false;
+    static int logged = 0;
+    if (!cinema || !g_cinemaShown || !vr::control::g_cinemaLaser || vr::menu::IsOpen() ||
+        !vr::control::g_gunCtrlPoseValid || g_cinemaOverlay == vr::k_ulOverlayHandleInvalid) {
+        hitWas = false;
+        return;
+    }
+    vr::IVROverlay* ov = vr::VROverlay();
+    HWND h = vr::display::GameWindow();
+    if (!ov || !h) return;
+    float m[12];
+    for (int i = 0; i < 12; ++i) m[i] = vr::control::g_gunCtrlPose[i].load();
+    vr::VROverlayIntersectionParams_t p = {};
+    p.vSource = {m[3], m[7], m[11]};
+    p.vDirection = {-m[2], -m[6], -m[10]};
+    p.eOrigin = vr::TrackingUniverseStanding;
+    vr::VROverlayIntersectionResults_t r = {};
+    if (!ov->ComputeOverlayIntersection(g_cinemaOverlay, &p, &r)) {
+        hitWas = false;
+        return;
+    }
+    float u = r.vUVs.v[0], v = r.vUVs.v[1];
+    if (!vr::control::g_cinemaLaserFlipY) v = 1.0f - v;  // OpenVR: UV con origine in basso a sinistra (da provare)
+    if (!(u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) || !g_cinemaTexW || !g_cinemaTexH) return;
+    UINT top = g_cropTop, bottom = g_cropBottom;
+    if (vr::control::g_cinemaLaserFullUv || bottom <= top || bottom > g_cinemaTexH) {
+        top = 0;
+        bottom = g_cinemaTexH;
+    }
+    float texX = u * g_cinemaTexW, texY = top + v * (bottom - top);
+    RECT rc;
+    if (!GetClientRect(h, &rc) || rc.right <= rc.left || rc.bottom <= rc.top) return;
+    POINT pt = {static_cast<LONG>(texX / g_cinemaTexW * (rc.right - rc.left)),
+                static_cast<LONG>(texY / g_cinemaTexH * (rc.bottom - rc.top))};
+    ClientToScreen(h, &pt);
+    SetCursorPos(pt.x, pt.y);
+    bool trigger = vr::control::g_rightTriggerHeld;
+    bool edge = trigger != triggerWas;
+    if (edge) {
+        INPUT in = {};
+        in.type = INPUT_MOUSE;
+        in.mi.dwFlags = trigger ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        SendInput(1, &in, sizeof(in));
+    }
+    triggerWas = trigger;
+    if ((!hitWas || edge) && logged < 6) {
+        ++logged;
+        char b[200];
+        std::snprintf(b, sizeof(b), "LASER: screen hit uv=(%.3f, %.3f) rows %u-%u -> client (%ld, %ld) of %ldx%ld%s", u,
+                      r.vUVs.v[1], top, bottom, pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top,
+                      edge ? (trigger ? " click down" : " click up") : "");
+        vr::log::Line(b);
+    }
+    hitWas = true;
 }
 
 // Mostra lo schermo davanti alla direzione in cui guarda il giocatore
@@ -955,6 +1024,8 @@ void WorkerLoop() {
             g_cropSession = false;
         }
         vr::toast::Tick();  // avvisi nel visore (R-U1)
+        vr::wrist::Tick();  // HUD al polso (R-U3)
+        CinemaLaserTick(cinema);  // laser sui menu del gioco (R-U5)
         vr::menu::Tick(cinema);  // menu del mod: eventi del puntatore a ogni frame (dal thread della sessione erano ogni 0,5 s)
         if (!tex[0] || !tex[1]) {
             endBusy();

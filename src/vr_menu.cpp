@@ -39,6 +39,10 @@ struct Item {
 std::vector<Item> BasicItems() {
     return {
         {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: everything mirrors.", Kind::Choice, {"right", "left"}},
+        {"mirrorbody", "Mirrored body", "Walker's body mirrored so the gun is in his left hand (auto = with the left dominant hand).", Kind::Choice, {"auto", "on", "off"}},
+        {"cinemalaser", "Laser on the screen", "Point the gun controller at the virtual screen to move the game's cursor on its menus; trigger = click.", Kind::OnOff},
+        {"wristhud", "Wrist HUD", "Ammo, weapon and health on the support-hand wrist, like a watch.", Kind::OnOff},
+        {"commandaim", "Squad orders aim", "Who the squad order targets while the squad button is held: along the gun barrel, the centre of the view (game), or where the support hand points.", Kind::Choice, {"gun", "head", "support"}},
         {"height", "Standing height", "auto = your real height measured while playing; hold both sticks 3 s to set it.", Kind::Choice, {"auto", "fixed"}},
         {"snapturn", "Turning", "0 = smooth turning with the right stick, 30/45 = snap turns in degrees.", Kind::Choice, {"0", "30", "45"}},
         {"vignette", "Comfort vignette", "Darkens the edges while moving: 0 off, 0.5 light, 1 strong.", Kind::Choice, {"0", "0.5", "1"}},
@@ -50,7 +54,7 @@ std::vector<Item> BasicItems() {
         {"laser", "Laser beam", "A visible beam from the barrel to the point of impact.", Kind::OnOff},
         {"spread", "Bullet spread", "on = the game's spread scaled by stance; off = laser-straight shots.", Kind::OnOff},
         {"roomscale", "Room-scale", "Walker follows your real steps (collisions included).", Kind::OnOff},
-        {"seated", "Seated play", "Eye height from the game's crouch view, for playing seated.", Kind::OnOff},
+        {"seated", "Seated play", "Playing sitting down: the view keeps Walker's standing eye height from where your head is when you recenter.", Kind::OnOff},
         {"hints", "Controller hints", "Short hints in the headset during the first sessions.", Kind::Choice, {"auto", "on", "off"}},
         {"vrmenu", "This menu at start", "Open this menu on the game's main menu at every start.", Kind::Choice, {"on", "off"}},
     };

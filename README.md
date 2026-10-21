@@ -18,6 +18,9 @@ virtual cinema screen.
   Walker walks with you. Your real height sets the eye height (seated mode
   available). The game's recoil, camera shakes and crouching never move your
   view; cuts, checkpoints and death fade from black.
+- **Wrist HUD and laser**: ammo, weapon and health on your support-hand
+  wrist like a watch (`wristhud`); on the virtual screen the gun controller
+  is a laser pointer for the game's menus, trigger to click (`cinemalaser`).
 - **First person** with Walker's body: his arms follow your controllers
   (inverse kinematics on the game's own skeleton), the gun stays in his hand,
   and the body turns with you when you turn around (`fpbody off` in

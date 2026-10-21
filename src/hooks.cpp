@@ -4,6 +4,8 @@
 #include "screenshot.h"
 #include "vr_output.h"
 #include "vr_toast.h"
+#include "vr_wrist.h"
+#include "vr_menu.h"
 #include "vr_session.h"
 #include "script_call.h"
 #include "display_spoof.h"
@@ -2887,6 +2889,7 @@ double ProfMs() {
 
 void UpdateFirstPersonBody(void* pawn);
 void UpdateSquadCommandAim(char* cam, void* pawn);
+void PublishWristData(char* cam);
 void InteractionScan(void* pawn);
 void InteractionAffordance();
 extern float g_handWorld[2][3];
@@ -3181,11 +3184,12 @@ public:
         char* cam = static_cast<char*>(g_cameraPtr.load());
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
-        UpdateFirstPersonBody(vr::control::g_fpBody && !vr::control::g_seated && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // da seduti il corpo (in piedi) si vedeva deforme: solo braccia (21/10)
+        UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // da seduti il corpo (in piedi) si vedeva deforme: solo braccia (21/10)
         UpdateProjectileLog();
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        PublishWristData(cam);
         InteractionScan(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // fase 0 (interactlog)
         InteractionAffordance();                                                             // fase 1 (prossimita')
         if (vr::control::g_visCheck) VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
@@ -4227,7 +4231,14 @@ void UpdateHeadTracking() {
         lastRefT = nowR;
         bool spike = lastY != 0.0f && pos[1] - lastY > 0.10f;
         lastY = pos[1];
-        if (pos[1] > posRef[1] && !spike) posRef[1] = pos[1];
+        // Seduti ("seated on"): il riferimento e' l'altezza della testa al
+        // ricentramento, non la massima ne' quella fissa in piedi. Prima con
+        // "height 1.55" e la testa seduta a 1,2 m la vista scendeva di 35 cm
+        // sotto gli occhi di Walker e il corpo con lei (gambe nel pavimento,
+        // braccia stirate verso i controller: "nano deforme", 21/10).
+        bool seated = vr::control::g_seated;
+        if (seated) {
+        } else if (pos[1] > posRef[1] && !spike) posRef[1] = pos[1];
         else if (pos[1] < posRef[1] && posRef[1] - pos[1] < 0.15f && dtR > 0.0f && dtR < 0.5f)
             posRef[1] = (std::max)(pos[1], posRef[1] - 0.01f * dtR);
         // Calibrazione (entrambi gli stick 3 s, in piedi): l'altezza di adesso
@@ -4242,7 +4253,7 @@ void UpdateHeadTracking() {
             vr::log::Line(std::string("HEIGHT: standing height set to ") + v + " m from the controllers and saved.");
         }
         float fixedM = vr::control::g_heightFixedM.load();
-        if (fixedM > 0.0f) posRef[1] = fixedM;
+        if (fixedM > 0.0f && !seated) posRef[1] = fixedM;
     }
     // Il corpo segue la testa: l'eccesso oltre la soglia passa dalla testa al
     // corpo (rotazione del PlayerController) e il riferimento si sposta della
@@ -4512,6 +4523,8 @@ void UpdateHeadTracking() {
         vr::TrackedDeviceIndex_t ri = vrsys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
         if (ri != vr::k_unTrackedDeviceIndexInvalid && ri < vr::k_unMaxTrackedDeviceCount && handPoses[ri].bPoseIsValid) {
             const vr::HmdMatrix34_t& c = handPoses[ri].mDeviceToAbsoluteTracking;
+            for (int i = 0; i < 12; ++i) vr::control::g_gunCtrlPose[i] = c.m[i / 4][i % 4];  // laser sullo schermo virtuale
+            vr::control::g_gunCtrlPoseValid = true;
             if (vr::control::g_stockCalibRequest.exchange(false)) {
                 // Calcio in posizione di mira, bersaglio lontano guardato al
                 // centro della vista: la direzione vera di mira e' quella della
@@ -5694,6 +5707,37 @@ void* g_fpHeadMesh = nullptr;
 uint32_t g_fpPawnCls = 0, g_fpHeadMeshCls = 0;
 float g_fpSavedCylinders[8];
 float g_fpSavedMeshX = 0.0f, g_fpSavedMeshY = 0.0f, g_fpSavedMeshZ = 0.0f;
+// Corpo specchiato per i mancini ("mirrorbody", auto con "hand left"): Scale3D
+// della mesh (PrimitiveComponent +0x1DC) a -1 sull'asse laterale della mesh
+// (Rotation +0x1CC: con yaw +-90 l'asse laterale e' la X locale, altrimenti
+// la Y). Il braccio destro di Walker, quello con l'arma, appare a sinistra e
+// va al controller sinistro senza incrociare le braccia; la mano destra
+// specchiata e' una mano sinistra. I bersagli IK restano in spazio attore:
+// la trasformazione specchiata della mesh li riporta al posto giusto.
+constexpr uintptr_t kOffMeshRotationYaw = 0x1D0, kOffMeshScale3D = 0x1DC;
+float g_fpSavedScale3D[3] = {1.0f, 1.0f, 1.0f};
+bool g_fpMirrored = false;
+bool MirrorBodyWanted() {
+    int m = vr::control::g_mirrorBody.load();
+    return m == 1 || (m == 2 && vr::control::g_leftHanded);
+}
+void ApplyBodyMirror(void* mesh, bool mirror) {
+    float s[3] = {g_fpSavedScale3D[0], g_fpSavedScale3D[1], g_fpSavedScale3D[2]};
+    if (mirror) {
+        int32_t yaw = 0;
+        SafeCopy(&yaw, static_cast<char*>(mesh) + kOffMeshRotationYaw, 4);
+        int axis = (std::abs(((yaw % 65536) + 65536) % 65536 - 32768) < 8192) || std::abs(((yaw % 65536) + 65536) % 65536) < 8192 ? 1 : 0;
+        s[axis] = -std::fabs(s[axis]);
+        if (!g_fpMirrored)
+            vr::log::Line("BODY: Walker mirrored (left-handed), mesh yaw " + std::to_string(yaw) + ", axis " + (axis ? "Y" : "X") +
+                          ", game Scale3D (" + std::to_string(g_fpSavedScale3D[0]) + ", " + std::to_string(g_fpSavedScale3D[1]) + ", " +
+                          std::to_string(g_fpSavedScale3D[2]) + ").");
+    } else if (g_fpMirrored) {
+        vr::log::Line("BODY: Walker mirror removed.");
+    }
+    g_fpMirrored = mirror;
+    SafeCopy(static_cast<char*>(mesh) + kOffMeshScale3D, s, 12);
+}
 
 bool SetCylinders(void* pawn, const float* v) { return SafeCopy(static_cast<char*>(pawn) + kOffPawnInvisCylinders, v, 32); }
 
@@ -5742,6 +5786,7 @@ void UpdateFirstPersonBody(void* pawn) {
             SetHeadHidden(g_fpHeadMesh, false);
             float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
             SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xyz, 12);
+            if (g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, false);
         }
         g_fpPawn = nullptr;
         g_fpHeadMesh = nullptr;
@@ -5760,7 +5805,11 @@ void UpdateFirstPersonBody(void* pawn) {
         if (g_fpHeadMesh) {
             float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
             SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xyz, 12);
+            if (g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, false);
         }
+        SafeCopy(g_fpSavedScale3D, reinterpret_cast<char*>(mesh) + kOffMeshScale3D, 12);
+        for (float& v : g_fpSavedScale3D) v = std::fabs(v) > 0.01f ? std::fabs(v) : 1.0f;
+        g_fpMirrored = false;
         SafeCopy(&g_fpSavedMeshX, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX, 4);
         SafeCopy(&g_fpSavedMeshY, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX + 4, 4);
         SafeCopy(&g_fpSavedMeshZ, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX + 8, 4);
@@ -5843,6 +5892,8 @@ void UpdateFirstPersonBody(void* pawn) {
             if (headDrop < 0.0f) z += headDrop;
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX + 8, &z, 4);
+        bool mirror = MirrorBodyWanted();
+        if (mirror != g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, mirror);
     }
 }
 
@@ -6342,6 +6393,13 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
                        g_leftRoll.load(), lPos, lAxes);
             for (int i = 0; i < 3; ++i) g_handWorld[1][i] = lPos[i];
             g_handWorldValid[1] = true;
+            {
+                // Direzione in cui punta la mano di supporto (ordini alla squadra, "commandaim support").
+                float sf[3], sr[3], su[3];
+                RotatorToAxes(g_bodyPitch.load() + g_leftPitch.load(), g_bodyYaw.load() + g_leftYaw.load(), g_leftRoll.load(), sf, sr, su);
+                for (int i = 0; i < 3; ++i) vr::control::g_supportFwd[i] = sf[i];
+                vr::control::g_supportFwdValid = true;
+            }
         }
         // Relazione della presa fissata per arma: si accetta quando resta
         // ferma 0,3 s e poi segue solo variazioni piccole (3 unita'). Le
@@ -7680,6 +7738,16 @@ std::vector<void*> CheapShooters() {
     return cache;
 }
 
+// Dati per l'HUD al polso (R-U3): solo in gioco, in prima persona, Walker vivo.
+void PublishWristData(char* cam) {
+    void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
+    bool show = pawn && vr::control::g_firstPerson && !vr::control::g_cinemaActive && !vr::control::g_gamePaused &&
+                !vr::menu::IsOpen() && PawnAlive(pawn);
+    int32_t health = -1;
+    if (pawn) TrySafeReadUint32(static_cast<char*>(pawn) + 0x304, reinterpret_cast<uint32_t*>(&health));
+    vr::wrist::SetData(show, vr::control::g_weaponAmmo[1].load(), vr::control::g_weaponAmmo[0].load(), health, g_weaponInfo.cls);
+}
+
 void UpdateSquadCommandAim(char* cam, void* pawn) {
     static void* lastPick = nullptr;
     static uint32_t lastPickCls = 0;  // classe al momento della scelta (oggetto ancora valido?)
@@ -7711,7 +7779,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     }
     // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
-    if (!vr::control::g_commandFollowsGun || !pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
+    if (vr::control::g_commandAimMode == 0 || !pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
         lastPick = nullptr;
         return;
     }
@@ -7720,13 +7788,20 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // controlla dagli occhi, come fa il gioco: la canna all'altezza del fianco
     // dietro una copertura "vede" solo la copertura.
     float bo[3], bd[3];
-    if (!g_muzzleAimValid) return;
-    std::memcpy(bo, cam + 0x10, sizeof(bo));
-    float dl = std::sqrt((g_muzzleTarget[0] - bo[0]) * (g_muzzleTarget[0] - bo[0]) +
-                         (g_muzzleTarget[1] - bo[1]) * (g_muzzleTarget[1] - bo[1]) +
-                         (g_muzzleTarget[2] - bo[2]) * (g_muzzleTarget[2] - bo[2]));
-    if (dl < 1.0f) return;
-    for (int i = 0; i < 3; ++i) bd[i] = (g_muzzleTarget[i] - bo[i]) / dl;
+    if (vr::control::g_commandAimMode == 2 && vr::control::g_supportFwdValid && g_handWorldValid[1]) {
+        // Mano di supporto che punta (fase 4, E8): raggio dalla mano lungo la
+        // sua direzione; la visibilita' resta controllata dagli occhi sotto.
+        std::memcpy(bo, g_handWorld[1], sizeof(bo));
+        for (int i = 0; i < 3; ++i) bd[i] = vr::control::g_supportFwd[i].load();
+    } else {
+        if (!g_muzzleAimValid) return;
+        std::memcpy(bo, cam + 0x10, sizeof(bo));
+        float dl = std::sqrt((g_muzzleTarget[0] - bo[0]) * (g_muzzleTarget[0] - bo[0]) +
+                             (g_muzzleTarget[1] - bo[1]) * (g_muzzleTarget[1] - bo[1]) +
+                             (g_muzzleTarget[2] - bo[2]) * (g_muzzleTarget[2] - bo[2]));
+        if (dl < 1.0f) return;
+        for (int i = 0; i < 3; ++i) bd[i] = (g_muzzleTarget[i] - bo[i]) / dl;
+    }
     uint32_t worldInfo = 0, p = 0;
     if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo ||
         !TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + kOffWorldInfoPawnList, &p))

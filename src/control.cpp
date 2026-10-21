@@ -72,6 +72,15 @@ std::atomic<bool> g_vrDashboard{false};
 std::atomic<bool> g_vsDiag{false};
 std::atomic<bool> g_fades{true};
 std::atomic<bool> g_leftHanded{false};
+std::atomic<int> g_mirrorBody{0};  // sperimentale: spento (vedi TECHNICAL.md)
+std::atomic<bool> g_cinemaLaser{true}, g_cinemaLaserFlipY{false}, g_cinemaLaserFullUv{false};
+std::atomic<float> g_gunCtrlPose[12];
+std::atomic<bool> g_gunCtrlPoseValid{false};
+std::atomic<bool> g_wristHud{true};
+std::atomic<float> g_wristHudWidthM{0.09f};
+std::atomic<int> g_commandAimMode{1};
+std::atomic<float> g_supportFwd[3];
+std::atomic<bool> g_supportFwdValid{false};
 std::atomic<bool> g_cinemaRecenter{false};
 std::atomic<float> g_forcedMotion{0.0f};
 std::atomic<bool> g_heightAuto{true};
@@ -430,6 +439,24 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_leftHanded = (v == "left");
+    } else if (cmd == "mirrorbody") {
+        std::string v;
+        in >> v;
+        g_mirrorBody = v == "on" ? 1 : (v == "off" ? 0 : 2);
+    } else if (cmd == "cinemalaser") {
+        // cinemalaser on|off | flipy on|off | uv band|full
+        std::string v, w;
+        in >> v >> w;
+        if (v == "flipy") g_cinemaLaserFlipY = (w == "on");
+        else if (v == "uv") g_cinemaLaserFullUv = (w == "full");
+        else g_cinemaLaser = OnOff(cmd, v, true);
+    } else if (cmd == "wristhud") {
+        // wristhud on|off [larghezza m]
+        std::string v;
+        float w = 0.0f;
+        in >> v >> w;
+        g_wristHud = OnOff(cmd, v, true);
+        if (w >= 0.04f && w <= 0.3f) g_wristHudWidthM = w;
     } else if (cmd == "headsample") {
         std::string v;
         in >> v;
@@ -1015,9 +1042,11 @@ void ExecuteNormalized(const std::string& line) {
         in >> v;
         g_turnWithHeadDeg = v < 0.0f ? 0.0f : (v > 170.0f ? 170.0f : v);
     } else if (cmd == "commandaim") {
+        // commandaim gun | head | support (la mano di supporto punta il bersaglio)
         std::string v;
         in >> v;
         g_commandFollowsGun = (v != "head");
+        g_commandAimMode = v == "head" ? 0 : (v == "support" ? 2 : 1);
     } else if (cmd == "handpredict") {
         // handpredict <ms> | auto (= stessa predizione della testa)
         std::string t;

@@ -262,6 +262,20 @@ extern std::atomic<bool> g_fades;
 // Mancini ("hand left"): i ruoli dei controller si scambiano (il sinistro
 // regge l'arma e ha grilletto/tasti della mano dell'arma).
 extern std::atomic<bool> g_leftHanded;
+extern std::atomic<int> g_mirrorBody;  // corpo di Walker specchiato: 0 off, 1 on, 2 auto (= con hand left)
+// Laser sullo schermo virtuale (R-U5): il controller dell'arma muove il cursore
+// del gioco sui menu, il grilletto clicca. flipy/full: convenzioni UV da provare.
+extern std::atomic<bool> g_cinemaLaser, g_cinemaLaserFlipY, g_cinemaLaserFullUv;
+// Posa del controller dell'arma (spazio standing di OpenVR, corretta), per il laser.
+extern std::atomic<float> g_gunCtrlPose[12];
+extern std::atomic<bool> g_gunCtrlPoseValid;
+// HUD al polso (R-U3).
+extern std::atomic<bool> g_wristHud;
+extern std::atomic<float> g_wristHudWidthM;
+// Ordini alla squadra: 0 testa (gioco), 1 canna, 2 mano di supporto che punta.
+extern std::atomic<int> g_commandAimMode;
+extern std::atomic<float> g_supportFwd[3];  // direzione della mano di supporto nel mondo
+extern std::atomic<bool> g_supportFwdValid;
 inline vr::ETrackedControllerRole GunRole() {
     return g_leftHanded ? vr::TrackedControllerRole_LeftHand : vr::TrackedControllerRole_RightHand;
 }

@@ -744,12 +744,40 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   zipline / turret: haptic tick near the grab point and `grabuse`; both
   sticks 3 s for the standing height; `submitpose on` (R-C1); left-handed
   play (`hand left`: lateral offsets mirrored, haptics swapped).
+- **R-U3 wrist HUD (21/10):** `src/vr_wrist.cpp`, overlay `specopsvr.wrist`
+  attached to the support-hand controller (11 cm towards the forearm, facing
+  the controller's +Y, 9 cm wide, `wristhud on|off [m]`): magazine / reserve
+  (`g_weaponAmmo`), weapon short name, health (`Pawn.Health` +0x304).
+  Data published once per tick by `PublishWristData` (only in first person,
+  gameplay, Walker alive, no menu); redrawn (GDI) only when a value changes.
+  The game's own ammo widget is not hidden (the `DrawTile` hook filtered by
+  the calling script function was judged too fragile; `hud` scale remains).
+- **R-U5 laser on the game menus (21/10):** `CinemaLaserTick` in the output
+  worker: the gun controller's pose (standing space, stored by the HMD tick
+  in `g_gunCtrlPose`) gives a ray that `ComputeOverlayIntersection` tests
+  against the cinema overlay; the UV is mapped through the shown crop rows
+  to the game window's client area and the Windows cursor is moved there
+  (the UIScene menus follow the cursor and draw their own); trigger edges
+  send left clicks with `SendInput`. No SteamVR input focus on the overlay,
+  so the controller buttons keep reaching the game. `cinemalaser flipy on`
+  and `cinemalaser uv full` are the two UV conventions to try if the cursor
+  lands in the wrong place (`LASER:` lines log the first hits). The in-VR
+  quick menu part of R-U5 is the settings menu (`vrmenu`).
+- **Interaction stages 3-4 (21/10):** stage 3 was already covered: B of the
+  punch gesture held back one poll (M3), candidates within 60 degrees of the
+  gaze with `IsBeingExecutedOrRevived`, body turned only by the needed angle,
+  impact haptic on the execution special moves; the rifle-butt jab exists as
+  the opt-in gun melee. Stage 4: `commandaim support` targets the squad
+  order along the support hand's pointing direction (`g_supportFwd`, from
+  the left controller's rotation) while the squad button is held; pick-ups
+  go through the interaction scan (`Pickup` classes) and `grabuse`.
 - **Not done, with the reason:** R-I2 extra controller profiles (Pico,
   Focus 3, Pimax) need the SteamVR `controller_type` strings from a log of
-  those headsets; R-U3 wrist HUD and R-U5 quick menu/laser are larger UI
-  projects left for a later milestone; stages 3-4 of the interaction plan
-  (gaze-chosen executions, pick-ups, QTE gestures) depend on playtests of
-  stages 0-2.
+  those headsets; the downward-strike gesture (A3) is skipped after today's
+  false positives with the gun melee (the forward punch already triggers
+  executions); QTE / moral-choice gestures (E9/E10) and the per-move policy
+  table need per-scene playtests and R-T3 (special-move names), both left
+  for a later milestone; hiding the game's ammo widget (part of R-U3) see above.
 - **Game menus on the virtual screen (21/10):** fixed in the end by running
   `UpdateAutoResolution` on the virtual screen too (the per-eye `setres`
   right when the Scene starts re-lays out the viewport; before, with the
@@ -780,6 +808,22 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   the virtual screen too, so the `setres` happens at once. A `dumpcam`-style
   `shot`/`burst` of the back buffer (`specopsvr_shots/*.bmp`) is the way to
   see what the game draws; the mirror window shows the same back buffer.
+- **Seated play (21/10):** with `seated on` the vertical reference is the
+  head height at the recenter, never the standing maximum nor the fixed
+  `height`; the Scene start (headset put on) requests a silent recenter so
+  the reference is taken with the headset worn. Before, with `height 1.55`
+  and the head seated at 1.2 m, the view sat 35 cm under Walker's eyes and
+  the body followed it into the floor ("deformed dwarf").
+- **Left-handed body (21/10, open):** with `hand left` the mod drives
+  Walker's right arm (the gun arm) to the physical left controller, so the
+  arms cross. `mirrorbody` (experimental, off) mirrors the mesh
+  (`Scale3D` +0x1DC, lateral axis from the mesh yaw at +0x1D0, Walker's is
+  0 → Y): the mesh renders mirrored, but the hand/weapon relation measured
+  from the (reflected) bone matrices becomes garbage every frame and the
+  hands fly away (headless shots `shots/mirror_*.png`). To finish it: freeze
+  the relation measured unmirrored, mirror the actor-space effector/joint
+  (Y → -Y) and the rotation frame (f, -r, u mirrored) in `WriteHand`, and
+  review every other bone-based measurement (support grip, barrel, magazine).
 - **Automatic recenters (21/10):** Virtual Desktop sends
   `ChaperoneUniverseHasChanged` / zero-pose-reset events in bursts; they are
   now debounced to one per 10 s and silent (no toast, no blink;

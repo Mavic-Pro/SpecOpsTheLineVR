@@ -272,6 +272,8 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
+HWND GameWindow() { return g_gameWindow; }
+
 // 20/10: con "wndinfo" si e' visto che poco dopo l'avvio il gioco installa
 // una sua procedura (0x00F59DF0) al posto della nostra e non la richiama piu'
 // (10 messaggi ricevuti in tutto): keepfocus, WM_GETMINMAXINFO e il ripristino

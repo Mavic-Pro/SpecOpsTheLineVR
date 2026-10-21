@@ -78,6 +78,13 @@ bool InitAs(vr::EVRApplicationType type) {
     g_scene = (type == vr::VRApplication_Scene);
     vr::log::Line(std::string("OpenVR initialised as ") + TypeName(type) + ".");
     if (g_reconnectPending.exchange(false)) vr::toast::Notify("SteamVR reconnected");
+    if (g_scene) {
+        // Visore appena indossato: direzione e altezza di riferimento da qui
+        // (seduti il riferimento verticale e' questa altezza; prima restava la
+        // posa del visore appoggiato, 1,0 m, 21/10). Silenzioso.
+        vr::control::g_recenterSilent = true;
+        vr::control::g_recenterRequested = true;
+    }
     return true;
 }
 
