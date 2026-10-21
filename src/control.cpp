@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "pure_utils.h"
 #include "vr_toast.h"
+#include "vr_menu.h"
 #include "vr_input.h"
 #include "haptics_ext.h"
 #include "display_spoof.h"
@@ -89,6 +90,11 @@ std::atomic<bool> g_interactZone[2]{false, false};
 std::atomic<bool> g_grabUse{true};
 std::atomic<bool> g_ham{false};
 std::atomic<bool> g_cinema3d{false};
+std::atomic<float> g_spreadAds{0.1f}, g_spreadTwoHand{0.5f}, g_spreadOneHand{1.5f};
+std::atomic<bool> g_laser{false};
+std::atomic<int> g_vrMenu{1};
+std::atomic<bool> g_vrMenuOpen{false};
+std::atomic<bool> g_vdDetected{false};
 std::atomic<bool> g_waitBeforeSubmit{true};
 std::atomic<unsigned long long> g_interactSimUntil[2]{0, 0};
 std::atomic<int> g_hintsShown{0};
@@ -142,7 +148,7 @@ std::atomic<bool> g_aimHand{true};
 std::atomic<float> g_aimPitchOffsetDeg{0.0f};
 std::atomic<float> g_synthAimYawDeg{0.0f};
 std::atomic<float> g_synthAimPitchDeg{0.0f};
-std::atomic<bool> g_aimMarker{true};
+std::atomic<bool> g_aimMarker{false};  // mirino verde: spento di default dal 21/10 (mirini veri; "laser on" in alternativa)
 std::atomic<bool> g_headCollision{true};
 std::atomic<float> g_snapTurnDeg{0.0f};
 std::atomic<bool> g_stickPitch{false};
@@ -341,6 +347,17 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_waitBeforeSubmit = OnOff(cmd, v, true);
+    } else if (cmd == "vrmenu") {
+        // vrmenu on|off (all'avvio) | show | hide
+        std::string v;
+        in >> v;
+        if (v == "show") vr::menu::Show(true);
+        else if (v == "hide") vr::menu::Show(false);
+        else g_vrMenu = OnOff(cmd, v, true) ? 1 : 0;
+    } else if (cmd == "laser") {
+        std::string v;
+        in >> v;
+        g_laser = OnOff(cmd, v, false);
     } else if (cmd == "cinema3d") {
         std::string v;
         in >> v;
@@ -627,6 +644,15 @@ void ExecuteNormalized(const std::string& line) {
                 vr::log::Line("CONFIG: spread " + v + " ignored (on, off or 0..2).");
                 s = g_spreadScale.load();
             }
+        }
+        // Fattori per postura dopo il valore: spread on <scala> <ads> <due mani> <una mano>
+        {
+            float sc = -1.0f, ads = -1.0f, two = -1.0f, one = -1.0f;
+            in >> sc >> ads >> two >> one;
+            if (sc >= 0.0f && sc <= 2.0f && (v == "on" || v == "1" || v == "true" || v == "yes")) s = sc;
+            if (ads >= 0.0f && ads <= 2.0f) g_spreadAds = ads;
+            if (two >= 0.0f && two <= 2.0f) g_spreadTwoHand = two;
+            if (one >= 0.0f && one <= 3.0f) g_spreadOneHand = one;
         }
         g_spreadScale = s;
         g_spread = s > 0.0f;
@@ -1108,14 +1134,15 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // in basso col corpo avanti si vedeva l'interno del colletto).
 // 5 (0.9.7): "hud 0.6 150" -> "hud 0.5 100" (angoli dell'HUD fuori dalla zona nitida delle lenti, HUD a 3 m
 // davanti a ripari a 30 cm; audit 19/10).
-constexpr int kConfigVersion = 5;
+constexpr int kConfigVersion = 6;
 
 void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
     // Ogni cambio vale solo per gli ini piu' vecchi della sua versione: chi era
     // gia' alla 2 e aveva rimesso a mano "submitpose on" non viene toccato.
     static const vr::pure::ConfigChange kChanges[] = {
         {2, "submitpose on", "submitpose off"}, {2, "predict off", "predict auto"}, {3, "bodyback 6 10", "bodyback -10 26"},
-        {4, "bodyback -10 10", "bodyback -10 26"}, {5, "hud 0.6 150", "hud 0.5 100"}};
+        {4, "bodyback -10 10", "bodyback -10 26"}, {5, "hud 0.6 150", "hud 0.5 100"},
+        {6, "marker on", "marker off"}};  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
     std::string done;
     if (!vr::pure::MigrateConfigLines(lines, kConfigVersion, kChanges, sizeof(kChanges) / sizeof(kChanges[0]), &done))
         return;
@@ -1248,5 +1275,7 @@ bool TakeScreenshotRequest(std::string* outPath) {
     g_shots.pop_front();
     return true;
 }
+
+void ExecuteLine(const std::string& raw) { Execute(raw); }
 
 }  // namespace vr::control

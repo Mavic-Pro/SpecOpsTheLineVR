@@ -721,6 +721,8 @@ struct FrameTag {
     // fine UpdateAimMarker, prima del Present di questo occhio).
     bool markerSet = false, markerVis = false, targetVis = false;
     float markerNdc[2] = {0, 0}, targetNdc[2] = {0, 0};
+    bool laserVis = false;           // raggio dalla canna (laser on)
+    float laserNdc[2] = {0, 0};      // partenza del raggio (la fine e' il mirino)
     bool scope = false;  // cannocchiale attivo in questo disegno (L4: la maschera seguiva con un frame di ritardo)
 };
 std::mutex g_frameTagMutex;
@@ -856,6 +858,8 @@ void LogStats();
 // Indicatore di mira: NDC per occhio (thread di gioco -> Present).
 std::atomic<float> g_markerNdc[2][2];
 std::atomic<bool> g_markerVisible[2];
+std::atomic<float> g_laserNdc[2][2];   // partenza del raggio per occhio (laser on)
+std::atomic<bool> g_laserVisible[2];
 std::atomic<bool> g_markerFrameValid{false};
 void DrawAimMarker(IDirect3DDevice9* dev, int eye);
 // Bersaglio del comando alla squadra (tasto squadra tenuto): posizione nel
@@ -869,8 +873,8 @@ std::atomic<bool> g_targetVisible[2];
 // avere gia' riscritto per il tick seguente: un occhio mostrava il mirino di
 // un altro frame e muovendosi lo si vedeva doppio (19/10).
 struct PresentMarker {
-    bool vis = false, targetVis = false;
-    float ndc[2] = {0, 0}, targetNdc[2] = {0, 0};
+    bool vis = false, targetVis = false, laserVis = false;
+    float ndc[2] = {0, 0}, targetNdc[2] = {0, 0}, laserNdc[2] = {0, 0};
 };
 PresentMarker g_presentMarker;
 std::atomic<uint32_t> g_markerFromTag{0}, g_markerFromGlobals{0};
@@ -891,9 +895,11 @@ void PresentMarkerFromGlobals(int eye) {
     int e = eye == 1 ? 1 : 0;
     g_presentMarker.vis = g_markerVisible[e];
     g_presentMarker.targetVis = g_targetVisible[e];
+    g_presentMarker.laserVis = g_laserVisible[e];
     for (int i = 0; i < 2; ++i) {
         g_presentMarker.ndc[i] = g_markerNdc[e][i];
         g_presentMarker.targetNdc[i] = g_targetNdc[e][i];
+        g_presentMarker.laserNdc[i] = g_laserNdc[e][i];
     }
 }
 
@@ -986,9 +992,11 @@ HRESULT WINAPI Hooked_Present(
                 g_markerFromTag.fetch_add(1, std::memory_order_relaxed);
                 g_presentMarker.vis = tag.markerVis;
                 g_presentMarker.targetVis = tag.targetVis;
+                g_presentMarker.laserVis = tag.laserVis;
                 for (int i = 0; i < 2; ++i) {
                     g_presentMarker.ndc[i] = tag.markerNdc[i];
                     g_presentMarker.targetNdc[i] = tag.targetNdc[i];
+                    g_presentMarker.laserNdc[i] = tag.laserNdc[i];
                 }
                 g_presentScope = tag.scope;
             } else {
@@ -1277,6 +1285,56 @@ void DrawTargetBox(IDirect3DDevice9* dev, IDirect3DSurface9* bb, const D3DSURFAC
     }
 }
 
+// Raggio laser (laser on): segmento dalla partenza (25 unita' davanti alla
+// canna) al punto d'impatto (il mirino), fatto di quadratini con Clear come il
+// mirino: 0,08 gradi di spessore, rosso con bordo scuro.
+void DrawLaser(IDirect3DDevice9* dev, IDirect3DSurface9* bb, const D3DSURFACE_DESC& d) {
+    if (!g_presentMarker.laserVis) return;
+    float pk = g_presentPercent / 100.0f;
+    auto px = [&](const float* ndc, LONG* cx, LONG* cy) {
+        *cx = static_cast<LONG>((ndc[0] * 0.5f * pk + 0.5f) * d.Width);
+        *cy = static_cast<LONG>((0.5f - ndc[1] * 0.5f * pk) * d.Height);
+    };
+    LONG x0, y0, x1, y1;
+    px(g_presentMarker.laserNdc, &x0, &y0);
+    px(g_presentMarker.ndc, &x1, &y1);
+    if (std::fabs(g_presentMarker.ndc[0]) > 1.5f || std::fabs(g_presentMarker.ndc[1]) > 1.5f) return;
+    float ppd = PixelsPerDegree(d, pk);
+    LONG th = (std::max)(2L, static_cast<LONG>(0.08f * ppd + 0.5f));
+    float len = std::sqrt(static_cast<float>((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)));
+    int n = static_cast<int>(len / (th * 0.8f)) + 1;
+    if (n > 400) n = 400;
+    IDirect3DSurface9* oldRt = nullptr;
+    dev->GetRenderTarget(0, &oldRt);
+    D3DVIEWPORT9 oldVp;
+    dev->GetViewport(&oldVp);
+    DWORD scissor = FALSE;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissor);
+    dev->SetRenderTarget(0, bb);
+    D3DVIEWPORT9 vp = {0, 0, d.Width, d.Height, 0.0f, 1.0f};
+    dev->SetViewport(&vp);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    static D3DRECT r[400];
+    auto draw = [&](LONG grow, D3DCOLOR color) {
+        DWORD cnt = 0;
+        for (int i = 0; i < n; ++i) {
+            float t = n > 1 ? static_cast<float>(i) / (n - 1) : 0.0f;
+            LONG cx = x0 + static_cast<LONG>((x1 - x0) * t), cy = y0 + static_cast<LONG>((y1 - y0) * t);
+            if (cx < -th || cy < -th || cx > static_cast<LONG>(d.Width) + th || cy > static_cast<LONG>(d.Height) + th) continue;
+            r[cnt++] = {cx - th / 2 - grow, cy - th / 2 - grow, cx + th / 2 + 1 + grow, cy + th / 2 + 1 + grow};
+        }
+        if (cnt) dev->Clear(cnt, r, D3DCLEAR_TARGET, color, 1.0f, 0);
+    };
+    draw(1, D3DCOLOR_XRGB(40, 0, 0));
+    draw(0, D3DCOLOR_XRGB(255, 50, 40));
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, scissor);
+    dev->SetViewport(&oldVp);
+    if (oldRt) {
+        dev->SetRenderTarget(0, oldRt);
+        oldRt->Release();
+    }
+}
+
 void DrawAimMarker(IDirect3DDevice9* dev, int eye) {
     IDirect3DSurface9* bb = nullptr;
     if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
@@ -1287,6 +1345,7 @@ void DrawAimMarker(IDirect3DDevice9* dev, int eye) {
     DrawVignette(dev, bb, eye);
     int e = (eye == 1) ? 1 : 0;
     DrawTargetBox(dev, bb, d, e);
+    DrawLaser(dev, bb, d);
     if (!g_presentMarker.vis) {
         bb->Release();
         return;
@@ -7016,9 +7075,11 @@ void StampMarkerOnTag(int eye) {
         it->markerSet = true;
         it->markerVis = g_markerVisible[eye];
         it->targetVis = g_targetVisible[eye];
+        it->laserVis = g_laserVisible[eye];
         for (int i = 0; i < 2; ++i) {
             it->markerNdc[i] = g_markerNdc[eye][i];
             it->targetNdc[i] = g_targetNdc[eye][i];
+            it->laserNdc[i] = g_laserNdc[eye][i];
         }
         break;
     }
@@ -7152,6 +7213,28 @@ void UpdateAimMarkerImpl(const float* aimOrigin, const float* eyeLoc, const int3
     TanToNdc(eye, g_drawOffCenter, x / z, y / z, th, tv, &nx, &ny);
     g_markerNdc[eye][0] = nx;
     g_markerNdc[eye][1] = ny;
+    // Laser: partenza 25 unita' davanti alla canna lungo il raggio (la canna
+    // stessa e' troppo vicina all'occhio per essere proiettata bene).
+    {
+        float dirv[3] = {p[0] - aimOrigin[0], p[1] - aimOrigin[1], p[2] - aimOrigin[2]};
+        float dl = std::sqrt(dirv[0] * dirv[0] + dirv[1] * dirv[1] + dirv[2] * dirv[2]);
+        bool lvis = false;
+        if (dl > 30.0f) {
+            float s0[3] = {aimOrigin[0] + dirv[0] / dl * 25.0f - eyeLoc[0], aimOrigin[1] + dirv[1] / dl * 25.0f - eyeLoc[1],
+                           aimOrigin[2] + dirv[2] / dl * 25.0f - eyeLoc[2]};
+            float z0 = s0[0] * vf[0] + s0[1] * vf[1] + s0[2] * vf[2];
+            if (z0 > 1.0f) {
+                float x0 = s0[0] * vrt[0] + s0[1] * vrt[1] + s0[2] * vrt[2];
+                float y0 = s0[0] * vu[0] + s0[1] * vu[1] + s0[2] * vu[2];
+                float lx, ly;
+                TanToNdc(eye, g_drawOffCenter, x0 / z0, y0 / z0, th, tv, &lx, &ly);
+                g_laserNdc[eye][0] = lx;
+                g_laserNdc[eye][1] = ly;
+                lvis = true;
+            }
+        }
+        g_laserVisible[eye] = lvis && vr::control::g_laser && !vr::control::g_adsActive;
+    }
     // Milkor: le granate fanno una parabola, un mirino in linea retta
     // indicherebbe un punto sbagliato: niente mirino (audit 19/10).
     bool lob = g_weaponInfo.cls.find("Milkor") != std::string::npos;
@@ -7887,16 +7970,18 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
                     float r1[3], u1[3], r2[3], u2[3];
                     DirBasis(nom, r1, u1);
                     DirBasis(bd, r2, u2);
-                    // Postura: due mani 0.6, tacche all'occhio 0.5, arma lunga
-                    // con una mano sola 1.5 (R-W1).
+                    // Postura (R-W1, regolabile: "spread on <scala> <ads> <due mani>
+                    // <una mano>"): tacche all'occhio 0.1 (mirini veri = quasi
+                    // laser, prova nel visore 21/10), due mani 0.5, arma lunga
+                    // con una mano sola 1.5.
                     float k = scale;
-                    if (g_twoHandActive) k *= 0.6f;
-                    if (vr::control::g_adsActive) k *= 0.5f;
+                    if (vr::control::g_adsActive) k *= vr::control::g_spreadAds;
+                    else if (g_twoHandActive) k *= vr::control::g_spreadTwoHand;
                     const std::string& cls = CurrentWeaponInfo(self).cls;
                     bool pistol = cls.find("DesertEagle") != std::string::npos || cls.find("M9A1") != std::string::npos ||
                                   cls.find("Python") != std::string::npos || cls.find("MicroUzi") != std::string::npos ||
                                   cls.find("Pistol") != std::string::npos;
-                    if (!g_twoHandActive && !vr::control::g_adsActive && !pistol) k *= 1.5f;
+                    if (!g_twoHandActive && !vr::control::g_adsActive && !pistol) k *= vr::control::g_spreadOneHand;
                     float b = (act[0] * r1[0] + act[1] * r1[1] + act[2] * r1[2]) * k;
                     float c = (act[0] * u1[0] + act[1] * u1[1] + act[2] * u1[2]) * k;
                     float lat2 = b * b + c * c;

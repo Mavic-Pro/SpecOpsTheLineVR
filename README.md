@@ -23,8 +23,10 @@ virtual cinema screen.
   and the body turns with you when you turn around (`fpbody off` in
   `specopsvr.ini` if you prefer floating hands).
 - **Aim with the gun**: shots, rockets and grenade-launcher rounds leave the
-  barrel of the gun you hold and land on the green marker (verified for every
-  campaign weapon, within 0.15 degrees). Two-handed aiming with the left hand
+  barrel of the gun you hold, with the game's own spread scaled by your
+  stance (sights at the eye = practically none, two hands = half, long gun in
+  one hand = more). Use the weapon's sights; `marker on` adds a green marker
+  where the barrel points, `laser on` a visible beam. Two-handed aiming with the left hand
   on the barrel (within 12 cm of the gun line, `twohand on <cm>` to widen it;
   the log says when it engages). **Aim down the sights** by bringing the gun
   to your eye.

@@ -314,6 +314,14 @@ extern std::atomic<bool> g_grabUse;
 extern std::atomic<bool> g_ham;
 // "cinema3d on|off": schermo virtuale in stereo (due disegni a 0,4 IPD, overlay fianco a fianco; R-C6).
 extern std::atomic<bool> g_cinema3d;
+// Fattori del cono per postura: tacche all'occhio, due mani, arma lunga a una mano ("spread on <scala> <ads> <due> <una>").
+extern std::atomic<float> g_spreadAds, g_spreadTwoHand, g_spreadOneHand;
+// "laser on|off": raggio visibile dalla canna al punto d'impatto (aiuto alla mira alternativo al mirino).
+extern std::atomic<bool> g_laser;
+// Menu nel visore: "vrmenu on|off" (apertura automatica all'avvio), aperto adesso, Virtual Desktop rilevato.
+extern std::atomic<int> g_vrMenu;
+extern std::atomic<bool> g_vrMenuOpen;
+extern std::atomic<bool> g_vdDetected;
 // "waitbeforesubmit on|off": attesa del compositor dopo la copia, subito prima dell'invio (pacing).
 extern std::atomic<bool> g_waitBeforeSubmit;
 extern std::atomic<unsigned long long> g_interactSimUntil[2];  // "interactsim": zona finta fino a (ms)
@@ -402,6 +410,8 @@ extern std::atomic<bool> g_threadLag;
 extern std::atomic<bool> g_poseCorrect;
 // Scrive "chiave valore" in specopsvr.ini (sostituisce la riga o la aggiunge).
 void SaveIniValue(const std::string& key, const std::string& value);
+// Esegue una riga di comando come dall'ini / specopsvr_cmd.txt (menu VR).
+void ExecuteLine(const std::string& raw);
 extern std::atomic<float> g_armRotDeg[3];
 // Allungamento massimo del braccio per raggiungere i controller (1 = nessuno).
 extern std::atomic<float> g_armStretch;

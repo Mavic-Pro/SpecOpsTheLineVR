@@ -1,6 +1,7 @@
 #include "vr_session.h"
 #include "control.h"
 #include "vr_toast.h"
+#include "vr_menu.h"
 #include "logger.h"
 
 #include <windows.h>
@@ -166,6 +167,7 @@ void ConfigureReprojection() {
         if (d[0]) vr::log::Line("VR: SteamVR HMD driver " + d + ".");
     }
     if (vd) {
+        vr::control::g_vdDetected = true;
         vr::log::Line("VR: Virtual Desktop detected. If the game stays at half the headset refresh rate, set "
                       "\"Synchronous Spacewarp\" to Disabled in the Virtual Desktop menu (Streaming tab).");
         vr::toast::Notify("Virtual Desktop: set Synchronous Spacewarp to Disabled (VD menu, Streaming) for full frame rate");
@@ -349,6 +351,7 @@ void MonitorLoop() {
         {
             Shared s;
             quit = !PollEvents();
+            if (!quit) vr::menu::Tick(vr::control::g_cinemaActive);  // menu nel visore (stesso thread dello switch)
             // Lo stato della dashboard viene dagli eventi, ma un evento perso
             // (cambio Background/Scene, focus preso da un'altra app) lasciava
             // la mod convinta che fosse aperta, con tutti i comandi bloccati:

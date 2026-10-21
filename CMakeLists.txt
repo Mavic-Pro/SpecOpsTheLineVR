@@ -66,6 +66,8 @@ add_library(d3d9proxy SHARED
     src/pure_utils.h
     src/vr_toast.cpp
     src/vr_toast.h
+    src/vr_menu.cpp
+    src/vr_menu.h
     src/haptics_ext.cpp
     src/updater.h
     src/version.h

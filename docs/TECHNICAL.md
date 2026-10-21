@@ -708,6 +708,32 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   half-rate toast (submits/s < 0.6 x refresh) and a Virtual Desktop notice
   (driver `oculus_virtualdesktop` from `LastKnown/ActualHMDDriver`) tell
   the player to disable SSW, which no PC-side setting can do.
+- **Aiming after the first headset round (21/10):** the stance factors of
+  the cone are configurable (`spread on <scale> <ads> <twohand> <onehand>`,
+  defaults 1 / 0.1 / 0.5 / 1.5): with the sights at the eye the shot is
+  practically a laser, so the weapon's own sights are usable; the green
+  marker is **off by default** (configversion 6 migrates `marker on` to
+  `off`; players who want it turn it back on) and a new **`laser on`** draws
+  a red beam from 25 units ahead of the barrel to the point of impact
+  (start point carried per eye in the frame tag like the marker, drawn with
+  Clear rects, hidden while aiming down the sights).
+- **In-headset settings menu (`src/vr_menu.cpp`, asked 21/10):** a 1.5 m
+  SteamVR overlay (`specopsvr.menu`) placed in front of the player, mouse
+  input from the controller laser (`VROverlayInputMethod_Mouse`,
+  `MakeOverlaysInteractiveIfVisible`, mouse scale = bitmap size, y flipped),
+  drawn with GDI into a 1100x820 RGBA bitmap (`SetOverlayRaw`). Tabs:
+  **Basic** (17 curated settings with one-line explanations: hand, height,
+  turning, vignette, HUD, body, reload, two-hand, marker, laser, spread,
+  room-scale, seated, hints, this menu, update channel, auto-update),
+  **Advanced** (every key of the player's ini with the comment block above
+  it as help; on/off toggles, numbers with -/+ steps, choices cycle) and
+  **Controls** (the full control list). Every change runs `Execute` at once
+  and `SaveIniValue` into the ini. Opens by itself 2 s after the first
+  virtual screen (game main menu) when `vrmenu on`; PLAY closes it; `vrmenu
+  show|hide` from commands; while open the game pad is neutral. A Virtual
+  Desktop banner (driver detected) tells what to disable (SSW, 72 Hz,
+  Ethernet). Ticks on the session thread, same as the Scene switch (no
+  overlay calls outside the lock). *Needs the headset for the pointer.*
 - **Headset checklist for this batch** (everything above passed the
   headless gate; these need eyes and hands): toasts and the first-session
   hints (`TOAST:` lines); menus and Bink movies on the GPU cinema path

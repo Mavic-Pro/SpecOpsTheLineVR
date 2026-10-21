@@ -3,6 +3,7 @@
 #include "control.h"
 #include "haptics_ext.h"
 #include "vr_session.h"
+#include "vr_menu.h"
 #include "hooks.h"
 #include "vr_output.h"
 
@@ -1521,7 +1522,7 @@ void ApplyVrStickRules(XGamepad* pad) {
             pad->wButtons = kStart;
             return;
         }
-        if (vr::control::g_vrDashboard) {
+        if (vr::control::g_vrDashboard || vr::menu::IsOpen()) {  // dashboard o menu del mod: pad neutro
             *pad = {};
             return;
         }
