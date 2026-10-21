@@ -739,7 +739,14 @@ void WorkerLoop() {
             if (mirror == 0) compositor->HideMirrorWindow();
         }
         double tw = QpcMs();
-        if (vr::control::g_outputTest < 2) {
+        // "waitbeforesubmit on" (predefinito dal 21/10): l'attesa del
+        // compositor sta dopo la copia, subito prima dell'invio, cosi' il
+        // frame parte al "running start" e non 4-8 ms dopo il vsync. Prima
+        // (attesa -> copia -> invio) con Virtual Desktop l'invio arrivava
+        // tardi e il compositor saltava un frame su due (45 su 90, 36 su 72)
+        // con la GPU libera.
+        bool waitLate = vr::control::g_waitBeforeSubmit;
+        if (vr::control::g_outputTest < 2 && !waitLate) {
             vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
             compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
         }
@@ -936,6 +943,12 @@ void WorkerLoop() {
             endBusy();
             continue;
         }
+        if (waitLate && vr::control::g_outputTest < 2) {
+            double tw2 = QpcMs();
+            vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
+            compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+            waitMs += QpcMs() - tw2;
+        }
         double ts = QpcMs();
         vr::Texture_t texL = {cinema && g_blackTex ? g_blackTex : tex[0], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
         vr::Texture_t texR = {cinema && g_blackTex ? g_blackTex : tex[1], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
@@ -1020,6 +1033,25 @@ void WorkerLoop() {
                           copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs, g_pairsDropped,
                           g_fenceTimeout9.load(), g_fenceTimeout11.load());
             vr::log::Line(b);
+            // Visore a meta' frequenza (SSW di Virtual Desktop, ASW di Link):
+            // 36 invii/s su 72 Hz con la GPU libera = riproiezione continua,
+            // fisheye e nausea (prova 21/10). Avviso nel visore una volta.
+            {
+                static int halfWindows = 0;
+                static bool warned = false;
+                double rate = 1000.0 * n / (now - windowStart);
+                float hz = g_hmdHz.load();
+                if (submits > 1 && hz > 0.0f && rate > 10.0 && rate < 0.6 * hz) ++halfWindows;
+                else halfWindows = 0;
+                if (halfWindows >= 2 && !warned) {
+                    warned = true;
+                    char w[160];
+                    std::snprintf(w, sizeof(w), "Headset at half rate (%.0f of %.0f fps): turn off SSW / ASW in Virtual Desktop or Link",
+                                  rate, hz);
+                    vr::toast::Notify(w);
+                    vr::log::Line(std::string("VR-OUTPUT: ") + w);
+                }
+            }
             windowStart = now;
             copyMs = waitMs = submitMs = 0.0;
         }
@@ -1131,6 +1163,10 @@ void DeliverGpuSlot(int e, int g) {
     pk.w = g_slotW[e][g];
     pk.h = g_slotH[e][g];
     pk.gpuSrc = g_shTex11[e][g];
+    // Schermo virtuale sul percorso GPU (R-C5): senza questo flag la coppia
+    // non risultava mai completa (serve il destro) e al menu nessun frame
+    // arrivava al compositor: SteamVR restava su "Prossimo" (21/10, VD).
+    pk.cinema = g_slotCinema[e][g];
     pk.poseValid = g_slotPoseValid[e][g];
     pk.tick = g_slotTick[e][g];
     pk.seq = g_slotSeq[e][g];
@@ -1414,8 +1450,16 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     float waitBudget = g_sameTickWaitMs;
     // Solo se i due slot sono dello stesso tick (L3: l'occhio sinistro del
     // tick prima con il destro di questo univa due tick).
+    // L3 (21/10): il vincolo "stessi tick" era sbagliato in pratica (i tick
+    // dei due slot non coincidono mai: la riga "same-tick submit" non e'
+    // piu' apparsa e con Virtual Desktop si andava a meta' frequenza);
+    // tolto, si contano solo le coppie con tick diversi nel log.
+    static unsigned tickMismatch = 0;
     if (eye == 1 && waitBudget > 0.0f && g_gpuSlot[0] >= 0 && g_gpuSlot[1] >= 0 && g_slotGpu[0][g_gpuSlot[0]] &&
-        g_slotGpu[1][g_gpuSlot[1]] && g_slotTick[0][g_gpuSlot[0]] == g_slotTick[1][g_gpuSlot[1]]) {
+        g_slotGpu[1][g_gpuSlot[1]] && g_slotTick[0][g_gpuSlot[0]] != g_slotTick[1][g_gpuSlot[1]])
+        ++tickMismatch;
+    if (eye == 1 && waitBudget > 0.0f && g_gpuSlot[0] >= 0 && g_gpuSlot[1] >= 0 && g_slotGpu[0][g_gpuSlot[0]] &&
+        g_slotGpu[1][g_gpuSlot[1]]) {
         double tq = QpcMs();
         bool done = false;
         while (true) {
@@ -1433,7 +1477,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         }
         if ((g_sameTickOk + g_sameTickMissed) % 600 == 1)
             vr::log::Line("VR-OUTPUT: same-tick submit " + std::to_string(g_sameTickOk) + " ok, " +
-                          std::to_string(g_sameTickMissed) + " left for the next tick.");
+                          std::to_string(g_sameTickMissed) + " left for the next tick, " + std::to_string(tickMismatch) +
+                          " pairs with different slot ticks.");
     }
     // Stereo: la coppia e' completa dopo l'occhio destro (mono: subito).
     if (eye == 0) return;

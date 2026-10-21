@@ -128,11 +128,16 @@ void Notify(const std::string& text) {
 }
 
 void Tick() {
-    // Chiamato dal worker dell'uscita VR e dal thread della sessione (anche
-    // senza visore, app Background): uno alla volta, chi trova occupato salta.
+    // Chiamato dal worker dell'uscita VR. Gli overlay si toccano solo con il
+    // lock condiviso della sessione: senza, il thread della sessione che
+    // passa da Background a Scene (VR_Shutdown + VR_Init) restava bloccato
+    // per sempre con la vista nel visore mai partita (21/10, Virtual Desktop).
+    // Se il lock non e' libero (switch in corso) si salta il frame.
     static std::mutex tickMutex;
     std::unique_lock<std::mutex> lock(tickMutex, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    vr::session::Shared session(true);
+    if (!session.ok() || !vr::session::Ready()) return;
     ULONGLONG now = GetTickCount64();
     if (g_visible && now >= g_shownUntil) {
         if (vr::VROverlay() && g_overlay != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->HideOverlay(g_overlay);

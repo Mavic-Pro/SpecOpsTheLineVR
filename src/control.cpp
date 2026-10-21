@@ -89,6 +89,7 @@ std::atomic<bool> g_interactZone[2]{false, false};
 std::atomic<bool> g_grabUse{true};
 std::atomic<bool> g_ham{false};
 std::atomic<bool> g_cinema3d{false};
+std::atomic<bool> g_waitBeforeSubmit{true};
 std::atomic<unsigned long long> g_interactSimUntil[2]{0, 0};
 std::atomic<int> g_hintsShown{0};
 std::atomic<bool> g_weaponNeedsAim{false};
@@ -169,6 +170,7 @@ std::atomic<float> g_gunOffsetCm[3];
 std::atomic<float> g_synthHandCm[3] = {35.0f, 20.0f, -35.0f};
 std::atomic<bool> g_twoHand{true};
 std::atomic<float> g_twoHandCm{12.0f};
+std::atomic<float> g_twoHandSmoothSec{0.08f};
 std::atomic<bool> g_arms{true};
 std::atomic<float> g_armStretch{1.25f};
 std::atomic<bool> g_muzzleAim{true};
@@ -335,6 +337,10 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_toasts = OnOff(cmd, v, true);
+    } else if (cmd == "waitbeforesubmit") {
+        std::string v;
+        in >> v;
+        g_waitBeforeSubmit = OnOff(cmd, v, true);
     } else if (cmd == "cinema3d") {
         std::string v;
         in >> v;
@@ -718,10 +724,11 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "twohand") {
         // twohand on|off [cm]: tolleranza della sinistra dalla linea dell'arma
         std::string v;
-        float cm = 0.0f;
-        in >> v >> cm;
+        float cm = 0.0f, sm = -1.0f;
+        in >> v >> cm >> sm;
         g_twoHand = OnOff(cmd, v, true);
         if (cm >= 3.0f && cm <= 40.0f) g_twoHandCm = cm;
+        if (sm >= 0.0f && sm <= 0.5f) g_twoHandSmoothSec = sm < 0.005f ? 0.005f : sm;
     } else if (cmd == "synthleft") {
         float f = 0, r = 0, u = 0;
         in >> f >> r >> u;

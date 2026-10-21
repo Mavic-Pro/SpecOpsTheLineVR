@@ -314,6 +314,8 @@ extern std::atomic<bool> g_grabUse;
 extern std::atomic<bool> g_ham;
 // "cinema3d on|off": schermo virtuale in stereo (due disegni a 0,4 IPD, overlay fianco a fianco; R-C6).
 extern std::atomic<bool> g_cinema3d;
+// "waitbeforesubmit on|off": attesa del compositor dopo la copia, subito prima dell'invio (pacing).
+extern std::atomic<bool> g_waitBeforeSubmit;
 extern std::atomic<unsigned long long> g_interactSimUntil[2];  // "interactsim": zona finta fino a (ms)
 extern std::atomic<int> g_hintsShown;
 // Ini mai caricato (eseguibile non supportato, avvio lento): legge dall'ini
@@ -434,6 +436,7 @@ extern std::atomic<float> g_synthHandCm[3];
 // sinistra finta per i test (cm, come synthhand; 0 0 0 = assente).
 extern std::atomic<bool> g_twoHand;
 extern std::atomic<float> g_twoHandCm;  // tolleranza della sinistra dalla linea dell'arma (cm)
+extern std::atomic<float> g_twoHandSmoothSec;  // filtro della direzione a due mani (s), "twohand on <cm> <s>"
 extern std::atomic<float> g_synthLeftCm[3];
 // Gesti (vr_input.cpp): lancio della granata con la mano sinistra (LB),
 // ricarica tirando giu' il caricatore (X), copertura abbassandosi (A).

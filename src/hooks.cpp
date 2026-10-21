@@ -2396,7 +2396,20 @@ void ApplyTwoHandAim(const float* right, const float* left) {
     float af[3] = {std::cos(pitchR) * std::cos(yawR), std::cos(pitchR) * std::sin(yawR), std::sin(pitchR)};
     float along = d[0] * af[0] + d[1] * af[1] + d[2] * af[2];
     float px = d[0] - along * af[0], py = d[1] - along * af[1], pz = d[2] - along * af[2];
-    float off = std::sqrt(px * px + py * py + pz * pz);
+    // Scarto dalla linea dell'arma: di lato vale la tolleranza intera, sotto
+    // o sopra solo 2/3 (8 cm su 12). Con 12 cm anche in verticale la presa
+    // partiva con la sinistra SOTTO la canna (dove sta senza calcio) e la
+    // mano si vedeva "attaccata sotto" l'arma (prova nel visore 21/10).
+    float upw[3] = {-af[0] * af[2], -af[1] * af[2], 1.0f - af[2] * af[2]};  // su del mondo ortogonale ad af
+    float upl = std::sqrt(upw[0] * upw[0] + upw[1] * upw[1] + upw[2] * upw[2]);
+    float off;
+    if (upl > 1e-3f) {
+        float vert = (px * upw[0] + py * upw[1] + pz * upw[2]) / upl;
+        float lat2 = px * px + py * py + pz * pz - vert * vert;
+        off = std::sqrt((lat2 < 0.0f ? 0.0f : lat2) + vert * vert * 2.25f);
+    } else {
+        off = std::sqrt(px * px + py * py + pz * pz);
+    }
     // Tolleranza dalla linea dell'arma: "twohand on <cm>" (12 cm; prima 8,
     // e un tester con la sinistra a 9-10 cm sotto la canna non agganciava
     // mai), 1,75x finche' la presa e' attiva.
@@ -2431,8 +2444,29 @@ void ApplyTwoHandAim(const float* right, const float* left) {
         vr::log::Line("AIM: two-handed grip.");
     }
     wasActive = true;
-    twoYaw = lineYaw + offYaw;
-    twoPitch = linePitch + offPitch;
+    // Senza calcio la linea tra le mani trema (tremore della sinistra
+    // libera): filtro esponenziale da 80 ms sulla direzione a due mani
+    // (prova nel visore 21/10: "la mira a due mani fa schifo senza gunstock").
+    {
+        static double lastSm = 0.0;
+        static float smYaw = 0.0f, smPitch = 0.0f;
+        static bool smValid = false;
+        double nowSm = ProfMs() * 0.001;
+        float dtSm = lastSm > 0.0 ? static_cast<float>(nowSm - lastSm) : 1.0f;
+        lastSm = nowSm;
+        float ty = lineYaw + offYaw, tp = linePitch + offPitch;
+        if (!smValid || dtSm > 0.5f) {
+            smYaw = ty;
+            smPitch = tp;
+            smValid = true;
+        } else {
+            float k = 1.0f - std::exp(-dtSm / vr::control::g_twoHandSmoothSec);
+            smYaw += std::remainder(ty - smYaw, 6.28318530718f) * k;
+            smPitch += (tp - smPitch) * k;
+        }
+        twoYaw = smYaw;
+        twoPitch = smPitch;
+    }
     applyBlend(true);
     g_twoHandActive = true;
     vr::control::g_twoHandEngaged = true;

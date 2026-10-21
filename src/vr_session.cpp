@@ -150,9 +150,27 @@ void ConfigureReprojection() {
     }
     std::string sys(system);
     for (char& c : sys) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    if (sys.find("virtual") != std::string::npos || std::string(model).find("Virtual Desktop") != std::string::npos)
+    // Virtual Desktop si presenta come "oculus" / "Meta Quest 3": il driver
+    // vero sta in steamvr.vrsettings, LastKnown/ActualHMDDriver =
+    // "oculus_virtualdesktop" (21/10). L'SSW di VD si spegne solo dal menu di
+    // VD nel visore (Streaming > Synchronous Spacewarp): avviso nel visore.
+    bool vd = sys.find("virtual") != std::string::npos || std::string(model).find("Virtual Desktop") != std::string::npos;
+    {
+        Shared s;
+        char drv[128] = {};
+        vr::EVRSettingsError e = vr::VRSettingsError_None;
+        if (vr::VRSettings()) vr::VRSettings()->GetString("LastKnown", "ActualHMDDriver", drv, sizeof(drv), &e);
+        std::string d(e == vr::VRSettingsError_None ? drv : "");
+        for (char& c : d) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (d.find("virtualdesktop") != std::string::npos) vd = true;
+        if (d[0]) vr::log::Line("VR: SteamVR HMD driver " + d + ".");
+    }
+    if (vd) {
         vr::log::Line("VR: Virtual Desktop detected. If the game stays at half the headset refresh rate, set "
-                      "\"Synchronous Spacewarp\" to Disabled in the Virtual Desktop Streamer settings.");
+                      "\"Synchronous Spacewarp\" to Disabled in the Virtual Desktop menu (Streaming tab).");
+        vr::toast::Notify("Virtual Desktop: set Synchronous Spacewarp to Disabled (VD menu, Streaming) for full frame rate");
+        return;  // niente ASW di Link
+    }
     if (sys != "oculus" || !vr::control::g_linkAswOff) return;  // ASW: solo Link
     // Il gioco e' a 32 bit: qui "ProgramFiles" e' Program Files (x86). Prima
     // OculusBase (impostata dall'installazione di Meta), poi ProgramW6432.
@@ -331,7 +349,6 @@ void MonitorLoop() {
         {
             Shared s;
             quit = !PollEvents();
-            if (!quit) vr::toast::Tick();  // avvisi anche senza il worker dell'uscita (app Background)
             // Lo stato della dashboard viene dagli eventi, ma un evento perso
             // (cambio Background/Scene, focus preso da un'altra app) lasciava
             // la mod convinta che fosse aperta, con tutti i comandi bloccati:

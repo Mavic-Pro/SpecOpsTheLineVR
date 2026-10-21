@@ -691,6 +691,23 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   README) and prints the `gh release create` line with every asset; the
   updater downloads the ones missing or different (never `specopsvr.ini`).
   `reset_settings.bat` restores the shipped ini keeping a dated copy.
+- **Found in the headset (21/10 evening, Virtual Desktop):** the output
+  worker and the Scene switch were never exercised by the headless gate
+  (OpenVR stays Background there), so three regressions surfaced only live:
+  the toast tick touched overlays without the session lock while the session
+  thread did `VR_Shutdown`/`VR_Init` (Scene never came up; now the tick takes
+  a try-shared lock and skips during a switch); the GPU cinema path never
+  marked the frame ready (`pk.cinema` missing in `DeliverGpuSlot`: SteamVR
+  stayed on "Next up"); the L3 "same slot tick" constraint never matched and
+  killed the same-tick fast path (reverted, mismatches counted instead).
+  Also: the 12 cm two-hand tolerance engaged with the support hand *under*
+  the barrel (no gunstock) and the hand looked glued below the gun - the
+  tolerance is now 12 cm sideways and 8 cm vertically, with an 80 ms filter
+  on the hand-to-hand line (`twohand on <cm> <s>`); the compositor wait now
+  sits after the copy, right before `Submit` (`waitbeforesubmit on`); a
+  half-rate toast (submits/s < 0.6 x refresh) and a Virtual Desktop notice
+  (driver `oculus_virtualdesktop` from `LastKnown/ActualHMDDriver`) tell
+  the player to disable SSW, which no PC-side setting can do.
 - **Headset checklist for this batch** (everything above passed the
   headless gate; these need eyes and hands): toasts and the first-session
   hints (`TOAST:` lines); menus and Bink movies on the GPU cinema path
