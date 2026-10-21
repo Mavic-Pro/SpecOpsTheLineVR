@@ -614,7 +614,10 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   eye's own projection, and M19 showed no `Canvas.Project` traffic to fix);
   R-R1 (identity guards: `StillAlive`/`ObjClass` checks on every captured
   pointer, `LivePlayerController()`, presence pruning of the projectile list
-  - the generation counter was not needed once every use re-validates).
+  - the generation counter was not needed once every use re-validates);
+  R-B1 (eye-pivot helper: `compensatePivot(dUnits, fwd, headRotates)` is
+  the single correction used by the stick turn, the head catch-up and the
+  cover/turret paths, see H3/M1).
 - **Headset notices (R-U1):** `src/vr_toast.cpp` draws short messages with
   GDI into a head-locked SteamVR overlay (`specopsvr.status`, 22 cm below
   the gaze at 1 m, 3.5 s each, queue of 4, identical text once per 10 s,
@@ -646,6 +649,11 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   `Slide`, `Muzzle`...; the Milkor has none); while the physical reload has
   the magazine out or in hand, `HideBoneByName("Magazine")` hides it on the
   weapon (`MAGAZINE:` lines), restored on insert or weapon change.
+- **Cabin box (R-B2):** on a mount (Pawn not on firm ground: helicopter,
+  truck, turret) the horizontal head offset is clamped to 25 units
+  (`ClampCabinOffset`, both the real and the synthetic head path), so
+  leaning cannot put the view through the cabin; on foot there is no limit
+  (room-scale). Falling already counts as on foot (M2).
 - **Body facing from the hands (R-B3, experimental, `bodyfacing hands`):**
   the yaw that drives the body turn is the circular mean of head (0.5),
   the perpendicular to the left-right controller line nearest the head

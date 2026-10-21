@@ -2285,6 +2285,24 @@ bool CallMoveSmoothNative(void* actor, const float* delta, int* ret) {
     }
 }
 
+// Sui mezzi (elicottero, camion: Pawn non a terra) la testa non puo'
+// uscire dall'abitacolo: spostamento orizzontale della testa entro 25 unita'
+// (R-B2 "cabin box"); a piedi nessun limite (room-scale).
+bool PawnOnFirmGround(void* pawn);
+void* PlayerPawnIfViewTarget(char* cam);
+void ClampCabinOffset() {
+    char* cam = static_cast<char*>(g_cameraPtr.load());
+    void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
+    if (!pawn || PawnOnFirmGround(pawn)) return;
+    float f = g_headOffset[0].load(), r = g_headOffset[1].load();
+    float len = std::sqrt(f * f + r * r);
+    const float kBox = 25.0f;
+    if (len > kBox) {
+        g_headOffset[0] = f * kBox / len;
+        g_headOffset[1] = r * kBox / len;
+    }
+}
+
 // Sposta il Pawn di (dx, dy) nel mondo con moveSmooth (M10/R-B4): moved =
 // spostamento reale (gradini e muri lo riducono).
 bool RoomStepMove(void* pawn, float dx, float dy, float* moved) {
@@ -3909,6 +3927,7 @@ void UpdateHeadTracking() {
         g_deltaPitch = RadiansToUnreal(s * vr::control::g_synthPitchAmpDeg * kDegToRad);
         g_deltaRoll = 0;
         for (int i = 0; i < 3; ++i) g_headOffset[i] = s * vr::control::g_synthPosCm[i] * 0.01f * vr::control::g_posScale;
+        ClampCabinOffset();  // R-B2
         g_aimDeltaYaw = RadiansToUnreal(vr::control::g_synthAimYawDeg * kDegToRad);
         g_aimDeltaPitch = RadiansToUnreal(vr::control::g_synthAimPitchDeg * kDegToRad);
         g_aimValid = true;
@@ -4355,6 +4374,7 @@ void UpdateHeadTracking() {
         g_deltaRoll = 0;
         for (auto& v : g_headOffset) v = 0.0f;
     }
+    ClampCabinOffset();  // R-B2: abitacolo
     PublishHeadPose(&m);
     // Controller destro: direzione di puntamento (-Z del controller), yaw
     // relativo alla direzione di ricentramento, pitch rispetto all'orizzonte.
