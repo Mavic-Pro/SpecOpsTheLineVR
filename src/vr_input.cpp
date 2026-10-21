@@ -498,6 +498,35 @@ bool ReadTouchControllers(XGamepad* out) {
     if (!sys) return false;
     vr::TrackedDeviceIndex_t left = sys->GetTrackedDeviceIndexForControllerRole(vr::control::SupportRole());
     vr::TrackedDeviceIndex_t right = sys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
+    // Ruolo assegnato a un dispositivo che non e' un controller (Virtual
+    // Desktop espone una tastiera virtuale come tracker, 21/10: stick e tasti
+    // sinistri sempre a zero): si cerca il controller vero non usato
+    // dall'altra mano. Ogni cambio di dispositivo per ruolo va nel log.
+    auto realController = [&](vr::TrackedDeviceIndex_t idx, vr::TrackedDeviceIndex_t other) {
+        if (idx != vr::k_unTrackedDeviceIndexInvalid && sys->GetTrackedDeviceClass(idx) == vr::TrackedDeviceClass_Controller)
+            return idx;
+        for (vr::TrackedDeviceIndex_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i)
+            if (i != other && sys->GetTrackedDeviceClass(i) == vr::TrackedDeviceClass_Controller && sys->IsTrackedDeviceConnected(i))
+                return i;
+        return idx;
+    };
+    left = realController(left, right);
+    right = realController(right, left);
+    {
+        static vr::TrackedDeviceIndex_t lastL = 0xFFFF, lastR = 0xFFFF;
+        if (left != lastL || right != lastR) {
+            lastL = left;
+            lastR = right;
+            auto describe = [&](vr::TrackedDeviceIndex_t i) {
+                if (i == vr::k_unTrackedDeviceIndexInvalid) return std::string("none");
+                char model[64] = {};
+                sys->GetStringTrackedDeviceProperty(i, vr::Prop_ModelNumber_String, model, sizeof(model));
+                return std::to_string(i) + " (class " + std::to_string(static_cast<int>(sys->GetTrackedDeviceClass(i))) + ", " +
+                       model + ")";
+            };
+            vr::log::Line("INPUT: hand devices: left " + describe(left) + ", right " + describe(right));
+        }
+    }
     vr::VRControllerState_t ls = {}, rs = {};
     bool haveL = false, haveR = false;
     static double lastActionRead = 0.0;
@@ -522,6 +551,34 @@ bool ReadTouchControllers(XGamepad* out) {
         in->UpdateActionState(&set, sizeof(set), 1);
         haveL = left != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, vr::control::PhysicalHand(0), &ls);
         haveR = right != vr::k_unTrackedDeviceIndexInvalid && act::ReadHand(in, vr::control::PhysicalHand(1), &rs);
+        // Una mano con le azioni ferme mentre l'altra funziona (ruolo SteamVR
+        // sbagliato): quella mano si legge con l'API legacy dal controller
+        // vero trovato sopra, cosi' stick e tasti arrivano comunque.
+        {
+            static ULONGLONG oneSince = 0;
+            static bool hybridLogged = false;
+            bool oneMissing = (haveL != haveR) && left != vr::k_unTrackedDeviceIndexInvalid &&
+                              right != vr::k_unTrackedDeviceIndexInvalid;
+            if (oneMissing) {
+                if (!oneSince) oneSince = GetTickCount64();
+                if (GetTickCount64() - oneSince > 2000) {
+                    vr::VRControllerState_t st = {};
+                    vr::TrackedDeviceIndex_t idx = haveL ? right : left;
+                    if (sys->GetControllerState(idx, &st, sizeof(st))) {
+                        if (haveL) { rs = st; haveR = true; } else { ls = st; haveL = true; }
+                        if (!hybridLogged) {
+                            hybridLogged = true;
+                            vr::log::Line(std::string("INPUT: ") + (haveL && idx == left ? "left" : "right") +
+                                          " hand actions inactive for 2 s: that hand is read with the legacy API from device " +
+                                          std::to_string(idx) + ".");
+                        }
+                    }
+                }
+            } else {
+                oneSince = 0;
+                hybridLogged = false;
+            }
+        }
         // Controller collegati ma nessuna azione attiva per 5 s (fuori dalla
         // dashboard): tipo di controller senza binding predefinito. Si passa
         // all'API legacy invece di restare senza comandi (audit 19/10).
@@ -848,11 +905,14 @@ public:
         // canna (colpo di calcio) o giu' (colpo dall'alto) oltre 3,5 m/s, con
         // l'arma sotto l'altezza degli occhi; non in mira (ADS: arma all'occhio)
         // e non durante la ricarica fisica. "gesture melee off" spegne anche questo.
-        if (s.rightValid && vr::control::g_gestureMelee && s.t > m_meleeReady && m_mag == Mag::In && !m_magGrab) {
+        // Opzionali ("gesture gunmelee on"): in gioco scattavano girando l'arma
+        // in fretta (3 falsi in una partita, 21/10) e ogni colpo blocca la
+        // camminata per l'animazione; soglia 5 m/s.
+        if (s.rightValid && vr::control::g_gestureGunMelee && s.t > m_meleeReady && m_mag == Mag::In && !m_magGrab) {
             float along = s.rightVel[0] * s.rightFwd[0] + s.rightVel[1] * s.rightFwd[1] + s.rightVel[2] * s.rightFwd[2];
             float down = -s.rightVel[1];
             bool belowEyes = s.right[1] < s.hmd[1] - 0.08f;
-            if (belowEyes && (along > 3.5f || down > 3.5f)) {
+            if (belowEyes && (along > 5.0f || down > 5.0f)) {
                 Press(kB, s.t, 0.12, along > 3.5f ? "colpo di calcio" : "colpo dall'alto", along > 3.5f ? along : down);
                 vr::haptics::Melee();
                 m_meleeReady = s.t + 0.8;
@@ -1494,6 +1554,7 @@ void ApplyRecenterCombo(XGamepad* pad) {
     if (!since) since = now;
     if (!fired && now - since > 1000) {
         fired = true;
+        vr::control::g_recenterSilent = false;
         vr::control::g_recenterRequested = true;
         vr::log::Line("RECENTER: requested from the controllers (both sticks held).");
     }

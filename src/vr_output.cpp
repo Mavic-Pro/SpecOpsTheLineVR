@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "vr_session.h"
 #include "vr_toast.h"
+#include "vr_menu.h"
 #include "hooks.h"
 
 #include <windows.h>
@@ -820,17 +821,33 @@ void WorkerLoop() {
                 vr::log::Line(sbs ? "CINEMA: stereo screen (side by side)." : "CINEMA: flat screen.");
             }
             if (fed) {
+                // Il gioco disegna menu e filmati in 16:9 dentro il back buffer
+                // quasi quadrato: le bande vere sono quelle del 16:9 centrato.
+                // Scene scure davano fasce piu' strette (il contenuto veniva
+                // stirato: "menu ingrandito in una finestra", 21/10): una fascia
+                // sotto il 95% dell'altezza 16:9 viene portata al 16:9 centrato.
+                // (Nessuna fascia 16:9 forzata: i menu Scaleform sono a tutta
+                // finestra e la fascia li tagliava sopra e sotto, 21/10.)
                 // Ritaglio stabile: cambia solo se il nuovo resta uguale per 30
                 // frame (scene scure e dissolvenze lo facevano saltare a ogni
                 // frame) o all'inizio di ogni passaggio allo schermo virtuale.
-                if (!g_cropSession) {
+                // Percorso GPU: le righe si leggono ogni 15 frame, quindi il
+                // candidato va contato solo sulle letture vere (3 uguali =
+                // ~45 frame); prima i frame senza lettura azzeravano il
+                // contatore e il ritaglio restava quello del primo frame
+                // (menu del gioco tagliato, 21/10).
+                bool gpuRows = pk[0].gpuSrc != nullptr;
+                const int need = gpuRows ? 3 : 30;
+                if (gpuRows && !rowsKnown && g_cropSession) {
+                    // nessuna lettura nuova: ritaglio e candidato invariati
+                } else if (!g_cropSession) {
                     g_cropSession = true;
                     g_cropTop = top;
                     g_cropBottom = bottom;
                     g_cropCandFrames = 0;
                 } else if (top != g_cropTop || bottom != g_cropBottom) {
                     if (top == g_cropCandTop && bottom == g_cropCandBottom) {
-                        if (++g_cropCandFrames >= 30) {
+                        if (++g_cropCandFrames >= need) {
                             g_cropTop = top;
                             g_cropBottom = bottom;
                             g_cropCandFrames = 0;
@@ -845,6 +862,16 @@ void WorkerLoop() {
                 }
                 cinemaTop = g_cropTop;
                 cinemaBottom = g_cropBottom;
+                {
+                    static UINT lastTop = 0xFFFFFFFF, lastBottom = 0xFFFFFFFF;
+                    if (cinemaTop != lastTop || cinemaBottom != lastBottom) {
+                        lastTop = cinemaTop;
+                        lastBottom = cinemaBottom;
+                        vr::log::Line("CINEMA: content rows " + std::to_string(cinemaTop) + "-" + std::to_string(cinemaBottom) + " of " +
+                                      std::to_string(pk[0].h) + " (texture " + std::to_string(g_cinemaTexW) + "x" + std::to_string(g_cinemaTexH) +
+                                      ", gpu " + (pk[0].gpuSrc ? "yes" : "no") + ", stage " + (g_cinemaStage ? "yes" : "no") + ")");
+                    }
+                }
             }
         } else {
             for (int e = 0; e < 2; ++e) {
@@ -906,6 +933,9 @@ void WorkerLoop() {
                 g_cinemaSbs = false;  // il flag stereo va rimesso sull'overlay nuovo
             }
         }
+        // Il menu del mod e' opaco: lo schermo virtuale resta visibile dietro
+        // (nascondendolo, chi indossava il visore girato altrove vedeva solo
+        // nero e chiudeva il gioco, 21/10).
         if (cinema && g_cinemaTex) {
             // Ricentramento durante lo schermo virtuale: lo schermo si rimette
             // davanti (prima restava dov'era stato aperto).
@@ -925,6 +955,7 @@ void WorkerLoop() {
             g_cropSession = false;
         }
         vr::toast::Tick();  // avvisi nel visore (R-U1)
+        vr::menu::Tick(cinema);  // menu del mod: eventi del puntatore a ogni frame (dal thread della sessione erano ogni 0,5 s)
         if (!tex[0] || !tex[1]) {
             endBusy();
             continue;

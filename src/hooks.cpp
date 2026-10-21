@@ -1694,7 +1694,7 @@ bool IsCanvasMatrix(const float* m) {
 bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
     // Il Canvas carica la matrice in c0-c3 o in c6-c9 a seconda dello shader.
     if ((start != 0 && start != 6) || count != 4 || !IsCanvasMatrix(data)) return false;
-    if (vr::control::g_cinemaActive) return false;  // schermo virtuale: HUD/sottotitoli come sul monitor
+    if (vr::control::g_cinemaActive) return false;  // schermo virtuale: HUD/sottotitoli come sul monitor (la Scaleform dei menu non passa di qui)
     if (g_scopeActive) {
         // Cannocchiale: maschera a tutta vista (niente riduzione dell'HUD). Il
         // gioco la centra su un'area 16:9 (centro a y = W*9/32, misurato), il
@@ -3073,7 +3073,18 @@ void ApplyVrPreset(char* cam) {
 // Massimo 4096 (desktop finto di display_spoof).
 void UpdateAutoResolution(char* cam) {
     static ULONGLONG last = 0;
-    if (!vr::control::g_autoResolution || !vr::control::g_offCenter || GetTickCount64() - last < 5000) return;
+    static bool lastMenu = false;
+    if (!vr::control::g_autoResolution || !vr::control::g_offCenter) return;
+    // Schermo virtuale da almeno 1,5 s (menu, caricamenti, filmati lunghi; le
+    // inquadrature brevi delle scene non fanno reset del device). Al menu
+    // iniziale il gioco ha comunque una pedina: non si puo' usare quella.
+    static ULONGLONG cinemaSince = 0;
+    ULONGLONG nowA = GetTickCount64();
+    if (!vr::control::g_cinemaActive) cinemaSince = 0;
+    else if (!cinemaSince) cinemaSince = nowA;
+    bool menu = vr::control::g_menu169 && cinemaSince && nowA - cinemaSince >= 1500;
+    if (menu == lastMenu && nowA - last < 5000) return;  // subito al cambio menu/gioco
+    lastMenu = menu;
     last = GetTickCount64();
     uint32_t w = 0, h = 0;
     {
@@ -3084,6 +3095,11 @@ void UpdateAutoResolution(char* cam) {
     if (w < 640 || h < 640) return;
     w = (std::min)(w, 4096u) & ~7u;
     h = (std::min)(h, 4096u) & ~7u;
+    // Menu del gioco e filmati (schermo virtuale): back buffer 16:9. I menu UIScene si dispongono per l'altezza del
+    // viewport: con il back buffer alto quanto un occhio (2112x2304) il menu
+    // era largo 4096 px e tagliato a destra, e la fascia 16:9 lo tagliava
+    // sopra e sotto. A 2112x1188 e' completo, come sul monitor (21/10).
+    if (menu) h = (w * 9 / 16) & ~7u;
     UINT bw = g_backBufferW, bh = g_backBufferH;
     if (!bw || !bh) return;
     if (std::abs(static_cast<int>(w) - static_cast<int>(bw)) <= static_cast<int>(bw) / 25 &&
@@ -3095,7 +3111,8 @@ void UpdateAutoResolution(char* cam) {
     lastH = h;
     char cmd[64];
     std::snprintf(cmd, sizeof(cmd), "setres %ux%uw", w, h);
-    vr::log::Line("AUTORES: SteamVR recommends " + std::to_string(w) + "x" + std::to_string(h) + " per eye, game is " +
+    vr::log::Line(std::string("AUTORES: ") + (menu ? "game menu on the virtual screen, 16:9 " : "SteamVR recommends ") +
+                  std::to_string(w) + "x" + std::to_string(h) + (menu ? "" : " per eye") + ", game is " +
                   std::to_string(bw) + "x" + std::to_string(bh) + ": " + cmd);
     vr::script::ExecConsole(cam - 0x77C, cmd);
 }
@@ -3103,7 +3120,12 @@ void UpdateAutoResolution(char* cam) {
 void UpdateDynamicResolution(char* cam, bool mono) {
     static ULONGLONG last = 0;
     if (!mono) ApplyVrPreset(cam);
-    if (!mono && HasCameraSignature(cam)) UpdateAutoResolution(cam);
+    // Anche con lo schermo virtuale (mono): il menu iniziale restava disposto
+    // in un riquadro al 65% del frame (voci fuori dal riquadro, "menu
+    // tagliato", 21/10) finche' un setres non faceva ridisporre il viewport;
+    // con il visore indossato a gioco gia' avviato il setres arrivava solo al
+    // primo disegno stereo, cioe' mai sul menu.
+    if (HasCameraSignature(cam)) UpdateAutoResolution(cam);
     int cur = g_screenPercent;
     int want = cur;
     float hz = vr::output::HmdRefreshHz();
@@ -3159,7 +3181,7 @@ public:
         char* cam = static_cast<char*>(g_cameraPtr.load());
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
-        UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        UpdateFirstPersonBody(vr::control::g_fpBody && !vr::control::g_seated && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // da seduti il corpo (in piedi) si vedeva deforme: solo braccia (21/10)
         UpdateProjectileLog();
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
@@ -3245,6 +3267,13 @@ public:
                 snprintf(b, sizeof(b), "SPECIALMOVE: %u (%s) -> %u (%s)%s", lastSm, SpecialMoveName(lastSm), sm, SpecialMoveName(sm),
                          specialAnim ? " (body animated by the game)" : "");
                 vr::log::Line(b);
+                // Fase 3: impulso d'impatto all'inizio di esecuzione (27) e
+                // corpo a corpo (7, 8) nelle due mani.
+                if (sm == 27 || sm == 7 || sm == 8) {
+                    vr::haptics::Melee();
+                    vr::input::PulseHand(0, 120);
+                    vr::input::PulseHand(1, 120);
+                }
                 lastSm = sm;
             }
         }
@@ -3967,7 +3996,13 @@ void UpdateHeadTracking() {
         return;
     }
     static int frame = 0;
-    bool shouldLog = (++frame % 120 == 0);
+    // Ogni 2 s (non ogni 120 frame: senza visore il gioco rende a oltre
+    // 1000 fps e il log si riempiva di 13 dump al secondo, 21/10).
+    static ULONGLONG lastDump = 0;
+    ULONGLONG nowDump = GetTickCount64();
+    bool shouldLog = (nowDump - lastDump >= 2000);
+    if (shouldLog) lastDump = nowDump;
+    ++frame;
     g_roomStepValid = false;  // vale per il tick in cui il passo e' fatto (L8)
     {
         // "roomstep <unita'>": passo diagnostico lungo l'avanti del corpo,
@@ -4124,8 +4159,10 @@ void UpdateHeadTracking() {
         g_hmdPitchReference = 0.0f;
         for (int i = 0; i < 3; ++i) posRef[i] = pos[i];
         vr::control::g_cinemaRecenter = true;
-        g_blinkMs = GetTickCount64();
-        vr::toast::Notify("Recentered");
+        if (!vr::control::g_recenterSilent.exchange(true)) {  // solo il ricentramento voluto (stick, comando)
+            g_blinkMs = GetTickCount64();
+            vr::toast::Notify("Recentered");
+        }
         vr::log::Line("Recentered: hmdYaw=" + std::to_string(hmdYaw) + " hmdPitch=" + std::to_string(hmdPitch) +
                       " pos=(" + std::to_string(pos[0]) + ", " + std::to_string(pos[1]) + ", " + std::to_string(pos[2]) + ")");
     }
@@ -7502,7 +7539,11 @@ void InteractionScan(void* pawn) {
         if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
         void* obj = reinterpret_cast<void*>(o);
         std::string cls = vr::script::ClassName(obj);
-        if (cls.find("Interaction") == std::string::npos || cls.rfind("YTrigger_", 0) != 0) continue;
+        // Trigger delle interazioni e oggetti da raccogliere (fase 4: armi e
+        // munizioni a terra, classi con "Pickup"): stessa zona di presa.
+        bool trig = cls.find("Interaction") != std::string::npos && cls.rfind("YTrigger_", 0) == 0;
+        bool pickup = cls.find("Pickup") != std::string::npos && cls.rfind("Y", 0) == 0;
+        if (!trig && !pickup) continue;
         if (cls == "Class") continue;
         std::string name = vr::script::ObjectName(obj);
         if (name.rfind("Default__", 0) == 0) continue;  // oggetti predefiniti delle classi
@@ -7871,6 +7912,84 @@ void* CanvasProjectThunkAddress() {
         void* fp;
     } c;
     c.mfp = &CanvasProjectThunk::Detour;
+    return c.fp;
+}
+
+// Dimensione del viewport vista dai menu (UIScene di UE3, non Scaleform):
+// UGameViewportClient::GetViewportSize (0x00B45070, __thiscall(this, float*
+// out[2])) e UUIScreenObject::GetViewportSize (0x00574390, -> UBOOL, la
+// dimensione memorizzata nella scena). Con lo schermo virtuale attivo i menu,
+// scalati per l'altezza della finestra quasi quadrata (2400x2500), erano
+// larghi 4444 px e tagliati a destra (21/10): si dichiara un'altezza 16:9
+// (larghezza * 9/16), cosi' il menu si dispone per la larghezza.
+constexpr uintptr_t kViewportSizeAddr = 0x00B45070, kUiViewportSizeAddr = 0x00574390;
+typedef void(__thiscall* ViewportSize_t)(void* self, float* out);
+typedef int(__thiscall* UiViewportSize_t)(void* self, float* out);
+ViewportSize_t g_ViewportSize_Original = nullptr;
+UiViewportSize_t g_UiViewportSize_Original = nullptr;
+std::atomic<uint32_t> g_uiSizeClamped{0};
+inline void ClampUiSize(float* out) {
+    static std::atomic<int> logged{0};
+    if (!out) return;
+    if (logged.load() < 4) {
+        int n = logged.fetch_add(1);
+        if (n < 4) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "UISIZE: getter -> %.0f x %.0f (cinema %d, clamp %d)", out[0], out[1],
+                          vr::control::g_cinemaActive ? 1 : 0, vr::control::g_ui169 ? 1 : 0);
+            vr::log::Line(buf);
+        }
+    }
+    if (!vr::control::g_ui169 || !vr::control::g_cinemaActive || !(out[0] > 0.0f) || !(out[1] > 0.0f)) return;
+    float h169 = out[0] * 9.0f / 16.0f;
+    if (out[1] > h169 + 1.0f) {
+        out[1] = h169;
+        g_uiSizeClamped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+class ViewportSizeThunk {
+public:
+    void Detour(float* out) {
+        g_ViewportSize_Original(this, out);
+        ClampUiSize(out);
+    }
+};
+class UiViewportSizeThunk {
+public:
+    int Detour(float* out) {
+        int r = g_UiViewportSize_Original(this, out);
+        if (r) ClampUiSize(out);
+        return r;
+    }
+};
+// UGameUISceneClient::GetViewportSize(const UUIScene*, FVector2D& out)
+// (0x00F539E0, slot +0x150 della vtable del scene client, chiamata da
+// UUIScene::UpdateViewportSize e dagli aggiornamenti delle scene attive):
+// e' la vera sorgente della dimensione con cui i menu si dispongono.
+constexpr uintptr_t kSceneViewportSizeAddr = 0x00F539E0;
+typedef int(__thiscall* SceneViewportSize_t)(void* self, void* scene, float* out);
+SceneViewportSize_t g_SceneViewportSize_Original = nullptr;
+class SceneViewportSizeThunk {
+public:
+    int Detour(void* scene, float* out) {
+        int r = g_SceneViewportSize_Original(this, scene, out);
+        if (r) ClampUiSize(out);
+        return r;
+    }
+};
+void* SceneViewportSizeThunkAddress() {
+    union { int (SceneViewportSizeThunk::*mfp)(void*, float*); void* fp; } c;
+    c.mfp = &SceneViewportSizeThunk::Detour;
+    return c.fp;
+}
+void* ViewportSizeThunkAddress() {
+    union { void (ViewportSizeThunk::*mfp)(float*); void* fp; } c;
+    c.mfp = &ViewportSizeThunk::Detour;
+    return c.fp;
+}
+void* UiViewportSizeThunkAddress() {
+    union { int (UiViewportSizeThunk::*mfp)(float*); void* fp; } c;
+    c.mfp = &UiViewportSizeThunk::Detour;
     return c.fp;
 }
 
@@ -8291,6 +8410,8 @@ public:
         if (vr::control::g_cinemaActive) {
             // Schermo virtuale: il gioco torna a disegnare in 16:9 (bande
             // sopra e sotto); bConstrainAspectRatio era stato azzerato da noi.
+            // (Una sotto-area 16:9 di LocalPlayer restringe solo il 3D: la
+            // Scaleform dei menu resta a tutta finestra, provato 21/10.)
             char* pc = *reinterpret_cast<char**>(reinterpret_cast<char*>(this) + 0x40);
             uint32_t camPtr = 0, flags = 0;
             if (pc && TrySafeReadUint32(pc + 0x38C, &camPtr) && camPtr &&
@@ -8470,6 +8591,29 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
             vr::log::Line("Hook on the engine crash filter installed (crash reports before the game's own).");
         else
             vr::log::Line("ERROR: hook on the engine crash filter failed.");
+    }
+    {
+        void* t1 = reinterpret_cast<void*>(kViewportSizeAddr);
+        void* t2 = reinterpret_cast<void*>(kUiViewportSizeAddr);
+        // Il getter del GameViewportClient e' usato anche dal motore (4 chiamanti):
+        // con l'altezza ridotta il gioco usciva in silenzio 3 s dopo l'avvio
+        // (21/10). Si aggancia solo quello della UIScene.
+        bool ok1 = vr::control::g_uiHookGameViewport &&
+                   MH_CreateHook(t1, ViewportSizeThunkAddress(), reinterpret_cast<void**>(&g_ViewportSize_Original)) == MH_OK &&
+                   MH_EnableHook(t1) == MH_OK;
+        bool ok2 = vr::control::g_uiHookUiScene &&
+                   MH_CreateHook(t2, UiViewportSizeThunkAddress(), reinterpret_cast<void**>(&g_UiViewportSize_Original)) == MH_OK &&
+                   MH_EnableHook(t2) == MH_OK;
+        void* t3 = reinterpret_cast<void*>(kSceneViewportSizeAddr);
+        // Dimensione dichiarata ai menu: il ritaglio non li ridisponeva (21/10),
+        // e il back buffer 16:9 (menu169) faceva un fail-fast nell'overlay di
+        // Steam al caricamento della campagna. Entrambi spenti di default.
+        bool ok3 = vr::control::g_ui169 &&
+                   MH_CreateHook(t3, SceneViewportSizeThunkAddress(), reinterpret_cast<void**>(&g_SceneViewportSize_Original)) == MH_OK &&
+                   MH_EnableHook(t3) == MH_OK;
+        vr::log::Line(std::string("Hook on the UI viewport size: scene client ") + (ok3 ? "ok" : "FAILED") +
+                      " (menus laid out 16:9 on the virtual screen); diagnostics: game viewport " + (ok1 ? "ok" : "off") +
+                      ", UI scene " + (ok2 ? "ok" : "off") + ".");
     }
     {
         void* target = reinterpret_cast<void*>(kCanvasProjectAddr);

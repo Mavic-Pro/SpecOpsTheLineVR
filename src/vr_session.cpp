@@ -283,10 +283,21 @@ bool PollEvents() {
             break;
         case vr::VREvent_ChaperoneUniverseHasChanged:
         case vr::VREvent_StandingZeroPoseReset:
-        case vr::VREvent_SeatedZeroPoseReset:
-            vr::control::g_recenterRequested = true;
-            vr::log::Line("OpenVR: play area / zero pose changed, recentering.");
+        case vr::VREvent_SeatedZeroPoseReset: {
+            // Virtual Desktop li manda a raffica (anche 4 per secondo, 21/10):
+            // uno ogni 10 s al massimo, e senza avviso nel visore (il toast
+            // "Recentered" a 1 m davanti allo schermo virtuale era un riquadro
+            // che spuntava di continuo: nausea sulla bandiera iniziale).
+            static ULONGLONG lastAuto = 0;
+            ULONGLONG nowA = GetTickCount64();
+            if (nowA - lastAuto > 10000) {
+                lastAuto = nowA;
+                vr::control::g_recenterSilent = true;
+                vr::control::g_recenterRequested = true;
+                vr::log::Line("OpenVR: play area / zero pose changed, recentering.");
+            }
             break;
+        }
         case vr::VREvent_IpdChanged:
             vr::control::g_vrProjectionDirty = true;
             break;

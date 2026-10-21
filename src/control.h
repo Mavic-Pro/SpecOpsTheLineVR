@@ -22,6 +22,11 @@ enum TrackMode : int {
 
 extern std::atomic<int> g_mode;
 extern std::atomic<bool> g_recenterRequested;
+extern std::atomic<bool> g_recenterSilent;
+extern std::atomic<bool> g_uiHookGameViewport;
+extern std::atomic<bool> g_uiHookUiScene;
+extern std::atomic<bool> g_ui169;
+extern std::atomic<bool> g_menu169;  // menu del gioco: back buffer 16:9 sullo schermo virtuale  // menu del gioco disposti in 16:9 sullo schermo virtuale  // diagnostica: aggancia anche UGameViewportClient::GetViewportSize  // ricentramento automatico (eventi): niente avviso ne' nero
 extern std::atomic<bool> g_dumpCameraRequested;
 extern std::atomic<float> g_synthYawAmpDeg;
 extern std::atomic<float> g_synthPitchAmpDeg;
@@ -318,10 +323,13 @@ extern std::atomic<bool> g_cinema3d;
 extern std::atomic<float> g_spreadAds, g_spreadTwoHand, g_spreadOneHand;
 // "laser on|off": raggio visibile dalla canna al punto d'impatto (aiuto alla mira alternativo al mirino).
 extern std::atomic<bool> g_laser;
+// "gesture gunmelee on|off": colpo di calcio / dall'alto con la mano dell'arma (predefinito off).
+extern std::atomic<bool> g_gestureGunMelee;
 // Menu nel visore: "vrmenu on|off" (apertura automatica all'avvio), aperto adesso, Virtual Desktop rilevato.
 extern std::atomic<int> g_vrMenu;
 extern std::atomic<bool> g_vrMenuOpen;
 extern std::atomic<bool> g_vdDetected;
+extern std::atomic<bool> g_vrMenuFlipY;  // "vrmenu flipy on": asse Y del puntatore invertito (diagnostica)
 // "waitbeforesubmit on|off": attesa del compositor dopo la copia, subito prima dell'invio (pacing).
 extern std::atomic<bool> g_waitBeforeSubmit;
 extern std::atomic<unsigned long long> g_interactSimUntil[2];  // "interactsim": zona finta fino a (ms)

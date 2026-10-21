@@ -25,6 +25,11 @@ namespace vr::control {
 
 std::atomic<int> g_mode{kModeHmd};
 std::atomic<bool> g_recenterRequested{true};
+std::atomic<bool> g_recenterSilent{true};
+std::atomic<bool> g_uiHookGameViewport{false};
+std::atomic<bool> g_uiHookUiScene{false};
+std::atomic<bool> g_ui169{false};
+std::atomic<bool> g_menu169{false};  // il primo (avvio) e quelli da evento sono silenziosi
 std::atomic<bool> g_dumpCameraRequested{false};
 std::atomic<float> g_synthYawAmpDeg{30.0f};
 std::atomic<float> g_synthPitchAmpDeg{0.0f};
@@ -92,9 +97,11 @@ std::atomic<bool> g_ham{false};
 std::atomic<bool> g_cinema3d{false};
 std::atomic<float> g_spreadAds{0.1f}, g_spreadTwoHand{0.5f}, g_spreadOneHand{1.5f};
 std::atomic<bool> g_laser{false};
+std::atomic<bool> g_gestureGunMelee{false};
 std::atomic<int> g_vrMenu{1};
 std::atomic<bool> g_vrMenuOpen{false};
 std::atomic<bool> g_vdDetected{false};
+std::atomic<bool> g_vrMenuFlipY{true};  // origine in basso a sinistra (verificato nel visore 21/10)
 std::atomic<bool> g_waitBeforeSubmit{true};
 std::atomic<unsigned long long> g_interactSimUntil[2]{0, 0};
 std::atomic<int> g_hintsShown{0};
@@ -353,6 +360,11 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         in >> v;
         if (v == "show") vr::menu::Show(true);
         else if (v == "hide") vr::menu::Show(false);
+        else if (v == "flipy") {
+            std::string w;
+            in >> w;
+            g_vrMenuFlipY = OnOff(cmd, w, false);
+        }
         else g_vrMenu = OnOff(cmd, v, true) ? 1 : 0;
     } else if (cmd == "laser") {
         std::string v;
@@ -769,9 +781,10 @@ void ExecuteNormalized(const std::string& line) {
         if (which == "grenade" || which == "all") g_gestureGrenade = on;
         if (which == "melee" || which == "all") g_gestureMelee = on;
         if (which == "reload" || which == "all") g_gestureReload = on;
+        if (which == "gunmelee") g_gestureGunMelee = on;
         if (which == "cover" || which == "all") g_gestureCover = on;
         if (which == "weapon" || which == "all") g_gestureWeapon = on;
-        if (which != "grenade" && which != "melee" && which != "reload" && which != "cover" && which != "weapon" &&
+        if (which != "grenade" && which != "melee" && which != "reload" && which != "cover" && which != "weapon" && which != "gunmelee" &&
             which != "all")
             vr::log::Line("CONFIG: unknown gesture \"" + which + "\" (grenade, melee, reload, cover, weapon, all).");
     } else if (cmd == "reload") {
@@ -1050,7 +1063,24 @@ void ExecuteNormalized(const std::string& line) {
         std::string v;
         in >> v;
         g_mirrorRequest = (v == "off") ? 0 : 1;
+    } else if (cmd == "menu169") {
+        std::string v;
+        in >> v;
+        g_menu169 = (v != "off");
+    } else if (cmd == "ui169") {
+        std::string v;
+        in >> v;
+        g_ui169 = (v != "off");
+    } else if (cmd == "uihookuiscene") {
+        std::string v;
+        in >> v;
+        g_uiHookUiScene = (v == "on");
+    } else if (cmd == "uihookgameviewport") {
+        std::string v;
+        in >> v;
+        g_uiHookGameViewport = (v == "on");
     } else if (cmd == "recenter") {
+        g_recenterSilent = false;
         g_recenterRequested = true;
     } else if (cmd == "dumpcam") {
         g_dumpCameraRequested = true;

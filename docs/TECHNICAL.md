@@ -750,6 +750,41 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   projects left for a later milestone; stages 3-4 of the interaction plan
   (gaze-chosen executions, pick-ups, QTE gestures) depend on playtests of
   stages 0-2.
+- **Game menus on the virtual screen (21/10):** fixed in the end by running
+  `UpdateAutoResolution` on the virtual screen too (the per-eye `setres`
+  right when the Scene starts re-lays out the viewport; before, with the
+  headset put on at the main menu, nothing re-laid it out and the menu sat
+  in a 65% box with the items outside). Confirmed in the headset: complete
+  menu with `menu169 off` and `ui169 off`. The notes below record what was
+  tried while the cause was unclear (the `ui169` clamp made it worse: cut
+  on every side). The UIScene menus of
+  the game (`UUIScreenObject::GetViewportSize` → the scene's
+  `CurrentViewportSize`, fed by `UGameUISceneClient::GetViewportSize` at
+  0x00F539E0) lay themselves out by the *height* of the back buffer, so with
+  a per-eye buffer (2112x2304) the main menu is 4096 px wide and cut at the
+  right; the 16:9 crop of the virtual screen then cuts it top and bottom
+  too. Things tried: a 16:9 sub-viewport in `CalcSceneView` (restricts only
+  the 3D, the UI stays full-window); a canvas scale in `AdjustCanvasMatrix`
+  (the menus are not drawn through it); clamping the height returned by the
+  scene client (`ui169`, hook on 0x00F539E0: fires, but the scene keeps its
+  layout); hooking `UUIScreenObject::GetViewportSize` at 0x00574390 makes
+  the game exit silently 3 s after start (no crash filter, no dump, no
+  Windows event) — do not hook that function. What works: a 16:9 back
+  buffer (`setres 2112x1188w`): the menu is complete, as on a monitor.
+  Done automatically with `menu169 on` (after 1.5 s of virtual screen, back
+  to the per-eye size when the screen ends), but the campaign load then
+  fail-fasted inside the Steam overlay (0xc0000409, CRT abort in
+  gameoverlayrenderer.dll), so it is off by default. Also fixed: the
+  first-frame layout (menu in a 65% box) came from the window being resized
+  after the game laid out the viewport; `UpdateAutoResolution` now runs on
+  the virtual screen too, so the `setres` happens at once. A `dumpcam`-style
+  `shot`/`burst` of the back buffer (`specopsvr_shots/*.bmp`) is the way to
+  see what the game draws; the mirror window shows the same back buffer.
+- **Automatic recenters (21/10):** Virtual Desktop sends
+  `ChaperoneUniverseHasChanged` / zero-pose-reset events in bursts; they are
+  now debounced to one per 10 s and silent (no toast, no blink;
+  `g_recenterSilent`): the "Recentered" toast popping up in front of the
+  virtual screen every few seconds was the "half-3D nauseating flag".
 - **Tests:** `src/pure_utils.h` holds the pure functions of the updater and
   the ini parser (versions, JSON, revocation, companions, line normalization,
   migrations) covered by `tests/unit_tests.cpp` (R-T2); `regress.py` runs

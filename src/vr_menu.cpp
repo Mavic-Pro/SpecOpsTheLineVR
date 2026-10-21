@@ -53,8 +53,6 @@ std::vector<Item> BasicItems() {
         {"seated", "Seated play", "Eye height from the game's crouch view, for playing seated.", Kind::OnOff},
         {"hints", "Controller hints", "Short hints in the headset during the first sessions.", Kind::Choice, {"auto", "on", "off"}},
         {"vrmenu", "This menu at start", "Open this menu on the game's main menu at every start.", Kind::Choice, {"on", "off"}},
-        {"updatechannel", "Update channel", "stable = releases only; beta = test builds too.", Kind::Choice, {"stable", "beta"}},
-        {"autoupdate", "Automatic updates", "Download new versions at start (active from the next launch).", Kind::OnOff},
     };
 }
 
@@ -86,6 +84,8 @@ vr::VROverlayHandle_t g_overlay = vr::k_ulOverlayHandleInvalid;
 unsigned g_overlayGen = 0;
 int g_hoverX = -1, g_hoverY = -1;
 bool g_dirty = true;
+float g_placedYaw = 0.0f;
+ULONGLONG g_awaySince = 0;
 
 struct Hit {
     RECT r;
@@ -123,7 +123,8 @@ void LoadIni() {
         in >> key;
         std::getline(in, rest);
         rest = Trim(rest);
-        if (key == "configversion" || key == "hintsshown") {
+        // Mai nel menu (richiesta 21/10): gli aggiornamenti non vanno spenti per sbaglio.
+        if (key == "configversion" || key == "hintsshown" || key == "autoupdate" || key == "updatechannel" || key == "updaterepo") {
             help.clear();
             continue;
         }
@@ -261,19 +262,20 @@ bool Render(std::vector<uint32_t>* rgba) {
     // giocare a meta' frequenza.
     LONG topY = kTop;
     if (vr::control::g_vdDetected) {
-        RECT ra = {20, kTop - 14, kW - 20, kTop + 56};
+        // Testo corto e a capo automatico (prima due righe lunghe tagliate).
+        RECT ra = {20, kTop - 14, kW - 20, kTop + 92};
         HBRUSH ab = CreateSolidBrush(RGB(110, 70, 20));
         FillRect(dc, &ra, ab);
         DeleteObject(ab);
         SelectObject(dc, fontSmall);
         SetTextColor(dc, RGB(255, 235, 200));
-        RECT r1 = {32, kTop - 10, kW - 32, kTop + 16};
-        DrawTextA(dc, "VIRTUAL DESKTOP: in the VD menu (left menu button > Streaming) set Synchronous Spacewarp = DISABLED and VR Frame Rate = 72,",
-                  -1, &r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        RECT r2 = {32, kTop + 18, kW - 32, kTop + 50};
-        DrawTextA(dc, "connect the PC to the router by Ethernet cable, else the game runs at half frame rate (36 fps). Changes apply at the next start.",
-                  -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        topY = kTop + 70;
+        RECT r1 = {34, kTop - 8, kW - 34, kTop + 88};
+        DrawTextA(dc,
+                  "VIRTUAL DESKTOP: to avoid half frame rate, in the VD menu (Streaming tab) set Synchronous Spacewarp = Disabled, "
+                  "VR Frame Rate = 72, VR Graphics Quality = High or lower, and connect the PC to the router with an Ethernet cable. "
+                  "Changes apply at the next start.",
+                  -1, &r1, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        topY = kTop + 106;
     }
     if (g_tab == 2) {
         SelectObject(dc, mono);
@@ -285,7 +287,7 @@ bool Render(std::vector<uint32_t>* rgba) {
     } else {
         std::vector<Item>& items = g_tab == 0 ? g_basic : g_advanced;
         int n = static_cast<int>(items.size());
-        int rows = topY > kTop ? kRowsPerPage - 1 : kRowsPerPage;
+        int rows = topY > kTop ? kRowsPerPage - 2 : kRowsPerPage;
         if (g_scroll > n - rows) g_scroll = n - rows;
         if (g_scroll < 0) g_scroll = 0;
         for (int row = 0; row < rows && g_scroll + row < n; ++row) {
@@ -337,7 +339,7 @@ bool Render(std::vector<uint32_t>* rgba) {
     const uint32_t* src = static_cast<const uint32_t*>(bits);
     for (size_t i = 0; i < rgba->size(); ++i) {
         uint32_t p = src[i];
-        (*rgba)[i] = (p & 0xFF0000) >> 16 | (p & 0xFF00) | (p & 0xFF) << 16 | 0xF2000000u;
+        (*rgba)[i] = (p & 0xFF0000) >> 16 | (p & 0xFF00) | (p & 0xFF) << 16 | 0xFF000000u;  // opaco: leggibile
     }
     for (HFONT f : {title, body, fontSmall, mono}) DeleteObject(f);
     SelectObject(dc, oldBmp);
@@ -385,6 +387,7 @@ void Place() {
     fx /= fl;
     fz /= fl;
     float dist = 1.6f;
+    g_placedYaw = std::atan2(fx, -fz);  // direzione in cui e' stato messo (per rimetterlo davanti se ci si gira)
     float zx = -fx, zz = -fz;
     vr::HmdMatrix34_t t = {};
     t.m[0][0] = zz;   t.m[0][1] = 0.0f; t.m[0][2] = zx; t.m[0][3] = m.m[0][3] + fx * dist;
@@ -456,36 +459,76 @@ void Show(bool show) { g_request = show ? 1 : -1; }
 bool IsOpen() { return g_open; }
 
 void Tick(bool cinema) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    // Dal worker dell'uscita VR (ogni frame: puntatore reattivo) e dal thread
+    // della sessione (ogni 0,5 s, riserva senza visore). Uno alla volta, con
+    // il lock condiviso della sessione per gli overlay; chi trova occupato salta.
+    std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    vr::session::Shared session(true);
+    if (!session.ok()) return;
     int req = g_request.exchange(0);
     if (req) DoShow(req > 0);
     // Apertura automatica: sul primo schermo virtuale (menu del gioco), dopo 2 s.
     int mode = vr::control::g_vrMenu.load();
     if (!g_open && !g_shownAtStart && mode == 1 && vr::session::Ready() && vr::session::HmdPresent()) {  // mai senza visore (test headless)
+        // Prima del gioco: 1,5 s dopo l'inizio della sessione nel visore,
+        // qualunque cosa stia facendo il gioco (lo schermo virtuale resta
+        // nascosto finche' il menu e' aperto, vedi vr_output).
+        (void)cinema;
         ULONGLONG now = GetTickCount64();
-        if (cinema) {
-            if (!g_cinemaSince) g_cinemaSince = now;
-            if (now - g_cinemaSince > 2000) {
-                g_shownAtStart = true;
-                DoShow(true);
-            }
-        } else {
-            g_cinemaSince = 0;
+        if (!g_cinemaSince) g_cinemaSince = now;
+        if (now - g_cinemaSince > 1500) {
+            g_shownAtStart = true;
+            DoShow(true);
         }
     }
     if (!g_open || !vr::VROverlay() || g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    // Menu fuori dalla vista (testa girata di oltre 50 gradi per 0,7 s, p.es.
+    // visore indossato guardando altrove): lo si rimette davanti.
+    {
+        vr::IVRSystem* sys = vr::VRSystem();
+        vr::TrackedDevicePose_t pose;
+        if (sys) {
+            sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, &pose, 1);
+            const vr::HmdMatrix34_t& m = pose.mDeviceToAbsoluteTracking;
+            float yaw = std::atan2(-m.m[0][2], m.m[2][2]);
+            float d = std::fabs(std::remainder(yaw - g_placedYaw, 6.28318530718f));
+            ULONGLONG nowP = GetTickCount64();
+            if (pose.bPoseIsValid && d > 50.0f * 0.01745329252f) {
+                if (!g_awaySince) g_awaySince = nowP;
+                if (nowP - g_awaySince > 700) {
+                    g_awaySince = 0;
+                    Place();
+                }
+            } else {
+                g_awaySince = 0;
+            }
+        }
+    }
     vr::VREvent_t ev;
     while (vr::VROverlay()->PollNextOverlayEvent(g_overlay, &ev, sizeof(ev))) {
-        // Coordinate del mouse dell'overlay: origine in basso a sinistra.
-        int x = static_cast<int>(ev.data.mouse.x), y = kH - static_cast<int>(ev.data.mouse.y);
+        // Coordinate del mouse dell'overlay con SetOverlayMouseScale: origine
+        // in basso a sinistra (verificato nel visore 21/10: senza inversione
+        // nessun clic arrivava ai pulsanti); "vrmenu flipy off" per provare.
+        int x = static_cast<int>(ev.data.mouse.x), y = static_cast<int>(ev.data.mouse.y);
+        if (vr::control::g_vrMenuFlipY) y = kH - y;
         switch (ev.eventType) {
-        case vr::VREvent_MouseMove:
-            if (x != g_hoverX || y != g_hoverY) {
-                g_hoverX = x;
-                g_hoverY = y;
-                g_dirty = true;
-            }
+        case vr::VREvent_MouseMove: {
+            // Ridisegno solo quando cambia il pulsante sotto il puntatore:
+            // un SetOverlayRaw a ogni movimento faceva lampeggiare il menu.
+            auto hitAt = [&](int px, int py) {
+                for (size_t i = 0; i < g_hits.size(); ++i) {
+                    const RECT& r = g_hits[i].r;
+                    if (px >= r.left && px < r.right && py >= r.top && py < r.bottom) return static_cast<int>(i);
+                }
+                return -1;
+            };
+            int before = hitAt(g_hoverX, g_hoverY), after = hitAt(x, y);
+            g_hoverX = x;
+            g_hoverY = y;
+            if (before != after) g_dirty = true;
             break;
+        }
         case vr::VREvent_MouseButtonDown:
             Click(x, y);
             break;
