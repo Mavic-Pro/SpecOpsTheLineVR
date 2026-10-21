@@ -207,6 +207,12 @@ bool TrySafeReadUint32(void* addr, uint32_t* outValue);
 extern std::atomic<bool> g_onTurret;
 extern std::atomic<int32_t> g_turretYawUnits;
 bool TurretAimActive();
+// Fine dello schermo virtuale e ultimo salto della vista subito dopo (nero di assestamento).
+std::atomic<uint64_t> g_cinemaEndMs{0};
+std::atomic<uint64_t> g_settleJumpMs{0};
+std::atomic<uint64_t> g_teleportMs{0};
+// Minigun dell'elicottero in mano (YWeapon_TurretMiniGunOnFlight).
+std::atomic<bool> g_flightGunHeld{false};
 bool SafeCopy(void* dst, const void* src, size_t n);
 // Giocatore bloccato da una scena (bCinematicMode), aggiornato dal thread di gioco.
 std::atomic<bool> g_gameLockedScene{false};
@@ -2700,6 +2706,7 @@ class ViewportDrawThunk {
 public:
     void Detour(int bShouldPresent) {
         void* self = this;
+        const double tickStart = ProfMs();
         if (vr::control::g_headSampleOnDraw) UpdateHeadTracking();
         char* cam = static_cast<char*>(g_cameraPtr.load());
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
@@ -2789,14 +2796,62 @@ public:
             uint32_t pawnPtr = 0;
             bool dead = HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0x1F8, &pawnPtr) && pawnPtr &&
                         !PawnAlive(reinterpret_cast<void*>(pawnPtr));
-            vr::output::HoldBlack(vr::control::g_fades && vr::control::g_cinemaEnabled && noWalker && dead &&
-                                  !vr::control::g_cinemaActive && !vr::control::g_cinemaForce);
+            // Ritorno dallo schermo virtuale: nero per 0,7 s e fino a 0,3 s dopo
+            // l'ultimo salto della vista (al massimo 1,5 s). All'inizio della
+            // scena dell'elicottero Walker restava ~0,5 s a terra e poi saltava
+            // di 15000 unita' sull'elicottero: prima persona, lampo, scena, tre
+            // dissolvenze di fila (21/10).
+            ULONGLONG nowS = GetTickCount64(), end = g_cinemaEndMs.load();
+            // Minigun dell'elicottero: dopo la scena la camera resta ferma ~1,5 s
+            // a terra e poi salta sull'elicottero; nero finche' non si muove
+            // (al massimo 3 s).
+            static ULONGLONG baseFor = 0;
+            static float endBase[3] = {0, 0, 0};
+            bool stillAtStart = false;
+            if (end && HasCameraSignature(cam)) {
+                const float* cl = reinterpret_cast<const float*>(cam + 0x10);
+                // Riferimento: dove sta la camera alla fine dei primi 0,7 s (nei
+                // primi tick e' ancora quella della scena).
+                if (baseFor != end || nowS - end < 700) {
+                    baseFor = end;
+                    for (int i = 0; i < 3; ++i) endBase[i] = cl[i];
+                }
+                float dx = cl[0] - endBase[0], dy = cl[1] - endBase[1], dz = cl[2] - endBase[2];
+                float d2 = dx * dx + dy * dy + dz * dz;
+                stillAtStart = d2 < 1.0f;
+                // Salto sull'elicottero visto qui, nello stesso tick (il disegno
+                // lo vedrebbe dopo: un tick senza nero tra le due attese).
+                if (nowS - end < 3000 && d2 > 2000.0f * 2000.0f && g_teleportMs.load() < end) g_teleportMs = nowS;
+            }
+            bool settle = !vr::control::g_cinemaActive &&
+                          ((end && (nowS - end < 700 || (nowS - end < 1500 && nowS - g_settleJumpMs.load() < 300) ||
+                                    (nowS - end < 3000 && g_flightGunHeld && stillAtStart))) ||
+                           nowS - g_teleportMs.load() < 600);
+            {
+                static ULONGLONG settleStart = 0;
+                if (settle && !settleStart) settleStart = nowS;
+                if (!settle && settleStart) {
+                    char b[100];
+                    snprintf(b, sizeof(b), "FADE: black held %.2f s while the view settled", (nowS - settleStart) / 1000.0);
+                    vr::log::Line(b);
+                    settleStart = 0;
+                }
+            }
+            vr::output::HoldBlack(vr::control::g_fades && vr::control::g_cinemaEnabled && !vr::control::g_cinemaForce &&
+                                  ((noWalker && dead && !vr::control::g_cinemaActive) || settle));
         }
         // Isteresi: momenti brevi di modalita' cinematica durante il gioco
         // (porte, eventi scriptati) restano in VR. Passare allo schermo
         // virtuale per mezzo secondo e tornare indietro, nel visore, e' un
         // lampo (segnalazione 18/10: "flash of light ... during gameplay").
-        static ULONGLONG wantedSince = 0, unwantedSince = 0;
+        // Inizio delle scene scriptate (21/10, elicotteri all'inizio del
+        // capitolo 1): la camera passa da Walker per pochi decimi di secondo
+        // tra un'inquadratura e l'altra; con 0,15 s per tornare in VR e 0,6 s
+        // per ripartire lo schermo virtuale si vedeva prima persona, scena in
+        // 3D, schermo, prima persona, schermo. Ora: uscita dallo schermo dopo
+        // 0,8 s su Walker; i 0,6 s di tolleranza solo dopo 2 s di gioco vero in
+        // VR (prima, e all'avvio, 0,15 s).
+        static ULONGLONG wantedSince = 0, unwantedSince = 0, vrSince = 0;
         ULONGLONG nowMs = GetTickCount64();
         bool cinema = vr::control::g_cinemaActive.load();
         if (wanted) {
@@ -2804,13 +2859,19 @@ public:
             if (!wantedSince) wantedSince = nowMs;
             // Camera lontana da Walker per meno di 0,6 s (inquadrature brevi da 0,1-0,5 s
             // nei log): resta in VR, niente lampo dello schermo virtuale.
-            ULONGLONG need = vr::control::g_cinemaForce ? 0 : 600;
+            bool settled = vrSince && nowMs - vrSince >= 2000;
+            bool teleported = nowMs - g_teleportMs.load() < 1000;
+            ULONGLONG need = vr::control::g_cinemaForce || teleported ? 0 : (settled ? 600 : 150);
             if (nowMs - wantedSince >= need) cinema = true;
         } else {
             wantedSince = 0;
             if (!unwantedSince) unwantedSince = nowMs;
-            if (nowMs - unwantedSince >= 150) cinema = false;
+            if (nowMs - unwantedSince >= 800) cinema = false;
         }
+        // Solo il tempo con la camera davvero su Walker (all'avvio i tick di
+        // caricamento senza camera contavano come gioco: 0,6 s in prima persona).
+        if (cinema || !HasCameraSignature(cam)) vrSince = 0;
+        else if (!vrSince && !wanted) vrSince = nowMs;
         if (cinema != vr::control::g_cinemaActive.load()) {
             InvalidateEyeRing();
             // Coda delle etichette svuotata al cambio: durante i filmati il
@@ -2826,6 +2887,7 @@ public:
             g_cinemaSwitches.fetch_add(1, std::memory_order_relaxed);
             vr::log::Line(cinema ? "CINEMA: virtual screen (outside gameplay)" : "CINEMA: end, back to VR");
             vr::control::g_cinemaActive = cinema;
+            if (!cinema) g_cinemaEndMs = nowMs;
             if (vr::control::g_fades) vr::output::Blink(0.3f);
         }
         UpdateDynamicResolution(cam, cinema || half <= 0 || !vr::control::g_syncStereo);
@@ -2859,6 +2921,8 @@ public:
         uint32_t* vsSlot = ViewStateSlot(cam);
         uint32_t vsEngine = vsSlot ? *vsSlot : 0;
         uint32_t vsRight = vsSlot ? RightEyeViewState(vsEngine) : 0;
+        const double drawStart = ProfMs();
+        double drawEye[2] = {0.0, 0.0};
         for (int eye = 0; eye < 2; ++eye) {
             loc[0] = base[0];
             loc[1] = base[1];
@@ -2881,7 +2945,8 @@ public:
             if (eye == 1 && vsRight) *vsSlot = vsRight;
             g_ViewportDraw_Original(self, bShouldPresent);
             if (eye == 1 && vsRight) *vsSlot = vsEngine;
-            g_profDraw[eye] += ProfMs() - t0;
+            drawEye[eye] = ProfMs() - t0;
+            g_profDraw[eye] += drawEye[eye];
         }
         {
             static double last = 0.0;
@@ -2897,6 +2962,19 @@ public:
                 g_profTick += dt;
                 if (dt > 20.0) ++longTicks;
                 if (dt > maxTick) maxTick = dt;
+                // Dove va il tempo di un tick lento (21/10: 2-5 al secondo nella
+                // scena dell'elicottero): mod prima del disegno, disegno dei due
+                // occhi, fuori dal disegno (logica del gioco, Present, attesa).
+                static ULONGLONG lastHitchLog = 0;
+                if (dt > 20.0 && GetTickCount64() - lastHitchLog > 2000) {
+                    lastHitchLog = GetTickCount64();
+                    char hb[200];
+                    std::snprintf(hb, sizeof(hb),
+                                  "HITCH: tick %.1f ms = mod before draw %.1f, draw left %.1f right %.1f, outside the "
+                                  "draw %.1f",
+                                  dt, drawStart - tickStart, drawEye[0], drawEye[1], dt - (now - tickStart));
+                    vr::log::Line(hb);
+                }
             }
             last = now;
             if (++g_profCount >= 300) {
@@ -4181,6 +4259,7 @@ const WeaponInfo& CurrentWeaponInfo(void* weapon) {
         // L'RPG spara solo mirando (LT): col controller LT si tiene da solo
         // mentre si preme il grilletto (audit 19/10).
         vr::control::g_weaponNeedsAim = g_weaponInfo.cls.find("RPG") != std::string::npos;
+        g_flightGunHeld = g_weaponInfo.cls.find("OnFlight") != std::string::npos;
         // Caricatore per tipo d'arma (rispetto a magwell, tarato sui fucili):
         // pistole e Uzi nell'impugnatura sotto la mano, P90 sopra la canna,
         // fucili a tamburo/pompa piu' avanti.
@@ -5964,8 +6043,19 @@ public:
                 // tick diventava una dissolvenza (19/10, nel visore: lag e
                 // problemi nelle scene degli elicotteri).
                 static float prevDj = 0.0f;
-                if (dj > 80.0f && dj > 3.0f * prevDj + 40.0f && vr::control::g_fades && !g_gameLockedScene)
+                // Subito dopo lo schermo virtuale il nero e' gia' tenuto: il salto lo prolunga.
+                bool settling = GetTickCount64() - g_cinemaEndMs.load() < 1500;
+                if (dj > 80.0f && settling) g_settleJumpMs = GetTickCount64();
+                // Teletrasporto (fine di un tratto in elicottero: 17700 unita'
+                // e 0,6 s dopo la scena): nero tenuto e scena subito sullo schermo.
+                if (dj > 2000.0f) g_teleportMs = GetTickCount64();
+                if (dj > 80.0f && dj > 3.0f * prevDj + 40.0f && vr::control::g_fades && !g_gameLockedScene &&
+                    !settling) {
                     vr::output::Blink(0.3f);
+                    char b[120];
+                    snprintf(b, sizeof(b), "FADE: view jumped %.0f units in a tick (previous %.0f)", dj, prevDj);
+                    vr::log::Line(b);
+                }
                 prevDj = dj;
                 // Movimento forzato per la vignettatura: base della vista (senza
                 // testa) che si muove senza lo stick (veicoli, spinte del gioco)
