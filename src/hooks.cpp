@@ -3074,6 +3074,13 @@ void ApplyVrPreset(char* cam) {
 // piccola o, se impostata grande, troppo pesante. Controllo ogni 5 s; il
 // cambio (setres, con reset del device) solo se la differenza supera il 4%.
 // Massimo 4096 (desktop finto di display_spoof).
+// Dopo un setres sullo schermo virtuale il gioco puo' restare disposto in un
+// riquadro al 65% (menu tagliato, 21/10: setres 0,3 s dopo l'inizio della
+// Scene); spegnere e riaccendere lo schermo virtuale lo sistemava. Qui per
+// questi frame CalcSceneView toglie bConstrainAspectRatio e poi lo rimette:
+// stesso effetto senza lampo.
+std::atomic<int> g_relayoutFrames{0};
+
 void UpdateAutoResolution(char* cam) {
     static ULONGLONG last = 0;
     static bool lastMenu = false;
@@ -3118,10 +3125,22 @@ void UpdateAutoResolution(char* cam) {
                   std::to_string(w) + "x" + std::to_string(h) + (menu ? "" : " per eye") + ", game is " +
                   std::to_string(bw) + "x" + std::to_string(bh) + ": " + cmd);
     vr::script::ExecConsole(cam - 0x77C, cmd);
+    if (vr::control::g_cinemaActive) g_relayoutFrames = 20;
 }
 
 void UpdateDynamicResolution(char* cam, bool mono) {
     static ULONGLONG last = 0;
+    // Il gioco salva ScreenPercentage nelle sue impostazioni: dopo una sessione
+    // con la risoluzione dinamica partiva al 65% (menu iniziale disposto a
+    // tutta finestra ma scena al 65%: "menu tagliato", 21/10, verificato
+    // senza visore) mentre qui si credeva al 100%. All'avvio si impone il 100%.
+    static bool forced = false;
+    if (!forced && HasCameraSignature(cam)) {
+        forced = true;
+        vr::script::ExecConsole(cam - 0x77C, "scale set ScreenPercentage 100");
+        g_screenPercent = 100;
+        vr::log::Line("DYNRES: ScreenPercentage forced to 100% at start (the game saves the last value).");
+    }
     if (!mono) ApplyVrPreset(cam);
     // Anche con lo schermo virtuale (mono): il menu iniziale restava disposto
     // in un riquadro al 65% del frame (voci fuori dal riquadro, "menu
@@ -8482,7 +8501,9 @@ public:
             vr::log::Line(buf);
             ++logged;
         }
-        if (vr::control::g_cinemaActive) {
+        bool relayout = vr::control::g_cinemaActive && g_relayoutFrames.load() > 0;
+        if (relayout) --g_relayoutFrames;
+        if (vr::control::g_cinemaActive && !relayout) {
             // Schermo virtuale: il gioco torna a disegnare in 16:9 (bande
             // sopra e sotto); bConstrainAspectRatio era stato azzerato da noi.
             // (Una sotto-area 16:9 di LocalPlayer restringe solo il 3D: la
@@ -8493,7 +8514,7 @@ public:
                 TrySafeReadUint32(reinterpret_cast<char*>(camPtr) + 0x208, &flags) && !(flags & 2)) {
                 *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(camPtr) + 0x208) = flags | 2u;
             }
-        } else if (vr::control::g_fullViewport) {
+        } else if (vr::control::g_fullViewport || relayout) {
             float* originAndSize = reinterpret_cast<float*>(reinterpret_cast<char*>(this) + 0x68);
             originAndSize[0] = 0.0f;
             originAndSize[1] = 0.0f;

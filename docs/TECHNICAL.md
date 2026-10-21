@@ -778,14 +778,18 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   executions); QTE / moral-choice gestures (E9/E10) and the per-move policy
   table need per-scene playtests and R-T3 (special-move names), both left
   for a later milestone; hiding the game's ammo widget (part of R-U3) see above.
-- **Game menus on the virtual screen (21/10):** fixed in the end by running
-  `UpdateAutoResolution` on the virtual screen too (the per-eye `setres`
-  right when the Scene starts re-lays out the viewport; before, with the
-  headset put on at the main menu, nothing re-laid it out and the menu sat
-  in a 65% box with the items outside). Confirmed in the headset: complete
-  menu with `menu169 off` and `ui169 off`. The notes below record what was
+- **Game menus on the virtual screen (21/10), real cause:** the game saves
+  `ScreenPercentage` in its settings, so after a session where the dynamic
+  resolution had lowered it the game *started* at 65% while the mod assumed
+  100%: the UIScene menu is laid out on the full viewport but the scene is
+  drawn in a 65% box, and the crop of the virtual screen shows that box
+  ("menu cut on every side"). Reproduced without a headset (`shot` of the
+  back buffer: box 65% at boot, 100% after `scale set ScreenPercentage
+  100`, 90% after `90`). `UpdateDynamicResolution` now forces 100% once at
+  start; the virtual screen keeps 100%. The notes below record what was
   tried while the cause was unclear (the `ui169` clamp made it worse: cut
-  on every side). The UIScene menus of
+  on every side; `UpdateAutoResolution` on the virtual screen stays, it is
+  harmless). The UIScene menus of
   the game (`UUIScreenObject::GetViewportSize` → the scene's
   `CurrentViewportSize`, fed by `UGameUISceneClient::GetViewportSize` at
   0x00F539E0) lay themselves out by the *height* of the back buffer, so with
