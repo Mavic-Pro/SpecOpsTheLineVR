@@ -1381,6 +1381,12 @@ void ApplyVrStickRules(XGamepad* pad) {
     }
     if (!vr::control::g_stickPitch) pad->sThumbRY = 0;
     float snap = vr::control::g_snapTurnDeg;
+    // Scene e mosse animate dal gioco (corda, scavalcare, scene scriptate): il
+    // corpo lo muove l'animazione, una rotazione nostra lo porterebbe fuori posa.
+    if (vr::control::g_gameLocked) {
+        pad->sThumbRX = 0;
+        return;
+    }
     if (snap <= 0.0f) {
         // Rotazione continua fatta dalla mod a velocita' costante (turnspeed,
         // gradi/s, curva quadratica dopo la zona morta): quella del gioco ha

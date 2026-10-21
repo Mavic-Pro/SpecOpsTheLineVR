@@ -228,9 +228,32 @@ bool IsBodyAnimSpecialMove(uint8_t sm) {
            (sm >= 59 && sm <= 64) ||  // torrette (entrata/uscita), inciampi nella sabbia
            sm == 66 || sm == 67;      // adrenalina
 }
+// Mosse legate alla copertura (il gioco gira Walker verso il riparo: la
+// rotazione va tolta dalla vista, movimento nel riferimento del corpo):
+// scavalcare 2-6, girata SWAT 10, uscite di lato 11-15, scatto in copertura
+// 16-18, aggancio 19, uscita 20-21, fine sporgersi 22. Fuori (M9): scatti
+// 38-41 e girata rapida 42 (la vista deve restare dove guarda il giocatore,
+// movimento con la testa), colpi subiti 9 e 58, inciampi 63-64.
+bool IsCoverLikeSpecialMove(uint8_t sm) {
+    if (sm == 0) return false;
+    if (sm == 9 || sm == 58 || (sm >= 38 && sm <= 42) || sm == 63 || sm == 64) return false;
+    return true;
+}
+// Mosse in cui la testa di Walker scende davvero (la vista la segue, come
+// nelle scene scriptate): afferrato per un'esecuzione 26, corda 44-47,
+// zipline 48, scudo umano subito 50/52, atterrato e rialzarsi 54-57.
+// Non scavalcare e raccogliere (M8: la vista oscillava di decine di unita').
+bool IsNeckFollowSpecialMove(uint8_t sm) {
+    return sm == 26 || (sm >= 44 && sm <= 48) || sm == 50 || sm == 52 || (sm >= 54 && sm <= 57);
+}
 bool SafeCopy(void* dst, const void* src, size_t n);
-// Giocatore bloccato da una scena (bCinematicMode), aggiornato dal thread di gioco.
+// Giocatore bloccato da una scena (bCinematicMode) o da una mossa animata dal
+// gioco, aggiornato dal thread di gioco.
 std::atomic<bool> g_gameLockedScene{false};
+// Solo bCinematicMode (scena scriptata): dopo, la rotazione di Walker e' voluta.
+std::atomic<bool> g_cinematicScene{false};
+// La vista segue l'attacco del collo di Walker (scene scriptate, corda, atterrato).
+std::atomic<bool> g_neckFollowScene{false};
 
 void* VTableEntry(void* obj, int index) {
     void** vtable = *reinterpret_cast<void***>(obj);
@@ -2243,7 +2266,12 @@ void ApplyNearPlane(char* cam) {
 // spostata in avanti lungo lo yaw della camera.
 bool PawnOnFirmGround(void* pawn);
 
+// Avanzamento degli occhi rispetto al centro di Walker applicato nell'ultima
+// copia della camera (fp a terra, 0 sui mezzi, 0 se la vista non e' su Walker).
+std::atomic<float> g_fwdApplied{0.0f};
+
 void ApplyFirstPerson(char* cam) {
+    g_fwdApplied = 0.0f;
     if (!vr::control::g_firstPerson) return;
     // Pawn del giocatore: PlayerController.Pawn (+0x1F8); la camera e' a
     // PC+0x77C. (g_pawnPtr dall'hook di execGetPawnViewLocation e' spesso un
@@ -2270,6 +2298,7 @@ void ApplyFirstPerson(char* cam) {
     // avanti: con 15 unita' davanti al Pawn la vista finiva fuori dalla porta
     // dell'elicottero (19/10, nel visore, anche nella 0.9.6).
     float fwd = PawnOnFirmGround(pawn) ? vr::control::g_fpForward.load() : 0.0f;
+    g_fwdApplied = fwd;  // per le correzioni del perno (girando, gli occhi non devono scivolare)
     loc[0] = p[0] + fwd * std::cos(yaw);
     loc[1] = p[1] + fwd * std::sin(yaw);
     // "height auto": occhi all'altezza della testa vera (in piedi, misurata da
@@ -2364,7 +2393,10 @@ bool PawnOnFirmGround(void* pawn) {
     char* p = static_cast<char*>(pawn);
     uint32_t phys = 0, base = 0, veh = 0;
     if (g_onTurret) return false;
-    if (!TrySafeReadUint32(p + 0x94, &phys) || (phys & 0xFF) != 1) return false;
+    // Actor.Physics: 1 PHYS_Walking, 2 PHYS_Falling. Anche cadendo (gradini,
+    // salti da una sporgenza) Walker e' a piedi: prima contava come mezzo e
+    // per un attimo avanzamento, base della vista e corpo cambiavano modo (M2).
+    if (!TrySafeReadUint32(p + 0x94, &phys) || ((phys & 0xFF) != 1 && (phys & 0xFF) != 2)) return false;
     if (TrySafeReadUint32(p + 0x3B8, &veh) && veh) return false;
     if (!TrySafeReadUint32(p + 0xAC, &base)) return false;
     // Base in movimento nell'ultimo secondo = mezzo.
@@ -2796,11 +2828,13 @@ public:
         // scriptate, mani e corpo all'animazione. Nella discesa con la corda
         // del capitolo 1 le mani restavano sui controller e il corpo
         // spostato/girato: "corpo deforme" (21/10).
-        bool specialAnim = false;
+        bool specialAnim = false, neckFollow = false;
         if (!noWalker) {
             uint8_t sm = 0;
-            if (SafeCopy(&sm, static_cast<char*>(PlayerPawnIfViewTarget(cam)) + kOffPawnSpecialMove, 1))
+            if (SafeCopy(&sm, static_cast<char*>(PlayerPawnIfViewTarget(cam)) + kOffPawnSpecialMove, 1)) {
                 specialAnim = IsBodyAnimSpecialMove(sm);
+                neckFollow = IsNeckFollowSpecialMove(sm);
+            }
             static uint8_t lastSm = 0;
             if (sm != lastSm) {
                 char b[80];
@@ -2810,6 +2844,8 @@ public:
             }
         }
         g_pawnSpecialAnim = specialAnim;
+        g_cinematicScene = cinematicMode;
+        g_neckFollowScene = cinematicMode || neckFollow;
         g_gameLockedScene = cinematicMode || specialAnim;
         vr::control::g_gameLocked = cinematicMode || specialAnim;
         {
@@ -3621,25 +3657,29 @@ void UpdateHeadTracking() {
         vr::log::Line("Recentered: hmdYaw=" + std::to_string(hmdYaw) + " hmdPitch=" + std::to_string(hmdPitch) +
                       " pos=(" + std::to_string(pos[0]) + ", " + std::to_string(pos[1]) + ", " + std::to_string(pos[2]) + ")");
     }
-    // Rotazione con lo stick (continua o a scatti) attorno alla testa: il corpo
-    // gira attorno al centro di Walker e gli occhi, fp unita' davanti piu' lo
-    // spostamento della testa, giravano con lui (fino a 1 m di scivolata dopo
-    // un passo dal punto di ricentramento, audit 19/10). Si sposta il
-    // riferimento della posizione perche' gli occhi restino dove sono.
-    {
-        int32_t d = vr::control::g_stickYawUnits.exchange(0);
+    // Il corpo gira attorno al centro di Walker, gli occhi stanno fwd unita'
+    // davanti (piu' lo spostamento della testa): girando, gli occhi
+    // scivolerebbero di lato. Si sposta il riferimento della posizione della
+    // stessa quantita' perche' restino dove sono (perno sulla testa).
+    //   dUnits: rotazione del corpo appena applicata (unita' Unreal);
+    //   fwd: avanzamento davvero applicato (0 sui mezzi; 0 in copertura, dove
+    //        il gioco tiene il Pawn girato verso il riparo e ruota solo la vista);
+    //   headRotates: con lo stick lo spostamento della testa gira col corpo
+    //        (il riferimento non cambia), con la testa no (riferimento gia'
+    //        spostato di altrettanto: il vettore nel mondo resta uguale).
+    // Va chiamata con il riferimento (g_hmdYawReference) gia' aggiornato.
+    auto compensatePivot = [&](int32_t dUnits, float fwd, bool headRotates) {
         float scale = vr::control::g_posScale;
-        if (d && vr::control::g_sixDof && scale > 0.0f) {
-            float a = d * (6.28318530718f / 65536.0f);
-            float fwd = vr::control::g_fpForward.load();
-            float vf = fwd + g_headOffset[0].load(), vrr = g_headOffset[1].load();
-            float nf = vf * std::cos(a) + vrr * std::sin(a), nr = -vf * std::sin(a) + vrr * std::cos(a);
-            float df = (nf - fwd) - g_headOffset[0].load(), dr = nr - g_headOffset[1].load();
-            float sy = std::sin(g_hmdYawReference), cy = std::cos(g_hmdYawReference);
-            posRef[0] -= (df * sy + dr * cy) / scale;
-            posRef[2] -= (-df * cy + dr * sy) / scale;
-        }
-    }
+        if (!dUnits || !vr::control::g_sixDof || scale <= 0.0f) return;
+        float a = dUnits * (6.28318530718f / 65536.0f);
+        float hf = headRotates ? g_headOffset[0].load() : 0.0f, hr = headRotates ? g_headOffset[1].load() : 0.0f;
+        float vf = fwd + hf, vrr = hr;
+        float nf = vf * std::cos(a) + vrr * std::sin(a), nr = -vf * std::sin(a) + vrr * std::cos(a);
+        float df = (nf - fwd) - hf, dr = nr - hr;
+        float sy = std::sin(g_hmdYawReference), cy = std::cos(g_hmdYawReference);
+        posRef[0] -= (df * sy + dr * cy) / scale;
+        posRef[2] -= (-df * cy + dr * sy) / scale;
+    };
     // Altezza degli occhi per "height auto": testa in piedi (riferimento, metri
     // sul pavimento) meno il centro del Pawn in piedi (45 unita' sopra i
     // piedi), entro 25..55 unita'.
@@ -3683,9 +3723,13 @@ void UpdateHeadTracking() {
         // rotazione verso il riparo avviene qui, m_coverFaceState e' ancora 0),
         // 20 uscendo; anche scavalcamenti e corpo a corpo.
         specialMove = pawnT && TrySafeReadUint32(static_cast<char*>(pawnT) + 0x490, &special) &&
-                      ((special >> 8) & 0xFF) != 0;
+                      IsCoverLikeSpecialMove(static_cast<uint8_t>((special >> 8) & 0xFF));
         vr::control::g_inCover = inCover || specialMove;
     }
+    // Rotazione con lo stick (continua o a scatti): fino a 1 m di scivolata
+    // dopo un passo dal punto di ricentramento (audit 19/10). In copertura il
+    // Pawn non gira (fwd 0); sui mezzi fwd e' gia' 0.
+    compensatePivot(vr::control::g_stickYawUnits.exchange(0), inCover ? 0.0f : g_fwdApplied.load(), true);
     // Rotazione del corpo decisa dal gioco (entrando in copertura Walker viene
     // girato di ~50 gradi verso il riparo in pochi frame): la si toglie dalla
     // vista spostando il riferimento della testa, cosi' il mondo non gira
@@ -3709,7 +3753,7 @@ void UpdateHeadTracking() {
         // Dopo una cinematica il gioco rimette Walker nella sua direzione
         // (anche 90 gradi): quella rotazione e' voluta, non si compensa.
         static ULONGLONG cinemaSeen = 0;
-        if (vr::control::g_cinemaActive || g_gameLockedScene) cinemaSeen = GetTickCount64();
+        if (vr::control::g_cinemaActive || g_cinematicScene) cinemaSeen = GetTickCount64();
         bool afterCinema = GetTickCount64() - cinemaSeen < 2000;
         // Solo entrando, stando o appena usciti dalla copertura. Prima valeva per
         // ogni rotazione del gioco: dopo un salto al checkpoint, una ripartenza o
@@ -3816,8 +3860,16 @@ void UpdateHeadTracking() {
             // con la testa girata il corpo scattava tutto in un frame.
             float maxStep = 3.14159265f * (dtTurn > 0.0f && dtTurn < 0.1f ? dtTurn : 0.011f);
             if (std::fabs(shift) > maxStep) shift = std::copysign(maxStep, shift);
-            if (AddControllerYaw(pcForTurn, vr::control::g_yawSign * RadiansToUnreal(shift)))
-                g_hmdYawReference += shift;
+            // Al corpo vanno unita' intere: il riferimento si sposta di quelle
+            // (prima dei radianti esatti: fino a 0,25 gradi/s di deriva, L7).
+            int32_t units = static_cast<int32_t>(std::lround(shift * (65536.0f / 6.28318530718f)));
+            int32_t applied = vr::control::g_yawSign * units;
+            if (units && AddControllerYaw(pcForTurn, applied)) {
+                g_hmdYawReference += units * (6.28318530718f / 65536.0f);
+                // Gli occhi (fwd davanti al centro di Walker) non devono scivolare
+                // di lato mentre il corpo si allinea: ~23 cm in 0,25 s con 45 gradi (H3).
+                compensatePivot(applied, g_fwdApplied.load(), false);
+            }
         }
     }
     g_deltaYaw = vr::control::g_yawSign * RadiansToUnreal(std::remainder(hmdYaw - g_hmdYawReference, 6.28318530718f));
@@ -4252,20 +4304,29 @@ constexpr uintptr_t kOffCompTranslation = 0x1C0;  // FVector
 constexpr uintptr_t kOffCompRotation = 0x1CC;     // FRotator
 void* g_gunComp = nullptr;                        // componente modificato (thread di gioco)
 uint32_t g_gunCompCls = 0;
+uint8_t g_gunSaved[24];                           // Translation+Rotation originali del componente
+uint32_t g_gunSavedFlags = 0;                     // bit Abs* originali
 float g_gunEyeBase[3];                            // posizione del corpo dell'occhio sinistro
 bool g_gunEyeBaseValid = false;
 
+// enable: salva (prima volta) e scrive posa e bit assoluti; disable: rimette i
+// valori originali (prima si azzeravano, che e' quasi sempre ma non per forza
+// la posa del gioco).
 bool SafeSetGunPose(void* comp, bool enable, const float* pos, const int32_t* rot) {
     __try {
         char* c = static_cast<char*>(comp);
         uint32_t& flags = *reinterpret_cast<uint32_t*>(c + kOffCompFlags);
         if (enable) {
+            if (comp != g_gunComp) {
+                std::memcpy(g_gunSaved, c + kOffCompTranslation, 24);
+                g_gunSavedFlags = flags & (kAbsTranslation | kAbsRotation);
+            }
             std::memcpy(c + kOffCompTranslation, pos, 12);
             std::memcpy(c + kOffCompRotation, rot, 12);
             flags |= kAbsTranslation | kAbsRotation;
         } else {
-            flags &= ~(kAbsTranslation | kAbsRotation);
-            std::memset(c + kOffCompTranslation, 0, 24);
+            flags = (flags & ~(kAbsTranslation | kAbsRotation)) | g_gunSavedFlags;
+            std::memcpy(c + kOffCompTranslation, g_gunSaved, 24);
         }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4347,7 +4408,12 @@ void UpdateGunInHand(const float* base, int32_t bodyYaw) {
     void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
     // Solo in prima persona: in terza persona la mano sarebbe davanti alla camera.
     bool fp = vr::control::g_firstPerson;
-    void* comp = (vr::control::g_gunInHand && hand && fp && pawn) ? CurrentGunComponent(pawn) : nullptr;
+    // Stesse esclusioni delle braccia (UpdateArms): scene scriptate e mosse
+    // animate dal gioco (corda, zipline, scavalcare), schermo virtuale, Walker
+    // morto. Prima le braccia venivano rilasciate all'animazione ma il fucile
+    // restava inchiodato al controller: "corpo deforme" sulla corda (21/10).
+    bool gameplay = !g_gameLockedScene && !vr::control::g_cinemaActive && pawn && PawnAlive(pawn);
+    void* comp = (vr::control::g_gunInHand && hand && fp && gameplay) ? CurrentGunComponent(pawn) : nullptr;
     if (comp != g_gunComp) ReleaseGun();
     if (!comp) return;
     float center[3] = {base[0], base[1], base[2]};
@@ -5896,7 +5962,7 @@ public:
                 static double lastT = 0.0;
                 float want = 0.0f;
                 char* camK = static_cast<char*>(g_cameraPtr.load());
-                void* pawnK = g_gameLockedScene && HasCameraSignature(camK) ? PlayerPawnIfViewTarget(camK) : nullptr;
+                void* pawnK = g_neckFollowScene && HasCameraSignature(camK) ? PlayerPawnIfViewTarget(camK) : nullptr;
                 uint32_t meshK = 0;
                 if (pawnK && g_drawEye != 1 && TrySafeReadUint32(static_cast<char*>(pawnK) + kOffPawnMesh, &meshK) && meshK) {
                     struct {
