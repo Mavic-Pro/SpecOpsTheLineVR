@@ -196,6 +196,10 @@ BOOL WINAPI Hooked_SetWindowPlacement(HWND h, const WINDOWPLACEMENT* p) {
     return g_SetWindowPlacement_Real(h, p);
 }
 
+// Messaggio della mod: prendi il focus della tastiera (SetFocus vale solo
+// dal thread della finestra; KeepSubclass gira su quello di rendering).
+constexpr UINT kMsgTakeFocus = WM_APP + 0x51;
+
 LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     InterlockedIncrement(&g_wndMessages);
     if (msg == WM_CLOSE || msg == WM_DESTROY || (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE)) {
@@ -252,6 +256,27 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         vr::log::Line(s);
     }
+    // Attivazione all'avvio (lancio da Steam / dal visore): arrivava
+    // WM_ACTIVATE con il flag "ridotta a icona" (wp 0x200001) e mai
+    // WM_SETFOCUS, cosi' il gioco ignorava i comandi finche' non si cliccava
+    // sulla finestra (22/10, nel visore). Finestra non ridotta: il flag si
+    // toglie, e il focus della tastiera si prende qui (thread della finestra).
+    if (msg == kMsgTakeFocus) {
+        if (GetForegroundWindow() == hwnd && GetFocus() != hwnd) {
+            SetFocus(hwnd);
+            vr::log::Line("DISPLAY: game in the foreground without keyboard focus, focus taken.");
+        }
+        return 0;
+    }
+    if (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE) {
+        if (HIWORD(wp) && !IsIconic(hwnd)) wp = MAKEWPARAM(LOWORD(wp), 0);
+        LRESULT ra = CallWindowProcW(g_originalWndProc, hwnd, msg, wp, lp);
+        if (GetFocus() != hwnd) {
+            SetFocus(hwnd);
+            vr::log::Line("DISPLAY: window activated without keyboard focus, focus taken.");
+        }
+        return ra;
+    }
     LRESULT r = CallWindowProcW(g_originalWndProc, hwnd, msg, wp, lp);
     if (msg == WM_SIZE) {
         static int budget = 20;
@@ -297,6 +322,18 @@ void KeepSubclass() {
                           IsIconic(h), IsWindowVisible(h), r.left, r.top, r.right, r.bottom, style,
                           GetForegroundWindow() == h ? "game" : "other");
             vr::log::Line(b);
+        }
+    }
+    {
+        // In primo piano ma senza il focus della tastiera (lancio dal visore,
+        // 22/10): i comandi non arrivavano al gioco finche' non si cliccava.
+        static ULONGLONG lastFocus = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastFocus >= 1000 && GetForegroundWindow() == h) {
+            lastFocus = now;
+            GUITHREADINFO gti = {sizeof(gti)};
+            DWORD tid = GetWindowThreadProcessId(h, nullptr);
+            if (GetGUIThreadInfo(tid, &gti) && gti.hwndFocus != h) PostMessageW(h, kMsgTakeFocus, 0, 0);
         }
     }
     WNDPROC cur = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_WNDPROC));

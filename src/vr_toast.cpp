@@ -103,8 +103,27 @@ bool Show(const std::string& text) {
     if (!RenderText(text, &px)) return false;
     vr::EVROverlayError err = ov->SetOverlayRaw(g_overlay, px.data(), kW, kH, 4);
     if (err != vr::VROverlayError_None) {
-        vr::log::Line("TOAST: SetOverlayRaw failed, error " + std::to_string(err));
-        return false;
+        // Dopo il primo messaggio gli aggiornamenti fallivano tutti con 23
+        // (RequestFailed, 22/10 nel visore): overlay rifatto e un altro tentativo.
+        vr::log::Line("TOAST: SetOverlayRaw failed, error " + std::to_string(err) + ", overlay recreated");
+        ov->DestroyOverlay(g_overlay);
+        g_overlay = vr::k_ulOverlayHandleInvalid;
+        g_visible = false;
+        if (ov->CreateOverlay("specopsvr.status", "SpecOpsVR status", &g_overlay) != vr::VROverlayError_None) {
+            g_overlay = vr::k_ulOverlayHandleInvalid;
+            return false;
+        }
+        vr::HmdMatrix34_t t = {};
+        t.m[0][0] = 1.0f; t.m[1][1] = 1.0f; t.m[2][2] = 1.0f;
+        t.m[0][3] = 0.0f; t.m[1][3] = -0.22f; t.m[2][3] = -1.0f;
+        ov->SetOverlayTransformTrackedDeviceRelative(g_overlay, vr::k_unTrackedDeviceIndex_Hmd, &t);
+        ov->SetOverlayWidthInMeters(g_overlay, 0.55f);
+        ov->SetOverlaySortOrder(g_overlay, 1000);
+        err = ov->SetOverlayRaw(g_overlay, px.data(), kW, kH, 4);
+        if (err != vr::VROverlayError_None) {
+            vr::log::Line("TOAST: SetOverlayRaw failed again, error " + std::to_string(err));
+            return false;
+        }
     }
     ov->ShowOverlay(g_overlay);
     g_visible = true;

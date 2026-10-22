@@ -40,7 +40,7 @@ virtual cinema screen.
 - **VR cover**: the world does not spin when Walker takes cover; lean out
   with your body to pop out and aim.
 - **Mounted guns and the helicopter minigun** aim with your controller.
-- **Squad orders** target the enemy you point your gun or your left hand at, or look at; the
+- **Squad orders** target the enemy you look at; the
   target stays locked until you release the button.
 - **Executions**: press B next to a downed enemy and Walker turns to him.
 - **Gestures**: throw grenades (harder throw = faster grenade), punch or hit with the gun (melee), reload by touching the magazine with the left hand and pulling down (`reload physical` in the settings: pull the magazine, take a new one from your belt, push it in; `manualaction on` also asks you to rack the gun),
@@ -114,7 +114,7 @@ the release lists them; your `specopsvr.ini` is migrated, never replaced
 | Right stick | Turn (smooth or snap) |
 | Right trigger / left trigger | Fire / aim |
 | Left grip | Grenade (hold: trajectory, release: throw); on the gun it just holds the gun |
-| Right grip (hold, point the gun or look at an enemy, release) | Squad attack order |
+| Right grip (hold, look at an enemy, release) | Squad attack order |
 | A / B / X / Y | Action-cover / melee / reload / next weapon |
 | B + Y held for 1 s | Gunstock calibration |
 | Left menu button | Pause (hold 0.6 s: Back / objectives) |

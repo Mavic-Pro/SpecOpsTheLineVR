@@ -6196,11 +6196,14 @@ void UpdateFirstPersonBody(void* pawn) {
         // Il corpo si allontana dalla direzione dello sguardo (non solo
         // indietro rispetto al corpo): guardando di lato o alle spalle gli
         // occhi, davanti a Walker, vedevano l'interno del colletto con la testa
-        // nascosta ("corpo decapitato", 19/10). Oltre 60 gradi di testa girata
-        // si allontana di altre bodybacklook unita', come guardando in basso.
+        // nascosta ("corpo decapitato", 19/10). Da 35 a 75 gradi di testa
+        // girata si allontana di altre bodybacklook unita', come guardando in
+        // basso. Prima da 60 a 120: in copertura (il corpo resta verso il
+        // riparo) con la testa a 67 gradi spalla e colletto riempivano la
+        // vista (tester 22/10, "the body in the way").
         float headRel = a + g_deltaYaw.load() * (6.28318530718f / 65536.0f);
         float turned = (std::fabs(std::remainder(g_deltaYaw.load() * (6.28318530718f / 65536.0f), 6.28318530718f)) *
-                            57.2957795f - 60.0f) / 60.0f;
+                            57.2957795f - 35.0f) / 40.0f;
         turned = turned < 0.0f ? 0.0f : (turned > 1.0f ? 1.0f : turned);
         // bodyback si applica lungo il corpo, l'extra lontano dallo sguardo:
         // con bodyback negativo (corpo avanti, sotto la testa del giocatore,
@@ -7953,7 +7956,35 @@ void ExecutionAssist(void* pc, void* pawn) {
         if (best) vr::log::Line("EXECUTE: B with a standing enemy in front: no turn toward the downed one");
         return;
     }
-    if (!best) return;
+    if (!best) {
+        // Nessun nemico a terra riconosciuto: chi c'e' vicino (22/10, primo
+        // nemico a terra dopo il container del cap. 1: solo pugni).
+        uint32_t q = 0;
+        TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + kOffWorldInfoPawnList, &q);
+        std::string nearby;
+        for (int guard = 0; q && guard < 512; ++guard) {
+            char* other = reinterpret_cast<char*>(q);
+            uint32_t next = 0, flags = 0;
+            int32_t health = 0;
+            float loc[3];
+            TrySafeReadUint32(other + kOffPawnNextPawn, &next);
+            if (other != pawn && SafeCopy(loc, other + 0x54, 12)) {
+                float d = std::sqrt((loc[0] - me[0]) * (loc[0] - me[0]) + (loc[1] - me[1]) * (loc[1] - me[1]));
+                if (d < 400.0f) {
+                    TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&health));
+                    TrySafeReadUint32(other + kOffPawnDbnoFlags, &flags);
+                    int32_t rel = static_cast<int16_t>(RadiansToUnreal(std::atan2(loc[1] - me[1], loc[0] - me[0])) - viewYaw);
+                    char b[200];
+                    snprintf(b, sizeof(b), " %s d=%.0f dz=%.0f rel=%.0f deg health=%d flags5FC=%08X;",
+                             vr::script::ClassName(other).c_str(), d, loc[2] - me[2], rel * 360.0f / 65536.0f, health, flags);
+                    nearby += b;
+                }
+            }
+            q = next;
+        }
+        vr::log::Line("EXECUTE: B pressed, no downed enemy recognised; pawns within 4 m:" + (nearby.empty() ? std::string(" none") : nearby));
+        return;
+    }
     int32_t pcYaw = 0;
     if (!TrySafeReadUint32(static_cast<char*>(pc) + 0x64, reinterpret_cast<uint32_t*>(&pcYaw))) return;
     int32_t target = RadiansToUnreal(std::atan2(bestLoc[1] - me[1], bestLoc[0] - me[0]));
@@ -8221,7 +8252,11 @@ std::vector<void*> CheapShooters() {
         uint32_t c = ObjClass(reinterpret_cast<void*>(o));
         for (int depth = 0; c && depth < 4; ++depth) {  // classe o sottoclasse
             if (c == cls) {
-                cache.push_back(reinterpret_cast<void*>(o));
+                // Non l'oggetto predefinito della classe: sta all'origine della
+                // mappa e risultava il "cheap shooter" piu' vicino (22/10, log
+                // del tester al cartellone: sempre 30-60 gradi dalla canna).
+                if (vr::script::ObjectName(reinterpret_cast<void*>(o)).rfind("Default__", 0) != 0)
+                    cache.push_back(reinterpret_cast<void*>(o));
                 break;
             }
             uint32_t super = 0;
@@ -8261,10 +8296,19 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         char b[300];
         if (held) {
             everPicked = nullptr;
+            // Ordini bloccati dal gioco (YS_ControlRestrictions in +0xC30: bit
+            // impostato = azione vietata; m_squadControl 0x8000). Al cap. 1
+            // restano vietati in alcune fasi: il tester premeva il grip senza
+            // alcuna risposta (22/10). Lo si dice nel visore.
+            uint32_t restr = 0;
+            if (HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xC30, &restr) && (restr & 0x8000)) {
+                vr::toast::Notify("Squad orders are not available yet at this point of the game");
+                vr::log::Line("SQUAD: orders locked by the game here (control restrictions " + std::to_string(restr) + ").");
+            }
             snprintf(b, sizeof(b),
-                     "SQUAD: button pressed (gun + support hand + head, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
+                     "SQUAD: button pressed (head, restrictions %08X, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
                      "shooters=%u); game target %s",
-                     pawn != nullptr, (int)vr::control::g_aimHand.load(),
+                     restr, pawn != nullptr, (int)vr::control::g_aimHand.load(),
                      (int)g_armsActive.load(), (int)g_muzzleAimValid.load(), (unsigned)CheapShooters().size(),
                      sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
         } else {
@@ -8335,7 +8379,15 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     }
     // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
-    if (!pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
+    // Attacco vietato dal gioco (m_squadCommandAttack 0x200000) ma ordini
+    // permessi: e' un altro comando del tutorial (stordimento a cp01). La
+    // convalida del gioco esce subito con questo bit, e il bersaglio della
+    // mod scartava quello del gioco ("ignored while the mod points at",
+    // 22/10): si lascia scegliere al gioco (centro della vista).
+    uint32_t restrNow = 0;
+    bool attackLocked = HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xC30, &restrNow) &&
+                        (restrNow & (0x8000 | 0x200000));
+    if (!pawn || !held || attackLocked) {
         lastPick = nullptr;
         g_squadModPick = nullptr;
         return;
@@ -8344,30 +8396,13 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // verde): lo stesso della camera logica del gioco. La visibilita' si
     // controlla dagli occhi, come fa il gioco: la canna all'altezza del fianco
     // dietro una copertura "vede" solo la copertura.
-    // Tre raggi sempre attivi (22/10, richiesta: niente piu' scelta
-    // "commandaim"): canna, mano di supporto che punta, sguardo. Si provano in
-    // quest'ordine e vale il primo che trova un bersaglio.
+    // Solo lo sguardo (22/10, richiesta: canna e mano di supporto davano
+    // bersagli diversi da quello che il giocatore guardava). Il gioco sceglie
+    // allo stesso modo (centro della vista); la mod serve per i bersagli che
+    // il gioco da solo non convalida (cecchino sul cartellone, 18/10).
     float eo[3];
-    std::memcpy(eo, cam + 0x10, sizeof(eo));  // occhi: origine della passata lungo lo sguardo
-    float rayO[3][3], rayD[3][3];
-    bool rayOk[3] = {false, false, true};
-    if (g_muzzleAimValid) {
-        std::memcpy(rayO[0], eo, sizeof(eo));
-        float dl = std::sqrt((g_muzzleTarget[0] - eo[0]) * (g_muzzleTarget[0] - eo[0]) +
-                             (g_muzzleTarget[1] - eo[1]) * (g_muzzleTarget[1] - eo[1]) +
-                             (g_muzzleTarget[2] - eo[2]) * (g_muzzleTarget[2] - eo[2]));
-        if (dl >= 1.0f) {
-            for (int i = 0; i < 3; ++i) rayD[0][i] = (g_muzzleTarget[i] - eo[i]) / dl;
-            rayOk[0] = true;
-        }
-    }
-    if (vr::control::g_supportFwdValid && g_handWorldValid[1]) {
-        // Mano di supporto che punta (fase 4, E8): raggio dalla mano lungo la
-        // sua direzione; la visibilita' resta controllata dagli occhi sotto.
-        std::memcpy(rayO[1], g_handWorld[1], sizeof(eo));
-        for (int i = 0; i < 3; ++i) rayD[1][i] = vr::control::g_supportFwd[i].load();
-        rayOk[1] = true;
-    }
+    std::memcpy(eo, cam + 0x10, sizeof(eo));  // occhi
+    float rayO[1][3], rayD[1][3];
     uint32_t worldInfo = 0, p = 0;
     if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo ||
         !TrySafeReadUint32(reinterpret_cast<char*>(worldInfo) + kOffWorldInfoPawnList, &p))
@@ -8386,15 +8421,16 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // della vista: chi lo conosce muove la testa per metterlo sul nemico, non
     // il fucile (20/10, cecchino sul cartellone: "spostano il triangolo").
     float hr[3], hu[3];
-    RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, rayD[2], hr, hu);
-    std::memcpy(rayO[2], eo, sizeof(eo));  // lo sguardo parte dagli occhi, non dalla mano
+    RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, rayD[0], hr, hu);
+    std::memcpy(rayO[0], eo, sizeof(eo));
     const uint32_t pawnList = p;
-    for (int pass = 0; pass < 3 && !best; ++pass) {
-        if (!rayOk[pass]) continue;
+    for (int pass = 0; pass < 1 && !best; ++pass) {
         const float* dir = rayD[pass];
         const float* o = rayO[pass];
-        // Mano che punta senza mirino: tolleranza piu' larga (8 / 10 gradi invece di 3 / 4).
-        const float tolPawn = pass == 1 ? 0.1405f : 0.0524f, tolCheap = pass == 1 ? 0.1763f : 0.0699f;
+        // 3 gradi sui Pawn; i nemici semplificati (cecchino sul cartellone)
+        // sono bersagli scriptati per gli ordini: 10 gradi (con 4 lo sguardo
+        // a 9 gradi dal cecchino non bastava, 22/10).
+        const float tolPawn = 0.0524f, tolCheap = 0.1763f;
         p = pawnList;
         for (int guard = 0; p && guard < 512; ++guard) {
             char* other = reinterpret_cast<char*>(p);
@@ -8458,7 +8494,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
             if (along <= 50.0f) continue;
             float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
             float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
-            float tol = std::fmax(along * tolCheap, 60.0f);  // 4 gradi (10 con la mano): bersagli piccoli e lontani
+            float tol = std::fmax(along * tolCheap, 60.0f);  // 10 gradi: bersagli piccoli e lontani
             if (pass == 0 && std::atan2(off, along) * 57.2957795f < g_squadClosestDeg) {
                 g_squadClosestDeg = std::atan2(off, along) * 57.2957795f;
                 g_squadClosestCls = vr::script::ClassName(cs) + " (cheap shooter)";
@@ -8539,7 +8575,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
                      bufm ? vr::script::ClassName(reinterpret_cast<void*>(bufm)).c_str() : "none");
             why = b;
         }
-        vr::log::Line("SQUAD: command target along the barrel: " + vr::script::ClassName(pending) +
+        vr::log::Line("SQUAD: command target along the view: " + vr::script::ClassName(pending) +
                       (reinterpret_cast<void*>(sel) == pending ? " (selected)" : " (not taken by the game)") + why);
         pending = nullptr;
     }

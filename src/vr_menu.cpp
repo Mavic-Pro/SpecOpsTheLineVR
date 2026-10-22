@@ -62,7 +62,7 @@ const char* const kControls[] = {
     "A: action / cover          B: melee (punch or hit with the gun)",
     "X: reload                  Y: next weapon",
     "LEFT GRIP: grenade (quick throw with the left hand) / hold the gun by the barrel",
-    "RIGHT GRIP: squad orders (aim the gun at a target) / grab ropes, ziplines, turrets",
+    "RIGHT GRIP: squad orders (look at the target) / grab ropes, ziplines, turrets",
     "LEFT MENU BUTTON: pause     RIGHT STICK HELD + direction: D-pad",
     "BOTH STICKS 1 s: recenter   BOTH STICKS 3 s: also save your standing height",
     "B + Y 1 s: gunstock calibration (aim at something far, look at it)",
