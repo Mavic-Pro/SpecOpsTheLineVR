@@ -582,10 +582,16 @@ bool ReadTouchControllers(XGamepad* out) {
         // Controller collegati ma nessuna azione attiva per 5 s (fuori dalla
         // dashboard): tipo di controller senza binding predefinito. Si passa
         // all'API legacy invece di restare senza comandi (audit 19/10).
+        // Non mentre il menu del mod e' aperto o un'altra app ha il focus
+        // dell'input: il menu e' un overlay interattivo, SteamVR (vrcompositor)
+        // prende il focus e le azioni della scena restano inattive di
+        // proposito; il passaggio al legacy in quel momento era definitivo
+        // (22/10 su Link: pad morto nel menu principale).
         static ULONGLONG noneSince = 0;
         bool connected = left != vr::k_unTrackedDeviceIndexInvalid && right != vr::k_unTrackedDeviceIndexInvalid &&
                          sys->IsTrackedDeviceConnected(left) && sys->IsTrackedDeviceConnected(right);
-        if (!haveL && !haveR && connected && !vr::control::g_vrDashboard && vr::session::HmdPresent()) {
+        if (!haveL && !haveR && connected && !vr::control::g_vrDashboard && !vr::menu::IsOpen() && sys->IsInputAvailable() &&
+            vr::session::HmdPresent()) {
             if (!noneSince) noneSince = GetTickCount64();
             if (GetTickCount64() - noneSince > 5000) {
                 char type[64] = {};

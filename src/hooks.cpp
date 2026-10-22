@@ -313,9 +313,12 @@ void* VTableEntry(void* obj, int index) {
 
 void GpuQueriesRelease();
 
+void ReleaseMirrorChain();
+
 HRESULT WINAPI Hooked_Reset(IDirect3DDevice9* self, D3DPRESENT_PARAMETERS* params) {
     vr::output::OnBeforeReset();
     GpuQueriesRelease();
+    ReleaseMirrorChain();  // swap chain della finestra specchio (risorsa DEFAULT)
     if (params) params->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
     HRESULT hr = g_Reset_Original(self, params);
     vr::log::Line("Device reset, hr=" + std::to_string(hr));
@@ -936,13 +939,19 @@ void MirrorWindowThread() {
     wc.lpszClassName = L"SpecOpsVRMirror";
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
-    // Proporzioni del back buffer di un occhio (quasi quadrato), alto quanto lo schermo.
-    UINT bw = g_backBufferW ? g_backBufferW.load() : 2528, bh = g_backBufferH ? g_backBufferH.load() : 2776;
-    RECT r = {0, 0, static_cast<LONG>(940 * bw / bh), 940};
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_VISIBLE;
-    AdjustWindowRect(&r, style, FALSE);
-    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"SpecOpsVR mirror", style, 0, 0,
-                             r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    // Finestra 16:9 senza bordi (registrazioni video): la parte centrale
+    // dell'occhio destro ritagliata a 16:9, 1920x1080 o quanto ci sta nello
+    // schermo (22/10: prima era alta quanto lo schermo con le proporzioni
+    // dell'occhio, quasi quadrata, e il ritaglio dopo perdeva risoluzione).
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    int w = sw < 1920 ? sw : 1920, hgt = w * 9 / 16;
+    if (hgt > sh) {
+        hgt = sh;
+        w = hgt * 16 / 9;
+    }
+    DWORD style = WS_POPUP | WS_VISIBLE;
+    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"SpecOpsVR mirror", style, 0, 0, w, hgt,
+                             nullptr, nullptr, wc.hInstance, nullptr);
     if (!h) {
         vr::log::Line("MIRRORWIN: window creation failed.");
         return;
@@ -968,6 +977,76 @@ void UpdateMirrorWindow() {
     }
     if (h) starting = false;
     if (!want && h) PostMessageW(h, WM_CLOSE, 0, 0);
+}
+
+// Swap chain aggiuntiva sulla finestra specchio (thread di rendering): la
+// fascia centrale 16:9 del back buffer (occhio destro) ci finisce con uno
+// StretchRect, cosi' la finestra mostra quello che si vede nel visore senza
+// stirarlo. Rilasciata al Reset del device e alla chiusura della finestra.
+IDirect3DSwapChain9* g_mirrorChain = nullptr;
+HWND g_mirrorChainHwnd = nullptr;
+
+void ReleaseMirrorChain() {
+    if (g_mirrorChain) g_mirrorChain->Release();
+    g_mirrorChain = nullptr;
+    g_mirrorChainHwnd = nullptr;
+}
+
+void PresentMirror(IDirect3DDevice9* dev, HWND mirror) {
+    if (!mirror || !IsWindow(mirror)) {
+        if (g_mirrorChain) ReleaseMirrorChain();
+        return;
+    }
+    if (g_mirrorChain && g_mirrorChainHwnd != mirror) ReleaseMirrorChain();
+    RECT rc = {};
+    GetClientRect(mirror, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) return;
+    if (!g_mirrorChain) {
+        D3DPRESENT_PARAMETERS pp = {};
+        pp.BackBufferWidth = rc.right;
+        pp.BackBufferHeight = rc.bottom;
+        pp.BackBufferFormat = D3DFMT_X8R8G8B8;
+        pp.BackBufferCount = 1;
+        pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+        pp.hDeviceWindow = mirror;
+        pp.Windowed = TRUE;
+        pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+        HRESULT hr = dev->CreateAdditionalSwapChain(&pp, &g_mirrorChain);
+        if (FAILED(hr) || !g_mirrorChain) {
+            g_mirrorChain = nullptr;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                char b[96];
+                snprintf(b, sizeof(b), "MIRRORWIN: swap chain creation failed (0x%08lX).", static_cast<unsigned long>(hr));
+                vr::log::Line(b);
+            }
+            return;
+        }
+        g_mirrorChainHwnd = mirror;
+        vr::log::Line("MIRRORWIN: 16:9 swap chain " + std::to_string(rc.right) + "x" + std::to_string(rc.bottom) + " created.");
+    }
+    IDirect3DSurface9* src = nullptr;
+    IDirect3DSurface9* dst = nullptr;
+    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &src)) && src &&
+        SUCCEEDED(g_mirrorChain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &dst)) && dst) {
+        D3DSURFACE_DESC d = {};
+        src->GetDesc(&d);
+        // Ritaglio centrale 16:9 dell'occhio (piu' alto che largo): tutta la
+        // larghezza, la fascia centrale in altezza.
+        LONG w = static_cast<LONG>(d.Width), h = w * 9 / 16;
+        if (h > static_cast<LONG>(d.Height)) {
+            h = static_cast<LONG>(d.Height);
+            w = h * 16 / 9;
+        }
+        RECT crop = {(static_cast<LONG>(d.Width) - w) / 2, (static_cast<LONG>(d.Height) - h) / 2, 0, 0};
+        crop.right = crop.left + w;
+        crop.bottom = crop.top + h;
+        dev->StretchRect(src, &crop, dst, nullptr, D3DTEXF_LINEAR);
+        g_mirrorChain->Present(nullptr, nullptr, nullptr, nullptr, 0);
+    }
+    if (src) src->Release();
+    if (dst) dst->Release();
 }
 
 HRESULT WINAPI Hooked_Present(
@@ -1051,8 +1130,8 @@ HRESULT WINAPI Hooked_Present(
     double tPres = ProfMs();
     UpdateMirrorWindow();
     HWND mirror = vr::control::g_mirrorWin ? g_mirrorHwnd.load() : nullptr;
-    HRESULT hr = mirror ? g_Present_Original(self, nullptr, nullptr, mirror, nullptr)
-                        : g_Present_Original(self, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+    PresentMirror(self, mirror);
+    HRESULT hr = g_Present_Original(self, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     g_profPresent += ProfMs() - tPres;
     return hr;
 }

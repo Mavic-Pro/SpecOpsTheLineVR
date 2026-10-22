@@ -125,6 +125,11 @@ add_custom_command(TARGET vrtest POST_BUILD
         "${CMAKE_SOURCE_DIR}/deploy/openvr_api.dll"
 )
 
+# Registrazione audio del visore (WASAPI loopback) per tools/mirrorrec.py:
+# build/Release/wasapiloop.exe.
+add_executable(wasapiloop tools/wasapiloop.cpp)
+target_link_libraries(wasapiloop PRIVATE ole32)
+
 # Test offline delle funzioni pure (updater, ini): build/Release/unit_tests.exe,
 # nessun gioco e nessun visore (R-T2). tools/regress.py li lancia per primo.
 add_executable(unit_tests tests/unit_tests.cpp)

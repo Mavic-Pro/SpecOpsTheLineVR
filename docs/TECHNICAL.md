@@ -1198,8 +1198,13 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
 ## Test tools (`tools/`)
 
 - `gamectl.py` - launch/close the game, send commands, screenshots.
-- `mirrorrec.py start|stop` - records what the headset shows over Meta Link
-  (OculusMirror captured by ffmpeg into an mp4).
+- `mirrorrec.py start|stop` - records what the headset shows and plays (the
+  mod's mirror window, `mirrorwin on`: borderless 16:9 window, 1920x1080 or
+  what fits the screen, fed by an additional swap chain with the central
+  16:9 crop of the right eye; captured by ffmpeg, the default playback
+  device by `wasapiloop.exe`, muxed into an mp4 at stop). Not
+  OculusMirror: over Link it takes the VR focus from SteamVR (22/10: input
+  focus captured, controllers dead, then the Link session dropped).
 - `levelsweep.py` - loads every campaign level and checks the VR state.
 - `deepsweep.py` - jumps through every checkpoint of every level.
 - `loadouttest.py` / `weapontest.py` - fire the weapons and measure the shot
