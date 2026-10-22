@@ -5189,20 +5189,17 @@ ArmRig g_rig;
 // quell'osso: orientando la mano cosi', l'arma ha l'orientamento del controller.
 float g_handInWeapon[2][3][3];
 bool g_handInWeaponValid[2] = {false, false};
-// Mancini ("hand left" + "armswap on"): il lato 0 (arma) e' il braccio
-// SINISTRO di Walker e il lato 1 (supporto) il destro; l'arma viene
-// riagganciata all'osso Weapon_Left. Niente mesh specchiata: l'IK del motore
-// converte gli spazi con atomi a quaternione, che una riflessione rompe
-// (22/10, Ghidra 0x00583610 / GetBoneQuaternion a caso).
-inline bool ArmsSwapped() { return vr::control::g_leftHanded && vr::control::g_armSwap; }
+// Mancini ("hand left"): il lato 0 (arma) e' il braccio SINISTRO di Walker e
+// il lato 1 (supporto) il destro; l'arma viene riagganciata all'osso Hand_Left.
+// Niente mesh specchiata: l'IK del motore converte gli spazi con atomi a
+// quaternione, che una riflessione rompe (22/10, Ghidra 0x00583610 /
+// GetBoneQuaternion a caso). Nessuna opzione a parte: segue "hand".
+inline bool ArmsSwapped() { return vr::control::g_leftHanded; }
 inline bool WalkerRightArm(int side) { return (side == 0) != ArmsSwapped(); }
 inline const char* HandBone(int side) { return WalkerRightArm(side) ? "Hand_Right" : "Hand_Left"; }
 inline const char* WeaponBone(int side) { return WalkerRightArm(side) ? "Weapon_Right" : "Weapon_Left"; }
 inline const char* IkHelperBone(int side) { return WalkerRightArm(side) ? "IK_Hand_R" : "IK_Hand_L"; }
 inline const char* ShoulderBone(int side) { return WalkerRightArm(side) ? "Arm_Right" : "Arm_Left"; }
-// Corpo specchiato (mancini): stato condiviso tra corpo, braccia e misure.
-bool g_fpMirrored = false;
-int g_unmirrorFrames = 0;  // frame senza specchio per rimisurare la relazione mano/arma (cambio d'arma)
 // Mancini: dopo il riaggancio dell'arma la mano sinistra resta all'animazione
 // per questi frame e la relazione mano/arma si misura all'ultimo, ferma; poi
 // non si rimisura piu' (misurarla con la mano guidata faceva ruotare la
@@ -5421,20 +5418,6 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
     WorldToActor(hf, af, ar, au, 1.0f, lf);
     WorldToActor(hr, af, ar, au, 1.0f, lr);
     WorldToActor(hu, af, ar, au, 1.0f, lu);
-    if (g_fpMirrored) {
-        // Mesh specchiata (Scale3D.Y = -1): il motore porta i bersagli in spazio
-        // attore nello spazio del componente con la sua trasformazione. Se vi
-        // include lo specchio, il bersaglio resta com'e' (effY 0) e la
-        // rotazione coniugata (M R M) rende la mano specchiata con avanti e
-        // alto del controller (rot 1); altrimenti Y negata. "mirrortest".
-        if (vr::control::g_mirrorEffNeg) eff[1] = -eff[1];
-        if (vr::control::g_mirrorRotConj) {
-            lf[1] = -lf[1];
-            lu[1] = -lu[1];
-            lr[0] = -lr[0];
-            lr[2] = -lr[2];
-        }
-    }
     int32_t lrot[3];
     AxesToRotator(lf, lr, lu, lrot);
     // Gomito: in basso, verso l'esterno e un po' indietro rispetto alla mano.
@@ -5461,9 +5444,8 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
         } bl = {{vr::script::NameIndex(HandBone(side)), 0}, 0, {0, 0, 0}};
         if (g_rig.mesh && vr::script::CallFunction(g_rig.mesh, "GetBoneLocation", &bl)) {
             float dx = bl.ret[0] - pos[0], dy = bl.ret[1] - pos[1], dz = bl.ret[2] - pos[2];
-            snprintf(buf, sizeof(buf), "ARMS %s: actual hand world=(%.1f, %.1f, %.1f), %.1f units from the wanted one%s",
-                     side == 0 ? "right" : "left", bl.ret[0], bl.ret[1], bl.ret[2], std::sqrt(dx * dx + dy * dy + dz * dz),
-                     g_fpMirrored ? " (mirrored body)" : "");
+            snprintf(buf, sizeof(buf), "ARMS %s: actual hand world=(%.1f, %.1f, %.1f), %.1f units from the wanted one",
+                     side == 0 ? "right" : "left", bl.ret[0], bl.ret[1], bl.ret[2], std::sqrt(dx * dx + dy * dy + dz * dz));
             vr::log::Line(buf);
         }
     }
@@ -5838,7 +5820,6 @@ bool UpdateGunAttachment(void* mesh, void* gunComp, void* pawn) {
 }
 
 void MeasureHandInWeapon(void* mesh, int side, void* gunComp) {
-    if (g_fpMirrored) return;  // mesh specchiata: GetBoneQuaternion da' valori a caso; la relazione resta quella misurata senza specchio
     float h[3][3], w[3][3];
     const char* hand = HandBone(side);
     const char* weap = side == 0 && gunComp ? "weapon mesh" : WeaponBone(side);
@@ -5959,37 +5940,6 @@ void* g_fpHeadMesh = nullptr;
 uint32_t g_fpPawnCls = 0, g_fpHeadMeshCls = 0;
 float g_fpSavedCylinders[8];
 float g_fpSavedMeshX = 0.0f, g_fpSavedMeshY = 0.0f, g_fpSavedMeshZ = 0.0f;
-// Corpo specchiato per i mancini ("mirrorbody", auto con "hand left"): Scale3D
-// della mesh (PrimitiveComponent +0x1DC) a -1 sull'asse laterale della mesh
-// (Rotation +0x1CC: con yaw +-90 l'asse laterale e' la X locale, altrimenti
-// la Y). Il braccio destro di Walker, quello con l'arma, appare a sinistra e
-// va al controller sinistro senza incrociare le braccia; la mano destra
-// specchiata e' una mano sinistra. I bersagli IK restano in spazio attore:
-// la trasformazione specchiata della mesh li riporta al posto giusto.
-constexpr uintptr_t kOffMeshRotationYaw = 0x1D0, kOffMeshScale3D = 0x1DC;
-float g_fpSavedScale3D[3] = {1.0f, 1.0f, 1.0f};
-bool MirrorBodyWanted() {
-    int m = vr::control::g_mirrorBody.load();
-    return m == 1 || (m == 2 && vr::control::g_leftHanded);
-}
-void ApplyBodyMirror(void* mesh, bool mirror) {
-    float s[3] = {g_fpSavedScale3D[0], g_fpSavedScale3D[1], g_fpSavedScale3D[2]};
-    if (mirror) {
-        int32_t yaw = 0;
-        SafeCopy(&yaw, static_cast<char*>(mesh) + kOffMeshRotationYaw, 4);
-        int axis = (std::abs(((yaw % 65536) + 65536) % 65536 - 32768) < 8192) || std::abs(((yaw % 65536) + 65536) % 65536) < 8192 ? 1 : 0;
-        s[axis] = -std::fabs(s[axis]);
-        if (!g_fpMirrored)
-            vr::log::Line("BODY: Walker mirrored (left-handed), mesh yaw " + std::to_string(yaw) + ", axis " + (axis ? "Y" : "X") +
-                          ", game Scale3D (" + std::to_string(g_fpSavedScale3D[0]) + ", " + std::to_string(g_fpSavedScale3D[1]) + ", " +
-                          std::to_string(g_fpSavedScale3D[2]) + ").");
-    } else if (g_fpMirrored) {
-        vr::log::Line("BODY: Walker mirror removed.");
-    }
-    g_fpMirrored = mirror;
-    SafeCopy(static_cast<char*>(mesh) + kOffMeshScale3D, s, 12);
-}
-
 bool SetCylinders(void* pawn, const float* v) { return SafeCopy(static_cast<char*>(pawn) + kOffPawnInvisCylinders, v, 32); }
 
 // Testa e collo nascosti (il collo comprende la testa): con la sola testa,
@@ -6037,7 +5987,6 @@ void UpdateFirstPersonBody(void* pawn) {
             SetHeadHidden(g_fpHeadMesh, false);
             float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
             SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xyz, 12);
-            if (g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, false);
         }
         g_fpPawn = nullptr;
         g_fpHeadMesh = nullptr;
@@ -6056,11 +6005,7 @@ void UpdateFirstPersonBody(void* pawn) {
         if (g_fpHeadMesh) {
             float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
             SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xyz, 12);
-            if (g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, false);
         }
-        SafeCopy(g_fpSavedScale3D, reinterpret_cast<char*>(mesh) + kOffMeshScale3D, 12);
-        for (float& v : g_fpSavedScale3D) v = std::fabs(v) > 0.01f ? std::fabs(v) : 1.0f;
-        g_fpMirrored = false;
         SafeCopy(&g_fpSavedMeshX, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX, 4);
         SafeCopy(&g_fpSavedMeshY, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX + 4, 4);
         SafeCopy(&g_fpSavedMeshZ, reinterpret_cast<char*>(mesh) + kOffMeshTranslationX + 8, 4);
@@ -6143,28 +6088,6 @@ void UpdateFirstPersonBody(void* pawn) {
             if (headDrop < 0.0f) z += headDrop;
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX + 8, &z, 4);
-        bool mirror = MirrorBodyWanted() && g_handInWeaponValid[0] && g_unmirrorFrames <= 0;
-        if (g_unmirrorFrames > 0) --g_unmirrorFrames;
-        if (mirror != g_fpMirrored) ApplyBodyMirror(g_fpHeadMesh, mirror);
-        if (g_fpMirrored) {
-            // UpdateSkelPose (0x006455E0) valuta i controlli solo se la mesh e'
-            // stata renderizzata di recente (LastRenderTime +0x1F0 contro
-            // WorldInfo.TimeSeconds +0x454): con la scala negativa il renderer
-            // non lo aggiornava e le braccia restavano all'animazione (22/10).
-            uint32_t wi = 0;
-            float ts = 0.0f, lrt = 0.0f;
-            if (TrySafeReadUint32(static_cast<char*>(pawn) + 0xEC, &wi) && wi &&  // Actor.WorldInfo
-                SafeCopy(&ts, reinterpret_cast<char*>(wi) + 0x454, 4) && SafeCopy(&lrt, static_cast<char*>(g_fpHeadMesh) + 0x1F0, 4)) {
-                static int logged = 0;
-                if (logged < 3 && ++logged) {
-                    char b[160];
-                    std::snprintf(b, sizeof(b), "BODY: mirrored, LastRenderTime %.2f, TimeSeconds %.2f%s", lrt, ts,
-                                  ts - lrt > 1.0f ? " (not rendered recently: forced)" : "");
-                    vr::log::Line(b);
-                }
-                SafeCopy(static_cast<char*>(g_fpHeadMesh) + 0x1F0, &ts, 4);
-            }
-        }
     }
 }
 
@@ -6620,7 +6543,6 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
     if (gunComp != lastGunComp) {
         lastGunComp = gunComp;
         measureDue[0] = true;
-        if (g_fpMirrored || MirrorBodyWanted()) g_unmirrorFrames = 12;  // misura senza specchio, poi di nuovo specchiato
     }
     bool gunInHand = false;
     if (gunComp) {

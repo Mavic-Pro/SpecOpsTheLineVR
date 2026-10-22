@@ -262,9 +262,6 @@ extern std::atomic<bool> g_fades;
 // Mancini ("hand left"): i ruoli dei controller si scambiano (il sinistro
 // regge l'arma e ha grilletto/tasti della mano dell'arma).
 extern std::atomic<bool> g_leftHanded;
-extern std::atomic<int> g_mirrorBody;  // corpo di Walker specchiato: 0 off, 1 on, 2 auto (= con hand left)
-extern std::atomic<bool> g_armSwap;  // mancini: il braccio sinistro di Walker e' quello dell'arma (arma riagganciata a Weapon_Left)
-extern std::atomic<int> g_mirrorEffNeg, g_mirrorRotConj;  // prove del corpo specchiato: bersaglio IK con Y negata, rotazione coniugata
 // Laser sullo schermo virtuale (R-U5): il controller dell'arma muove il cursore
 // del gioco sui menu, il grilletto clicca. flipy/full: convenzioni UV da provare.
 extern std::atomic<bool> g_cinemaLaser, g_cinemaLaserFlipY, g_cinemaLaserFullUv;

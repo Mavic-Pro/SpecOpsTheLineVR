@@ -828,8 +828,9 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   the reference is taken with the headset worn. Before, with `height 1.55`
   and the head seated at 1.2 m, the view sat 35 cm under Walker's eyes and
   the body followed it into the floor ("deformed dwarf").
-- **Left-handed body (21-22/10): arm swap.** With `hand left` (and
-  `armswap on`, default) the gun side (side 0) is Walker's LEFT arm and the
+- **Left-handed body (21-22/10): arm swap.** With `hand left` (no separate
+  option: the arm swap follows the dominant hand) the gun side (side 0) is
+  Walker's LEFT arm and the
   support side his right: `HandBone/WeaponBone/IkHelperBone/ShoulderBone(side)`
   return the swapped names, the IK control names are taken with `i ^ 1`
   (`IK_LeftHand`, `IKRot_LeftHand` for side 0) and the rig is re-acquired
@@ -848,7 +849,7 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   hand (`shots/swap_left.png`). Still to judge in a headset by a left-handed
   player: finger poses (the left hand uses the animation's support-hand
   fingers), the attach offset on the hand, holster/reload gestures.
-  Mirroring the mesh (`mirrorbody`, experimental, off) is a dead end: the
+  Mirroring the mesh (a `mirrorbody` experiment, code removed) is a dead end: the
   engine's `CalcComponentToFrameMatrix` (0x00583610) and bone quaternions
   do not survive a reflection (IK controls simply stop acting; Ghidra, vtable
   slot 84 = `USkelControlLimb::CalculateNewBoneTransforms` 0x00CE6EA0).

@@ -39,7 +39,6 @@ struct Item {
 std::vector<Item> BasicItems() {
     return {
         {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: the gun buttons move to the left controller and Walker holds the gun in his left hand.", Kind::Choice, {"right", "left"}},
-        {"mirrorbody", "Mirrored body", "Walker's body mirrored so the gun is in his left hand (auto = with the left dominant hand).", Kind::Choice, {"auto", "on", "off"}},
         {"cinemalaser", "Laser on the screen", "Point the gun controller at the virtual screen to move the game's cursor on its menus; trigger = click.", Kind::OnOff},
         {"wristhud", "Wrist HUD", "Ammo, weapon and health on the support-hand wrist, like a watch.", Kind::OnOff},
         {"commandaim", "Squad orders aim", "Who the squad order targets while the squad button is held: along the gun barrel, the centre of the view (game), or where the support hand points.", Kind::Choice, {"gun", "head", "support"}},
