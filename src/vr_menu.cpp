@@ -47,14 +47,14 @@ std::vector<Item> BasicItems() {
         {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.35 100", "0.4 100", "0.5 100", "0.6 100"}},
         {"fpbody", "Walker's body", "Show Walker's body and arms (off = floating hands and gun).", Kind::OnOff},
         {"reload", "Reload", "physical = grip the magazine, belt, push it in; simple = press X.", Kind::Choice, {"physical", "simple"}},
-        {"marker", "Green aim marker", "A marker where the barrel points. Off: use the weapon's own sights.", Kind::OnOff},
+        {"marker", "Green aim marker", "A green marker where the barrel points (on by default). Off: use only the weapon's own sights.", Kind::OnOff},
         {"laser", "Laser beam", "A visible beam from the barrel to the point of impact.", Kind::OnOff},
         {"spread", "Bullet spread", "on = the game's spread scaled by stance; off = laser-straight shots.", Kind::OnOff},
         {"roomscale", "Room-scale", "Walker follows your real steps (collisions included).", Kind::OnOff},
         {"seated", "Seated play", "Playing sitting down: the view keeps Walker's standing eye height from where your head is when you recenter.", Kind::OnOff},
         {"hints", "Controller hints", "Short hints in the headset during the first sessions.", Kind::Choice, {"auto", "on", "off"}},
         {"vrmenu", "This menu at start", "Open this menu on the game's main menu at every start.", Kind::Choice, {"on", "off"}},
-        {"runtime", "VR runtime", "steamvr = through SteamVR; openxr = Quest Link or Virtual Desktop (VDXR) directly, no SteamVR; auto = openxr unless SteamVR is the OpenXR runtime. Restart the game.", Kind::Choice, {"steamvr", "openxr", "auto"}},
+        {"runtime", "VR runtime", "steamvr = through SteamVR; openxr = Quest Link or Virtual Desktop (VDXR) directly, no SteamVR; auto (default) = Virtual Desktop (VDXR) when its Streamer runs, otherwise SteamVR. Restart the game.", Kind::Choice, {"steamvr", "openxr", "auto"}},
     };
 }
 
@@ -272,11 +272,18 @@ bool Render(std::vector<uint32_t>* rgba) {
         SelectObject(dc, fontSmall);
         SetTextColor(dc, RGB(255, 235, 200));
         RECT r1 = {34, kTop - 8, kW - 34, kTop + 88};
-        DrawTextA(dc,
-                  "VIRTUAL DESKTOP: to avoid half frame rate, in the VD menu (Streaming tab) set Synchronous Spacewarp = Disabled, "
-                  "VR Frame Rate = 72, VR Graphics Quality = High or lower, and connect the PC to the router with an Ethernet cable. "
-                  "Changes apply at the next start.",
-                  -1, &r1, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        // Con VDXR (runtime openxr) il gioco regge anche 120 Hz in Godlike
+        // (log 22/10: 117-120 invii/s a 3072x3264 per occhio): i limiti 72 Hz /
+        // High valgono solo passando da SteamVR.
+        const char* vdText =
+            vr::rt::Active() == vr::rt::Backend::OpenXR
+                ? "VIRTUAL DESKTOP (VDXR, no SteamVR): any VR Frame Rate and Graphics Quality works, up to 120 Hz on Godlike. "
+                  "Only if the game stays at half the refresh rate: VD menu (Streaming tab) > Synchronous Spacewarp = Disabled. "
+                  "Ethernet cable from the PC to the router recommended."
+                : "VIRTUAL DESKTOP through SteamVR: for full frame rate set VR runtime = openxr (Basic tab, then restart the game; "
+                  "up to 120 Hz on Godlike). Staying on SteamVR: VD menu (Streaming tab) > Synchronous Spacewarp = Disabled, "
+                  "VR Frame Rate = 72, Graphics Quality = High or lower.";
+        DrawTextA(dc, vdText, -1, &r1, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
         topY = kTop + 106;
     }
     if (g_tab == 2) {

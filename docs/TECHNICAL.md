@@ -743,7 +743,8 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   defaults 1 / 0.1 / 0.5 / 1.5): with the sights at the eye the shot is
   practically a laser, so the weapon's own sights are usable; the green
   marker is **off by default** (configversion 6 migrates `marker on` to
-  `off`; players who want it turn it back on) and a new **`laser on`** draws
+  `off`; players who want it turn it back on; configversion 9, 22/10, turned it
+  back **on** by default at the user's request, `marker off` in the menu) and a new **`laser on`** draws
   a red beam from 25 units ahead of the barrel to the point of impact
   (start point carried per eye in the frame tag like the marker, drawn with
   Clear rects, hidden while aiming down the sights).
@@ -1217,8 +1218,15 @@ ones listed in the script are implemented by hand, the rest return defaults).
   therefore not applied. `openxrjson <path>` overrides the json (tests:
   Oculus `oculus_openxr_32.json`, Virtual Desktop `virtualdesktop-openxr-32.json`,
   SteamVR `steamxr_win32.json`).
-- **Selection**: `runtime steamvr` (default), `openxr`, or `auto` (OpenXR
-  unless the active OpenXR runtime is SteamVR's). Read directly from the ini
+- **Selection**: `runtime auto` (default since configversion 9), `steamvr`,
+  or `openxr`. `auto`: with `VirtualDesktop.Streamer.exe` running it tries VDXR
+  (`virtualdesktop-openxr-32.json` from `AvailableRuntimes`, whatever the active
+  runtime is), otherwise SteamVR. The Oculus runtime (Link) is deliberately NOT
+  picked by `auto` until the backend is verified on Link in the headset (the
+  migration moves every Link player to `auto`). Until one Init succeeds every
+  retry (5 s) tries VDXR again, so a headset connected to VD after the game
+  started still gets VDXR. `auto` with an explicit `openxrjson` keeps the old
+  rule (OpenXR unless that runtime is SteamVR's). Read directly from the ini
   by `vr_runtime.cpp` because the session starts from `CreateDevice`, before
   the hooks load the ini. OpenXR has no Background applications: `Init`
   always gives a full session and `vr::session` treats it as Scene.

@@ -1201,7 +1201,15 @@ void WorkerLoop() {
                 static bool warned = false;
                 double rate = 1000.0 * n / (now - windowStart);
                 float hz = g_hmdHz.load();
-                if (submits > 1 && hz > 0.0f && rate > 10.0 && rate < 0.6 * hz) ++halfWindows;
+                // Solo in gameplay: menu e caricamenti dell'avvio girano a ~27
+                // fps e facevano scattare l'avviso a torto (log VDXR 22/10).
+                bool gameplay = !vr::control::g_cinemaActive.load();
+                // Ed e' il visore a frenare, non il gioco: con SSW/ASW l'attesa
+                // del compositor occupa gran parte del frame; quando e' il gioco a
+                // limitarsi (menu di pausa, caricamenti) l'attesa e' ~0 (0,04 ms a
+                // 27 fps nel log 22/10).
+                bool headsetBound = rate > 0.0 && waitMs / n >= 0.3 * (1000.0 / rate);
+                if (submits > 1 && gameplay && headsetBound && hz > 0.0f && rate > 10.0 && rate < 0.6 * hz) ++halfWindows;
                 else halfWindows = 0;
                 if (halfWindows >= 2 && !warned) {
                     warned = true;

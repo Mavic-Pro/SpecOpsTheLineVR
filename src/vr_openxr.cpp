@@ -9,6 +9,7 @@
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <dxgi.h>
@@ -245,7 +246,10 @@ bool LoadRuntime(const std::string& overrideJson, std::string* error) {
     g_runtimeDll = h;
     g_gipa = rr.getInstanceProcAddr;
     g_runtimeJsonName = FileName(json);
-    vr::log::Line("OPENXR: runtime " + lib + " (from " + json + ").");
+    // Una riga sola anche con i tentativi ogni 5 s del runtime auto.
+    static std::string lastLogged;
+    if (json != lastLogged) vr::log::Line("OPENXR: runtime " + lib + " (from " + json + ").");
+    lastLogged = json;
     return true;
 }
 
@@ -770,7 +774,12 @@ bool CreateInstanceAndSystem(std::string* error) {
     std::snprintf(g.runtimeVersion, sizeof(g.runtimeVersion), "%s %u.%u.%u", ip.runtimeName,
                   XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
                   XR_VERSION_PATCH(ip.runtimeVersion));
-    vr::log::Line(std::string("OPENXR: instance on ") + g.runtimeVersion + "; extensions:" + list);
+    {
+        static std::string lastLogged;  // tentativi ogni 5 s del runtime auto: una riga sola
+        std::string line = std::string("OPENXR: instance on ") + g.runtimeVersion + "; extensions:" + list;
+        if (line != lastLogged) vr::log::Line(line);
+        lastLogged = line;
+    }
     return true;
 }
 
@@ -2352,6 +2361,44 @@ vr::EVRApplicationError ApplicationsShim::GetApplicationKeyByProcessId(uint32_t,
 const char* ApplicationsShim::GetApplicationsErrorNameFromEnum(vr::EVRApplicationError) { return "not available (OpenXR)"; }
 
 // --- API pubblica ------------------------------------------------------------------
+
+std::string VirtualDesktopJson() {
+    HKEY k = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Khronos\\OpenXR\\1\\AvailableRuntimes", 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return "";
+    std::string found;
+    char name[MAX_PATH * 2];
+    for (DWORD i = 0;; ++i) {
+        DWORD len = sizeof(name) - 1;
+        if (RegEnumValueA(k, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        name[len] = 0;
+        if (FileName(name).find("virtualdesktop-openxr-32") != std::string::npos &&
+            GetFileAttributesA(name) != INVALID_FILE_ATTRIBUTES) {
+            found = name;
+            break;
+        }
+    }
+    RegCloseKey(k);
+    return found;
+}
+
+bool VirtualDesktopRunning() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe = {sizeof(pe)};
+    bool running = false;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !running; ok = Process32NextW(snap, &pe))
+        running = _wcsicmp(pe.szExeFile, L"VirtualDesktop.Streamer.exe") == 0;
+    CloseHandle(snap);
+    return running;
+}
+
+void Unload() {
+    DestroyAll();
+    g_gipa = nullptr;
+    g_runtimeDll = nullptr;
+    g_runtimeJsonName.clear();
+}
 
 bool ActiveRuntime(const std::string& overrideJson, std::string* name) {
     std::string json = RuntimeJsonPath(overrideJson);

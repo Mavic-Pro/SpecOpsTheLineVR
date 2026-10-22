@@ -157,7 +157,10 @@ void ConfigureReprojection() {
         vr::control::g_vdDetected = true;
         vr::log::Line("VR: Virtual Desktop detected. If the game stays at half the headset refresh rate, set "
                       "\"Synchronous Spacewarp\" to Disabled in the Virtual Desktop menu (Streaming tab).");
-        vr::toast::Notify("Virtual Desktop: set Synchronous Spacewarp to Disabled (VD menu, Streaming) for full frame rate");
+        // Con VDXR nessun avviso all'avvio: regge anche 120 Hz Godlike; se resta
+        // a meta' frequenza lo dice l'avviso di vr_output.
+        if (vr::rt::Active() != vr::rt::Backend::OpenXR)
+            vr::toast::Notify("Virtual Desktop via SteamVR: VR runtime = openxr (mod menu) for full frame rate");
         return;  // niente ASW di Link
     }
     if (sys != "oculus" || !vr::control::g_linkAswOff) return;  // ASW: solo Link

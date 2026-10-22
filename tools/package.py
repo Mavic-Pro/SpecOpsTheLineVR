@@ -82,7 +82,7 @@ if (Test-Path $ini) {
   Copy-Item (Join-Path $PSScriptRoot 'specopsvr.ini') $ini
 }
 Write-Host "SpecOpsTheLineVR installed in $dst"
-Write-Host 'Start SteamVR, then the game.'
+Write-Host 'Connect the headset (Virtual Desktop, Link or SteamVR), then start the game.'
 """
 
 UNINSTALL_PS1 = r"""
@@ -187,18 +187,19 @@ README_TXT = """SpecOpsTheLineVR {version} - unofficial VR mod for Spec Ops: The
 
 https://github.com/Mavic-Pro/SpecOpsTheLineVR
 
-Requirements: Windows 10/11, Spec Ops: The Line (Steam), SteamVR and a
-SteamVR-compatible headset with two motion controllers. Developed and tested
-with a Meta Quest 3 over Link.
+Requirements: Windows 10/11, Spec Ops: The Line (Steam) and a PC VR headset
+with two motion controllers, through Virtual Desktop (VDXR) or SteamVR:
+"runtime auto" (default) picks Virtual Desktop when its Streamer is running,
+otherwise SteamVR. Developed and tested with a Meta Quest 3.
 
 INSTALL
   1. Run install.bat (it finds the game through Steam; otherwise
      install.bat "D:\\SteamLibrary\\steamapps\\common\\SpecOps_TheLine").
   2. In Steam, game Properties > Launch options, add:
        -windowed ResX=2400 ResY=2500
-     (the mod then uses the resolution SteamVR recommends for your headset:
-     change sharpness with the SteamVR resolution slider).
-  3. Start SteamVR, put the headset on and start the game.
+     (the mod then uses the resolution the VR runtime recommends: change
+     sharpness in Virtual Desktop / the Oculus app / the SteamVR slider).
+  3. Connect the headset (Virtual Desktop, Link or SteamVR) and start the game.
 
 UNINSTALL
   Run uninstall.bat. The game files are never modified: the mod only adds

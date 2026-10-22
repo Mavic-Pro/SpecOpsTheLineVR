@@ -175,7 +175,7 @@ std::atomic<bool> g_aimHand{true};
 std::atomic<float> g_aimPitchOffsetDeg{0.0f};
 std::atomic<float> g_synthAimYawDeg{0.0f};
 std::atomic<float> g_synthAimPitchDeg{0.0f};
-std::atomic<bool> g_aimMarker{false};  // mirino verde: spento di default dal 21/10 (mirini veri; "laser on" in alternativa)
+std::atomic<bool> g_aimMarker{true};  // mirino verde: acceso di default dal 22/10 (configversion 9), spegnibile dal menu
 std::atomic<bool> g_headCollision{true};
 std::atomic<float> g_snapTurnDeg{0.0f};
 std::atomic<bool> g_stickPitch{false};
@@ -1267,7 +1267,10 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // 8 (22/10): "reload physical" -> simple (manual reload off by default);
 // "commandaim" retired: squad orders always try gun, support hand and head;
 // "hud 0.5 100" -> 0.4 (tester 22/10: HUD at the edge of the view, wanted 80%).
-constexpr int kConfigVersion = 8;
+// 9 (22/10 evening, user request): "marker off" -> on (green marker back on by
+// default, can be turned off in the menu); "runtime steamvr" -> auto (OpenXR
+// directly when the active runtime is not SteamVR: VDXR holds 120 Hz Godlike).
+constexpr int kConfigVersion = 9;
 const char* const kRetiredKeys[] = {"twohand", "leftgrip", "menu169", "cinema3d", "ham", "mode", "gun", "arms", "muzzleaim",
                                     "aimassist", "gamecrosshair", "6dof", "bodyfollow", "posscale", "near", "viewport",
                                     "offcenter", "eyestate", "submitpose", "handpredict", "coversnap", "cinemaalign",
@@ -1280,7 +1283,8 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
         {2, "submitpose on", "submitpose off"}, {2, "predict off", "predict auto"}, {3, "bodyback 6 10", "bodyback -10 26"},
         {4, "bodyback -10 10", "bodyback -10 26"}, {5, "hud 0.6 150", "hud 0.5 100"},
         {6, "marker on", "marker off"},  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
-        {8, "reload physical", "reload simple"}, {8, "hud 0.5 100", "hud 0.4 100"}};  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
+        {8, "reload physical", "reload simple"}, {8, "hud 0.5 100", "hud 0.4 100"},
+        {9, "marker off", "marker on"}, {9, "runtime steamvr", "runtime auto"}};
     std::string done;
     int removed = 0;
     if (vr::pure::ConfigVersionOf(lines) < 8)

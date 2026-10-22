@@ -13,6 +13,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace vr::rt {
 
@@ -21,6 +22,7 @@ namespace {
 std::atomic<Backend> g_active{Backend::None};
 std::mutex g_cfgMutex;
 std::string g_choice;      // "" = non ancora letto
+bool g_autoSettled = false;  // runtime auto: backend scelto (un Init riuscito)
 std::string g_openxrJson;  // override del json del runtime OpenXR
 
 // La sessione parte da CreateDevice, prima che l'ini sia caricato dai hook:
@@ -29,7 +31,7 @@ std::string g_openxrJson;  // override del json del runtime OpenXR
 void ReadChoiceFromIni() {
     std::lock_guard<std::mutex> lock(g_cfgMutex);
     if (!g_choice.empty()) return;
-    g_choice = "steamvr";
+    g_choice = "auto";  // predefinito dal 22/10 (configversion 9)
     std::ifstream f(vr::control::GameDirectory() + "\\specopsvr.ini");
     std::string line;
     while (f && std::getline(f, line)) {
@@ -145,6 +147,48 @@ bool Init(vr::EVRApplicationType type, std::string* error) {
         std::lock_guard<std::mutex> lock(g_cfgMutex);
         choice = g_choice;
         json = g_openxrJson;
+    }
+    if (!g_autoSettled && choice == "auto" && json.empty()) {
+        // Virtual Desktop preferito quando l'utente lo usa (streamer avviato,
+        // richiesta 22/10): VDXR regge 120 Hz Godlike, VD attraverso SteamVR no.
+        // Altrimenti SteamVR: il backend OpenXR su Link (runtime Oculus) non e'
+        // ancora provato nel visore, e con la migrazione a "auto" tutti i
+        // giocatori Link ci passerebbero (scelta prudente, 22/10). VDXR che non
+        // parte (visore non ancora collegato) -> SteamVR, e finche' nessuno e'
+        // partito ogni nuovo tentativo (ogni 5 s) riprova VDXR: il visore
+        // collegato a VD dopo l'avvio del gioco prende VDXR. Log solo quando cambia.
+        static std::string lastLog;
+        std::string log;
+        std::vector<std::pair<std::string, std::string>> tries;  // json, motivo
+        std::string vd = vr::xr::VirtualDesktopRunning() ? vr::xr::VirtualDesktopJson() : std::string();
+        if (!vd.empty()) tries.push_back({vd, "Virtual Desktop streamer running"});
+        for (const auto& t : tries) {
+            std::string e;
+            g_active = Backend::OpenXR;
+            if (vr::xr::Init(t.first, &e)) {
+                vr::log::Line(std::string("VR runtime: OpenXR (runtime auto: ") + t.second + ").");
+                std::lock_guard<std::mutex> lock(g_cfgMutex);
+                g_openxrJson = t.first;  // i tentativi successivi restano su questo runtime
+                g_autoSettled = true;
+                return true;
+            }
+            log += "VR runtime: OpenXR (runtime auto: " + t.second + ") not available (" + e + "), using SteamVR.\n";
+            vr::xr::Unload();
+        }
+        g_active = Backend::OpenVR;
+        log += std::string("VR runtime: ") + BackendName() + " (runtime auto: " +
+               (vd.empty() ? "Virtual Desktop streamer not running" : "Virtual Desktop not connected") + ").";
+        if (log != lastLog) {
+            lastLog = log;
+            for (size_t a = 0, b; a < log.size(); a = b + 1) {
+                b = log.find('\n', a);
+                if (b == std::string::npos) b = log.size();
+                vr::log::Line(log.substr(a, b - a));
+            }
+        }
+        bool ok = OpenVrInit(type, error);
+        if (ok) g_autoSettled = true;
+        return ok;
     }
     if (g_active == Backend::None) {
         // Scelta del backend una volta sola per partita (loggata).

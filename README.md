@@ -31,8 +31,9 @@ virtual cinema screen.
 - **Aim with the gun**: shots, rockets and grenade-launcher rounds leave the
   barrel of the gun you hold, with the game's own spread scaled by your
   stance (sights at the eye = practically none, two hands = half, long gun in
-  one hand = more). Use the weapon's sights; `marker on` adds a green marker
-  where the barrel points, `laser on` a visible beam. Two-handed aiming engages
+  one hand = more). A green marker shows where the barrel points (on by
+  default, `marker off` or the in-headset menu to use only the weapon's
+  sights); `laser on` adds a visible beam. Two-handed aiming engages
   by itself: left hand on the barrel of a rifle, or wrapped around the gun
   hand with a pistol. **Aim down the sights** by bringing the gun to your eye.
   Gamepad aim assist is disabled while aiming by hand.
@@ -71,10 +72,11 @@ virtual cinema screen.
 - *Spec Ops: The Line*. Developed and tested on the Steam version; other
   copies (non-Steam executables) are untested: the mod still starts and shows
   a notice in the headset, but it may not work on them.
-- A PC VR headset with two motion controllers, through **SteamVR** (default)
-  or, with `runtime openxr` in `specopsvr.ini` or the in-headset menu,
-  through the **OpenXR runtime** active on your PC (Meta Quest Link, Virtual
-  Desktop VDXR, Pimax, SteamVR...), without SteamVR. Developed and tested
+- A PC VR headset with two motion controllers. With the default
+  `runtime auto` the mod picks by itself: **Virtual Desktop (VDXR)** when the
+  Virtual Desktop Streamer is running, otherwise **SteamVR**. `runtime openxr`
+  (in `specopsvr.ini` or the in-headset menu) uses the OpenXR runtime active
+  on your PC instead (Meta Quest Link, Pimax...; experimental on Link). Developed and tested
   with a Meta Quest 3 over Link; Virtual Desktop works too. Default bindings
   for Quest/Rift Touch, Valve Index, Vive, Vive Cosmos, HP Reverb G2, Pico and
   Windows Mixed Reality controllers.
@@ -91,11 +93,10 @@ virtual cinema screen.
    `-windowed ResX=2400 ResY=2500`. Once the headset is on, the mod switches
    the game to the resolution SteamVR recommends for your headset: to change
    sharpness, use the SteamVR resolution slider.
-4. Start SteamVR, put the headset on, start the game. With `runtime openxr`
-   SteamVR is not needed: the game talks to the OpenXR runtime set as active
-   in the Oculus app / Virtual Desktop Streamer (restart the game after
-   changing the setting; the resolution then follows that runtime's own
-   setting instead of the SteamVR slider).
+4. Put the headset on (connect it to Virtual Desktop or Link, or start
+   SteamVR) and start the game. Through OpenXR (VDXR, Link) SteamVR is not
+   needed and the resolution follows that runtime's own setting (VD's
+   Graphics Quality, up to Godlike at 120 Hz) instead of the SteamVR slider.
 
 The game files are never modified: the mod only adds `d3d9.dll` and
 `openvr_api.dll` next to `SpecOpsTheLine.exe`. `uninstall.bat` removes them.

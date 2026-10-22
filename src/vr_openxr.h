@@ -16,7 +16,16 @@ namespace vr::xr {
 // file del json in minuscolo (es. "virtualdesktop-openxr-32.json").
 bool ActiveRuntime(const std::string& overrideJson, std::string* name);
 
+// json a 32 bit di Virtual Desktop (VDXR) se registrato tra gli AvailableRuntimes
+// ed esistente, altrimenti "". VirtualDesktopRunning = streamer di VD avviato.
+std::string VirtualDesktopJson();
+bool VirtualDesktopRunning();
+
 bool Init(const std::string& overrideJson, std::string* error);
+// Dopo un Init fallito: dimentica il runtime caricato, cosi' un Init successivo
+// puo' caricarne un altro (la dll resta in memoria: i suoi thread possono
+// essere ancora vivi).
+void Unload();
 void Shutdown();
 bool Alive();
 const char* RuntimeName();
