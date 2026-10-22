@@ -23,3 +23,4 @@ vendor/openvr/bin/*
 vendor/openvr/bin/win32/*.pdb
 !vendor/openvr/LICENSE
 vendor/minhook/.git*
+recordings/

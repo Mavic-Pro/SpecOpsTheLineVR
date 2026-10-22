@@ -278,15 +278,28 @@ bool PollEvents() {
     while (sys->PollNextEvent(&ev, sizeof(ev))) {
         switch (ev.eventType) {
         case vr::VREvent_DashboardActivated:
-        case vr::VREvent_InputFocusCaptured:
             if (!vr::control::g_vrDashboard.exchange(true)) {
                 vr::control::g_vrPauseRequest = true;
                 vr::log::Line("OpenVR: dashboard open, game paused.");
             }
             break;
         case vr::VREvent_DashboardDeactivated:
-        case vr::VREvent_InputFocusReleased:
             if (vr::control::g_vrDashboard.exchange(false)) vr::log::Line("OpenVR: dashboard closed.");
+            break;
+        case vr::VREvent_InputFocusCaptured:
+        case vr::VREvent_InputFocusReleased:
+            // Un'altra app prende il focus dell'input: su Link succede di
+            // continuo (22/10: catturato/rilasciato a raffica all'avvio, poi
+            // catturato per sempre con la dashboard invisibile: comandi morti
+            // per tutta la partita). Non e' la dashboard: SteamVR smette da
+            // solo di dare le azioni finche' dura, qui si logga e basta.
+            {
+                char b[120];
+                snprintf(b, sizeof(b), "OpenVR: input focus %s (pid %u, old pid %u).",
+                         ev.eventType == vr::VREvent_InputFocusCaptured ? "captured by another app" : "released",
+                         ev.data.process.pid, ev.data.process.oldPid);
+                vr::log::Line(b);
+            }
             break;
         case vr::VREvent_ChaperoneUniverseHasChanged:
         case vr::VREvent_StandingZeroPoseReset:
@@ -371,15 +384,22 @@ void MonitorLoop() {
             quit = !PollEvents();
             if (!quit) vr::menu::Tick(vr::control::g_cinemaActive);  // menu nel visore (stesso thread dello switch)
             // Lo stato della dashboard viene dagli eventi, ma un evento perso
-            // (cambio Background/Scene, focus preso da un'altra app) lasciava
-            // la mod convinta che fosse aperta, con tutti i comandi bloccati:
-            // ogni secondo si riallinea allo stato vero (audit 20/10).
+            // (cambio Background/Scene) lasciava la mod convinta che fosse
+            // aperta, con tutti i comandi bloccati: ogni secondo si riallinea
+            // allo stato vero (audit 20/10). Solo la dashboard visibile: su
+            // Link IsInputAvailable() resta falso per tutta la partita (22/10).
             static ULONGLONG lastSync = 0;
             if (!quit && g_scene && vr::VROverlay() && vr::VRSystem() && GetTickCount64() - lastSync > 1000) {
                 lastSync = GetTickCount64();
-                bool open = vr::VROverlay()->IsDashboardVisible() || !vr::VRSystem()->IsInputAvailable();
+                bool open = vr::VROverlay()->IsDashboardVisible();
                 if (vr::control::g_vrDashboard.exchange(open) != open)
                     vr::log::Line(open ? "OpenVR: dashboard open (state resync)." : "OpenVR: dashboard closed (state resync).");
+                static bool inputWas = true;
+                bool inputNow = vr::VRSystem()->IsInputAvailable();
+                if (inputNow != inputWas) {
+                    inputWas = inputNow;
+                    vr::log::Line(inputNow ? "OpenVR: input available again." : "OpenVR: input not available (another app has the focus).");
+                }
             }
         }
         // SteamVR morto senza l'evento di uscita (chiuso dal Task Manager,
