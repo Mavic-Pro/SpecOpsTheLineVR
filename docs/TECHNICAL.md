@@ -506,7 +506,7 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   hand is at the magwell or the grip belongs to the reload, the grip is not
   sent to the game as LB (grenade).
 
-## Review fixes (after 0.9.9, in progress)
+## Review fixes (0.9.10)
 
 Work list from the multi-agent review in `docs/REVIEW_FULLVR.md` (item ids
 H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,

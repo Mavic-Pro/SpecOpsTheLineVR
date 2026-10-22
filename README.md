@@ -142,7 +142,7 @@ direction, so it feels the same on every controller.
 | Duck quickly next to cover | Take cover |
 | Lean out sideways (or stand up) while in cover | Pop out and aim |
 | Gun up to your eye | Aim down the sights |
-| Right hand over the right shoulder + grip | Next weapon |
+| Right hand over the right shoulder (or at the hip) + grip | Next weapon |
 | Left hand on the barrel | The hand grips the gun; two-handed aiming |
 | Turn your head past 45 degrees | Walker turns with you |
 
@@ -189,6 +189,11 @@ there is plenty of headroom:
   SteamVR may show its dashboard: close it with the menu button.
 
 ## Configuration
+
+The **in-headset settings menu** opens by itself on the game's main menu
+(point the controller laser and pull the trigger; PLAY closes it): *Basic*
+has the main options with a short explanation, *Advanced* every option of the
+ini, *Controls* the full control list. Changes apply at once and are saved.
 
 `specopsvr.ini` in the game's `Binaries\Win32` folder; every option is
 documented in the file (aiming, arms, cover, comfort, cinema screen, haptics,
