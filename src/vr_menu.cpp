@@ -40,11 +40,10 @@ std::vector<Item> BasicItems() {
     return {
         {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: the gun buttons move to the left controller and Walker holds the gun in his left hand.", Kind::Choice, {"right", "left"}},
         {"wristhud", "Wrist HUD", "Ammo, weapon and health on the support-hand wrist, like a watch.", Kind::OnOff},
-        {"commandaim", "Squad orders aim", "Who the squad order targets while the squad button is held: along the gun barrel, the centre of the view (game), or where the support hand points.", Kind::Choice, {"gun", "head", "support"}},
         {"height", "Standing height", "auto = your real height measured while playing; hold both sticks 3 s to set it.", Kind::Choice, {"auto", "fixed"}},
         {"snapturn", "Turning", "0 = smooth turning with the right stick, 30/45 = snap turns in degrees.", Kind::Choice, {"0", "30", "45"}},
         {"vignette", "Comfort vignette", "Darkens the edges while moving: 0 off, 0.5 light, 1 strong.", Kind::Choice, {"0", "0.5", "1"}},
-        {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.4 100", "0.5 100", "0.6 100"}},
+        {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.35 100", "0.4 100", "0.5 100", "0.6 100"}},
         {"fpbody", "Walker's body", "Show Walker's body and arms (off = floating hands and gun).", Kind::OnOff},
         {"reload", "Reload", "physical = grip the magazine, belt, push it in; simple = press X.", Kind::Choice, {"physical", "simple"}},
         {"marker", "Green aim marker", "A marker where the barrel points. Off: use the weapon's own sights.", Kind::OnOff},

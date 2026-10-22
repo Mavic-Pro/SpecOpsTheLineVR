@@ -6769,7 +6769,7 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             for (int i = 0; i < 3; ++i) g_handWorld[1][i] = lPos[i];
             g_handWorldValid[1] = true;
             {
-                // Direzione in cui punta la mano di supporto (ordini alla squadra, "commandaim support").
+                // Direzione in cui punta la mano di supporto (ordini alla squadra).
                 float sf[3], sr[3], su[3];
                 RotatorToAxes(g_bodyPitch.load() + g_leftPitch.load(), g_bodyYaw.load() + g_leftYaw.load(), g_leftRoll.load(), sf, sr, su);
                 for (int i = 0; i < 3; ++i) vr::control::g_supportFwd[i] = sf[i];
@@ -8238,9 +8238,8 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         if (held) {
             everPicked = nullptr;
             snprintf(b, sizeof(b),
-                     "SQUAD: button pressed (commandaim %s, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
+                     "SQUAD: button pressed (gun + support hand + head, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
                      "shooters=%u); game target %s",
-                     vr::control::g_commandAimMode == 2 ? "support" : (vr::control::g_commandAimMode == 1 ? "gun" : "head"),
                      pawn != nullptr, (int)vr::control::g_aimHand.load(),
                      (int)g_armsActive.load(), (int)g_muzzleAimValid.load(), (unsigned)CheapShooters().size(),
                      sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
@@ -8312,7 +8311,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     }
     // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
-    if (vr::control::g_commandAimMode == 0 || !pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
+    if (!pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
         lastPick = nullptr;
         g_squadModPick = nullptr;
         return;
@@ -8321,24 +8320,29 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // verde): lo stesso della camera logica del gioco. La visibilita' si
     // controlla dagli occhi, come fa il gioco: la canna all'altezza del fianco
     // dietro una copertura "vede" solo la copertura.
-    float bo[3], bd[3], eo[3];
+    // Tre raggi sempre attivi (22/10, richiesta: niente piu' scelta
+    // "commandaim"): canna, mano di supporto che punta, sguardo. Si provano in
+    // quest'ordine e vale il primo che trova un bersaglio.
+    float eo[3];
     std::memcpy(eo, cam + 0x10, sizeof(eo));  // occhi: origine della passata lungo lo sguardo
-    bool support = vr::control::g_commandAimMode == 2 && vr::control::g_supportFwdValid && g_handWorldValid[1];
-    // Mano che punta senza mirino: tolleranza piu' larga (8 / 10 gradi invece di 3 / 4).
-    const float tolPawn = support ? 0.1405f : 0.0524f, tolCheap = support ? 0.1763f : 0.0699f;
-    if (support) {
+    float rayO[3][3], rayD[3][3];
+    bool rayOk[3] = {false, false, true};
+    if (g_muzzleAimValid) {
+        std::memcpy(rayO[0], eo, sizeof(eo));
+        float dl = std::sqrt((g_muzzleTarget[0] - eo[0]) * (g_muzzleTarget[0] - eo[0]) +
+                             (g_muzzleTarget[1] - eo[1]) * (g_muzzleTarget[1] - eo[1]) +
+                             (g_muzzleTarget[2] - eo[2]) * (g_muzzleTarget[2] - eo[2]));
+        if (dl >= 1.0f) {
+            for (int i = 0; i < 3; ++i) rayD[0][i] = (g_muzzleTarget[i] - eo[i]) / dl;
+            rayOk[0] = true;
+        }
+    }
+    if (vr::control::g_supportFwdValid && g_handWorldValid[1]) {
         // Mano di supporto che punta (fase 4, E8): raggio dalla mano lungo la
         // sua direzione; la visibilita' resta controllata dagli occhi sotto.
-        std::memcpy(bo, g_handWorld[1], sizeof(bo));
-        for (int i = 0; i < 3; ++i) bd[i] = vr::control::g_supportFwd[i].load();
-    } else {
-        if (!g_muzzleAimValid) return;
-        std::memcpy(bo, cam + 0x10, sizeof(bo));
-        float dl = std::sqrt((g_muzzleTarget[0] - bo[0]) * (g_muzzleTarget[0] - bo[0]) +
-                             (g_muzzleTarget[1] - bo[1]) * (g_muzzleTarget[1] - bo[1]) +
-                             (g_muzzleTarget[2] - bo[2]) * (g_muzzleTarget[2] - bo[2]));
-        if (dl < 1.0f) return;
-        for (int i = 0; i < 3; ++i) bd[i] = (g_muzzleTarget[i] - bo[i]) / dl;
+        std::memcpy(rayO[1], g_handWorld[1], sizeof(eo));
+        for (int i = 0; i < 3; ++i) rayD[1][i] = vr::control::g_supportFwd[i].load();
+        rayOk[1] = true;
     }
     uint32_t worldInfo = 0, p = 0;
     if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo ||
@@ -8357,12 +8361,16 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // sguardo. Il gioco mostra il triangolo rosso del bersaglio al centro
     // della vista: chi lo conosce muove la testa per metterlo sul nemico, non
     // il fucile (20/10, cecchino sul cartellone: "spostano il triangolo").
-    float hd[3], hr[3], hu[3];
-    RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, hd, hr, hu);
+    float hr[3], hu[3];
+    RotatorToAxes(g_lastViewRot[0], g_lastViewRot[1], 0, rayD[2], hr, hu);
+    std::memcpy(rayO[2], eo, sizeof(eo));  // lo sguardo parte dagli occhi, non dalla mano
     const uint32_t pawnList = p;
-    for (int pass = 0; pass < 2 && !best; ++pass) {
-        const float* dir = pass ? hd : bd;
-        const float* o = pass ? eo : bo;  // lo sguardo parte dagli occhi, non dalla mano
+    for (int pass = 0; pass < 3 && !best; ++pass) {
+        if (!rayOk[pass]) continue;
+        const float* dir = rayD[pass];
+        const float* o = rayO[pass];
+        // Mano che punta senza mirino: tolleranza piu' larga (8 / 10 gradi invece di 3 / 4).
+        const float tolPawn = pass == 1 ? 0.1405f : 0.0524f, tolCheap = pass == 1 ? 0.1763f : 0.0699f;
         p = pawnList;
         for (int guard = 0; p && guard < 512; ++guard) {
             char* other = reinterpret_cast<char*>(p);

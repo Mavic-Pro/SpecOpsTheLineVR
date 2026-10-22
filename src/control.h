@@ -60,11 +60,6 @@ extern std::atomic<float> g_outputScale;
 extern std::atomic<bool> g_submitWithPose;
 // Sperimentale: invia solo coppie di occhi presentate una dopo l'altra ("paircheck on").
 extern std::atomic<bool> g_pairCheck;
-// Comando alla squadra (tasto squadra tenuto): il bersaglio e' il nemico lungo
-// la canna, come il mirino verde. Il gioco lo sceglie al centro dello schermo,
-// cioe' dove guarda la testa (segnalazione 18/10: il cecchino sul cartellone
-// non si riusciva a indicare).
-extern std::atomic<bool> g_commandFollowsGun;
 // Pose di testa e controller predette per l'istante in cui il frame arriva
 // sul display: fino al prossimo vsync + vsync->fotoni + predictFrames frame.
 extern std::atomic<float> g_predictFrames;
@@ -275,7 +270,6 @@ extern std::atomic<bool> g_gunCtrlPoseValid;
 extern std::atomic<bool> g_wristHud;
 extern std::atomic<float> g_wristHudWidthM;
 // Ordini alla squadra: 0 testa (gioco), 1 canna, 2 mano di supporto che punta.
-extern std::atomic<int> g_commandAimMode;
 extern std::atomic<float> g_supportFwd[3];  // direzione della mano di supporto nel mondo
 extern std::atomic<bool> g_supportFwdValid;
 inline vr::ETrackedControllerRole GunRole() {
@@ -477,7 +471,7 @@ extern std::atomic<float> g_synthLeftCm[3];
 extern std::atomic<bool> g_gestureGrenade, g_gestureReload, g_gestureCover;
 // Pugno in avanti con la sinistra all'altezza del petto = corpo a corpo (B).
 extern std::atomic<bool> g_gestureMelee;
-// Ricarica fisica (reload physical, predefinita): grip sinistro sul
+// Ricarica fisica (reload physical; dal 22/10 predefinita "simple"): grip sinistro sul
 // caricatore e tirarlo via, grip alla cintura per prenderne uno nuovo,
 // portarlo sotto l'arma per inserirlo (X). "simple" = tocca e tira giu'.
 extern std::atomic<bool> g_reloadPhysical;

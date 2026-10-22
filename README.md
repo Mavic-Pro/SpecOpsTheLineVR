@@ -40,10 +40,10 @@ virtual cinema screen.
 - **VR cover**: the world does not spin when Walker takes cover; lean out
   with your body to pop out and aim.
 - **Mounted guns and the helicopter minigun** aim with your controller.
-- **Squad orders** target the enemy you point your gun at (or look at); the
+- **Squad orders** target the enemy you point your gun or your left hand at, or look at; the
   target stays locked until you release the button.
 - **Executions**: press B next to a downed enemy and Walker turns to him.
-- **Gestures**: throw grenades (harder throw = faster grenade), punch or hit with the gun (melee), physical two-handed reload (pull the magazine, take a new one from your belt, push it in; `manualaction on` also asks you to rack the gun),
+- **Gestures**: throw grenades (harder throw = faster grenade), punch or hit with the gun (melee), reload by touching the magazine with the left hand and pulling down (`reload physical` in the settings: pull the magazine, take a new one from your belt, push it in; `manualaction on` also asks you to rack the gun),
   duck into cover, grab the next weapon from your shoulder.
 - **Haptics**: controller rumble on the gun hand, **ProTubeVR**
   (ForceTube / ProVolver) recoil and **bHaptics** vest and sleeves.
@@ -138,7 +138,7 @@ direction, so it feels the same on every controller.
 |---|---|
 | Overhand throw with the left hand | Grenade (flies where you throw) |
 | Straight punch with the left hand (chest height) | Melee |
-| Left grip on the magazine (under the gun) and pull it out, grip at your belt for a new one, push it into the gun | Reload (each step vibrates; `reload simple` = touch the magazine and pull down) |
+| Left hand on the magazine (under the gun), then pull down | Reload (`reload physical`: grip the magazine and pull it out, grip at your belt for a new one, push it into the gun; each step vibrates) |
 | Duck quickly next to cover | Take cover |
 | Lean out sideways (or stand up) while in cover | Pop out and aim |
 | Gun up to your eye | Aim down the sights |

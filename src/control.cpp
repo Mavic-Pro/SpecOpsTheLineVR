@@ -51,7 +51,6 @@ std::atomic<int> g_outputTest{0};
 std::atomic<float> g_outputScale{1.0f};
 std::atomic<bool> g_submitWithPose{false};  // 19/10: con la posa, bande nere e fisheye muovendo la testa
 std::atomic<bool> g_pairCheck{false};
-std::atomic<bool> g_commandFollowsGun{true};
 std::atomic<float> g_turnWithHeadDeg{45.0f};
 std::atomic<int32_t> g_ownYawUnits{0};
 std::atomic<bool> g_stickTurning{false};
@@ -88,7 +87,6 @@ std::atomic<float> g_gunCtrlPose[12];
 std::atomic<bool> g_gunCtrlPoseValid{false};
 std::atomic<bool> g_wristHud{true};
 std::atomic<float> g_wristHudWidthM{0.09f};
-std::atomic<int> g_commandAimMode{1};
 std::atomic<float> g_supportFwd[3];
 std::atomic<bool> g_supportFwdValid{false};
 std::atomic<bool> g_cinemaRecenter{false};
@@ -181,8 +179,8 @@ std::atomic<bool> g_stickPitch{false};
 std::atomic<void*> g_playerController{nullptr};
 std::atomic<float> g_vignette{0.0f};
 std::atomic<float> g_motionAmount{0.0f};
-std::atomic<float> g_hudScale{0.6f};
-std::atomic<float> g_hudDepth{150.0f};
+std::atomic<float> g_hudScale{0.4f};
+std::atomic<float> g_hudDepth{100.0f};
 std::atomic<bool> g_sixDof{true};
 std::atomic<float> g_posScale{50.0f};
 std::atomic<int> g_rollSign{1};
@@ -256,7 +254,7 @@ std::string ArmControlName(int i) {
 std::atomic<float> g_synthLeftCm[3];
 std::atomic<bool> g_gestureGrenade{true}, g_gestureReload{true}, g_gestureCover{true};
 std::atomic<bool> g_gestureMelee{true};
-std::atomic<bool> g_reloadPhysical{true};
+std::atomic<bool> g_reloadPhysical{false};
 std::atomic<bool> g_manualAction{false};
 std::atomic<float> g_magwellCm[2] = {4.0f, 10.0f};
 std::atomic<float> g_magwellClassCm[2] = {0.0f, 0.0f};
@@ -608,7 +606,7 @@ void ExecuteNormalized(const std::string& line) {
         g_aimFollowsBody = (v != "view");
         g_aimHand = (v == "hand");
     } else if (cmd == "hud") {
-        float scale = 0.6f, depth = 150.0f;
+        float scale = 0.4f, depth = 100.0f;
         in >> scale >> depth;
         g_hudScale = scale;
         g_hudDepth = depth;
@@ -1082,11 +1080,10 @@ void ExecuteNormalized(const std::string& line) {
         in >> v;
         g_turnWithHeadDeg = v < 0.0f ? 0.0f : (v > 170.0f ? 170.0f : v);
     } else if (cmd == "commandaim") {
-        // commandaim gun | head | support (la mano di supporto punta il bersaglio)
+        // Ritirato (configversion 8): gli ordini alla squadra provano sempre
+        // canna, mano di supporto e sguardo. Accettato per gli ini vecchi.
         std::string v;
         in >> v;
-        g_commandFollowsGun = (v != "head");
-        g_commandAimMode = v == "head" ? 0 : (v == "support" ? 2 : 1);
     } else if (cmd == "handpredict") {
         // handpredict <ms> | auto (= stessa predizione della testa)
         std::string t;
@@ -1236,11 +1233,14 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // 7 (22/10): options that must simply work (two-handed grip, left grip, cover
 // snap, ...) and the experiments (menu169, cinema3d, ham) are no longer in
 // the ini: they stay as hidden commands, out of the in-headset menu.
-constexpr int kConfigVersion = 7;
+// 8 (22/10): "reload physical" -> simple (manual reload off by default);
+// "commandaim" retired: squad orders always try gun, support hand and head;
+// "hud 0.5 100" -> 0.4 (tester 22/10: HUD at the edge of the view, wanted 80%).
+constexpr int kConfigVersion = 8;
 const char* const kRetiredKeys[] = {"twohand", "leftgrip", "menu169", "cinema3d", "ham", "mode", "gun", "arms", "muzzleaim",
                                     "aimassist", "gamecrosshair", "6dof", "bodyfollow", "posscale", "near", "viewport",
                                     "offcenter", "eyestate", "submitpose", "handpredict", "coversnap", "cinemaalign",
-                                    "keepfocus", "execassist", "bodyback", "eyesmooth", "bodyfacing", "fp"};
+                                    "keepfocus", "execassist", "bodyback", "eyesmooth", "bodyfacing", "fp", "commandaim"};
 
 void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
     // Ogni cambio vale solo per gli ini piu' vecchi della sua versione: chi era
@@ -1248,10 +1248,11 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
     static const vr::pure::ConfigChange kChanges[] = {
         {2, "submitpose on", "submitpose off"}, {2, "predict off", "predict auto"}, {3, "bodyback 6 10", "bodyback -10 26"},
         {4, "bodyback -10 10", "bodyback -10 26"}, {5, "hud 0.6 150", "hud 0.5 100"},
-        {6, "marker on", "marker off"}};  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
+        {6, "marker on", "marker off"},  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
+        {8, "reload physical", "reload simple"}, {8, "hud 0.5 100", "hud 0.4 100"}};  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
     std::string done;
     int removed = 0;
-    if (vr::pure::ConfigVersionOf(lines) < 7)
+    if (vr::pure::ConfigVersionOf(lines) < 8)
         removed = vr::pure::RemoveRetiredKeys(lines, kRetiredKeys, sizeof(kRetiredKeys) / sizeof(kRetiredKeys[0]));
     if (!vr::pure::MigrateConfigLines(lines, kConfigVersion, kChanges, sizeof(kChanges) / sizeof(kChanges[0]), &done))
         return;
