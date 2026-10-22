@@ -506,6 +506,34 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
   hand is at the magwell or the grip belongs to the reload, the grip is not
   sent to the game as LB (grenade).
 
+## Tester fixes (0.9.11)
+
+From the first tester reports on 0.9.9/0.9.10 (Quest 3, Virtual Desktop, 120 Hz):
+
+- Auto resolution keeps the per-eye aspect when SteamVR asks for more than
+  4096 (the back buffer became 4096x4096 square, window clipped to 4067).
+- Wall pull also traces 10 and 22 units under the eye: behind a low crate
+  (chapter 1, cp01) the view sat over the lid.
+- Full-screen canvas effects (blood, flashes) use the HUD's per-eye mapping at
+  scale 1 and infinite distance: before, identical pixels in both eyes had a
+  large disparity with the off-centre projection ("cross-eyed", blood
+  covering the aim). Headset check pending.
+- Defaults: `reload simple`, `hud 0.4 100` (configversion 8); `commandaim`
+  retired: squad orders follow the head only.
+- Squad orders: the class default YCheapShooter is skipped (it sat at the map
+  origin and was always the "closest cheap shooter"); 10 degree tolerance on
+  cheap shooters; the game's control restrictions (PlayerController+0xC30,
+  YS_ControlRestrictions, bit set = forbidden; m_squadControl 0x8000,
+  m_squadCommandAttack 0x200000) give a toast when orders are forbidden and
+  leave the target to the game when only attack is forbidden.
+- Window activated without keyboard focus: focus taken (WM_ACTIVATE minimized
+  flag dropped + periodic check).
+- Body moves away from the gaze from 35 degrees of head turn.
+- Toast overlay recreated after SetOverlayRaw error 23.
+- Open: the order before the banner sniper (restrictions now logged on each
+  press) and the first downed enemy after the container in chapter 1 (B logs
+  the pawns within 4 m when no downed enemy is recognised).
+
 ## Review fixes (0.9.10)
 
 Work list from the multi-agent review in `docs/REVIEW_FULLVR.md` (item ids
