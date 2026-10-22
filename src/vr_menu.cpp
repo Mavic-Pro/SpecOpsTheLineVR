@@ -48,7 +48,7 @@ std::vector<Item> BasicItems() {
         {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.4 100", "0.5 100", "0.6 100"}},
         {"fpbody", "Walker's body", "Show Walker's body and arms (off = floating hands and gun).", Kind::OnOff},
         {"reload", "Reload", "physical = grip the magazine, belt, push it in; simple = press X.", Kind::Choice, {"physical", "simple"}},
-        {"twohand", "Two-handed aiming", "Left hand on the barrel steadies the gun (12 cm sideways, 8 cm vertical).", Kind::OnOff},
+        {"twohand", "Two-handed aiming", "Support hand on the barrel (rifles) or around the gun hand (pistols) steadies the gun.", Kind::OnOff},
         {"marker", "Green aim marker", "A marker where the barrel points. Off: use the weapon's own sights.", Kind::OnOff},
         {"laser", "Laser beam", "A visible beam from the barrel to the point of impact.", Kind::OnOff},
         {"spread", "Bullet spread", "on = the game's spread scaled by stance; off = laser-straight shots.", Kind::OnOff},

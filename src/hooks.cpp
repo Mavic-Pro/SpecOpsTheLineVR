@@ -2387,6 +2387,7 @@ std::atomic<float> g_handOffset[3];
 std::atomic<int32_t> g_handRoll{0};
 std::atomic<bool> g_handValid{false};
 std::atomic<bool> g_twoHandActive{false};  // per DUMPCAM
+std::atomic<bool> g_weaponShort{false};     // pistole e Uzi: la sinistra avvolge la destra (CurrentWeaponInfo)
 std::atomic<bool> g_leftOnGun{false};      // mano sinistra agganciata all'arma (UpdateArms)
 std::atomic<bool> g_leftDriven{false};     // mano sinistra guidata dalla mod (KeepGoodBones)
 // Controller sinistro: posizione come g_handOffset, direzione relativa come
@@ -2476,12 +2477,18 @@ void ApplyTwoHandAim(const float* right, const float* left) {
     // mai), 1,75x finche' la presa e' attiva.
     float engage = vr::control::g_twoHandCm * 0.01f;
     float limit = wasActive ? engage * 1.75f : engage;
-    if (along < 0.12f || along > 0.70f || off > limit) {
+    // Lungo la canna: con un fucile la sinistra sta sull'astina, 12-70 cm
+    // davanti alla destra. Con una pistola o un Uzi avvolge la mano destra: i
+    // controller sono affiancati (0-6 cm) e con la soglia dei fucili la presa
+    // non partiva mai, "anche tenendo i controller molto vicini" (22/10).
+    bool shortGun = g_weaponShort.load();
+    float alongMin = shortGun ? -0.06f : 0.12f, alongMax = shortGun ? 0.30f : 0.70f;
+    if (along < alongMin || along > alongMax || off > limit) {
         // Mano quasi sulla linea ma fuori tolleranza: lo si dice nel log ogni
         // 2 s, cosi' dai log dei tester si vede quanto manca.
         static double lastNear = 0.0;
         double nowN = ProfMs() * 0.001;
-        if (!wasActive && along >= 0.12f && along <= 0.70f && off <= engage * 3.0f && nowN - lastNear > 2.0) {
+        if (!wasActive && along >= alongMin && along <= alongMax && off <= engage * 3.0f && nowN - lastNear > 2.0) {
             lastNear = nowN;
             char b[128];
             std::snprintf(b, sizeof(b), "AIM: left hand %.0f cm off the gun line, two-handed grip needs %.0f (twohand on <cm>).",
@@ -2502,7 +2509,10 @@ void ApplyTwoHandAim(const float* right, const float* left) {
     if (!wasActive) {
         offYaw = std::remainder(yawR - lineYaw, 6.28318530718f);
         offPitch = pitchR - linePitch;
-        vr::log::Line("AIM: two-handed grip.");
+        char b[96];
+        std::snprintf(b, sizeof(b), "AIM: two-handed grip (%s, left hand %.0f cm along the barrel, %.0f cm off the line).",
+                      shortGun ? "short weapon" : "rifle", along * 100.0f, off * 100.0f);
+        vr::log::Line(b);
     }
     wasActive = true;
     // Senza calcio la linea tra le mani trema (tremore della sinistra
@@ -4988,6 +4998,7 @@ struct WeaponInfo {
     std::string cls;
     bool stationary = false;
     bool launcher = false;  // YWeapon_Launcher: RPG, Milkor (proiettili veri)
+    bool pistol = false;    // pistole e Uzi: una mano, caricatore nell'impugnatura, presa a due mani avvolgente
 };
 WeaponInfo g_weaponInfo;
 
@@ -5005,10 +5016,12 @@ const WeaponInfo& CurrentWeaponInfo(void* weapon) {
         // pistole e Uzi nell'impugnatura sotto la mano, P90 sopra la canna,
         // fucili a tamburo/pompa piu' avanti.
         const std::string& c = g_weaponInfo.cls;
+        g_weaponInfo.pistol = c.find("DesertEagle") != std::string::npos || c.find("M9A1") != std::string::npos ||
+                              c.find("Python") != std::string::npos || c.find("MicroUzi") != std::string::npos ||
+                              c.find("Pistol") != std::string::npos;
+        g_weaponShort = g_weaponInfo.pistol;
         float mf = 0.0f, md = 0.0f;
-        if (c.find("DesertEagle") != std::string::npos || c.find("M9A1") != std::string::npos ||
-            c.find("Python") != std::string::npos || c.find("MicroUzi") != std::string::npos ||
-            c.find("Pistol") != std::string::npos) {
+        if (g_weaponInfo.pistol) {
             mf = -4.0f;
             md = 2.0f;
         } else if (c.find("P90") != std::string::npos) {
@@ -8422,10 +8435,7 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
                     float k = scale;
                     if (vr::control::g_adsActive) k *= vr::control::g_spreadAds;
                     else if (g_twoHandActive) k *= vr::control::g_spreadTwoHand;
-                    const std::string& cls = CurrentWeaponInfo(self).cls;
-                    bool pistol = cls.find("DesertEagle") != std::string::npos || cls.find("M9A1") != std::string::npos ||
-                                  cls.find("Python") != std::string::npos || cls.find("MicroUzi") != std::string::npos ||
-                                  cls.find("Pistol") != std::string::npos;
+                    bool pistol = CurrentWeaponInfo(self).pistol;
                     if (!g_twoHandActive && !vr::control::g_adsActive && !pistol) k *= vr::control::g_spreadOneHand;
                     float b = (act[0] * r1[0] + act[1] * r1[1] + act[2] * r1[2]) * k;
                     float c = (act[0] * u1[0] + act[1] * u1[1] + act[2] * u1[2]) * k;

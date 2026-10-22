@@ -853,6 +853,11 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   engine's `CalcComponentToFrameMatrix` (0x00583610) and bone quaternions
   do not survive a reflection (IK controls simply stop acting; Ghidra, vtable
   slot 84 = `USkelControlLimb::CalculateNewBoneTransforms` 0x00CE6EA0).
+- **Two-handed grip with pistols (22/10):** the grip needed the support
+  hand 12-70 cm ahead of the gun hand along the barrel, which fits a rifle's
+  handguard but never a pistol (the support hand wraps the gun hand, the
+  controllers sit side by side). For pistols and the Uzi (`WeaponInfo::pistol`,
+  `g_weaponShort`) the window is -6..30 cm.
 - **Automatic recenters (21/10):** Virtual Desktop sends
   `ChaperoneUniverseHasChanged` / zero-pose-reset events in bursts; they are
   now debounced to one per 10 s and silent (no toast, no blink;
