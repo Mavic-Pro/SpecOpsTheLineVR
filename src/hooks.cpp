@@ -8,6 +8,7 @@
 #include "vr_menu.h"
 #include "vr_session.h"
 #include "script_call.h"
+#include "pure_utils.h"
 #include "display_spoof.h"
 #include "haptics_ext.h"
 #include "audio_diag.h"
@@ -3184,7 +3185,8 @@ void ApplyVrPreset(char* cam) {
 // (ResX/ResY a mano): su visori ad alta risoluzione (Dream Air, Pimax) troppo
 // piccola o, se impostata grande, troppo pesante. Controllo ogni 5 s; il
 // cambio (setres, con reset del device) solo se la differenza supera il 4%.
-// Massimo 4096 (desktop finto di display_spoof).
+// Lato piu' lungo al massimo 4032, proporzioni mantenute (desktop finto di
+// display_spoof a 4096, bordi della finestra compresi).
 // Dopo un setres sullo schermo virtuale il gioco puo' restare disposto in un
 // riquadro al 65% (menu tagliato, 21/10: setres 0,3 s dopo l'inizio della
 // Scene); spegnere e riaccendere lo schermo virtuale lo sistemava. Qui per
@@ -3214,8 +3216,8 @@ void UpdateAutoResolution(char* cam) {
         vr::VRSystem()->GetRecommendedRenderTargetSize(&w, &h);
     }
     if (w < 640 || h < 640) return;
-    w = (std::min)(w, 4096u) & ~7u;
-    h = (std::min)(h, 4096u) & ~7u;
+    // Desktop finto a 4096: la finestra con i bordi deve starci (64 px di margine).
+    vr::pure::FitRecommendedSize(w, h, 4032u);
     // Menu del gioco e filmati (schermo virtuale): back buffer 16:9. I menu UIScene si dispongono per l'altezza del
     // viewport: con il back buffer alto quanto un occhio (2112x2304) il menu
     // era largo 4096 px e tagliato a destra, e la fascia 16:9 lo tagliava

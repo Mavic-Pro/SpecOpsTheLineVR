@@ -135,6 +135,21 @@ static void TestMigrate() {
     CHECK(lines[1] == "hud 0.6 150");
 }
 
+static void TestFitRecommendedSize() {
+    uint32_t w = 2112, h = 2304;
+    FitRecommendedSize(w, h, 4032);
+    CHECK(w == 2112 && h == 2304);  // Quest 3 al 100%: invariata
+    w = 4400; h = 4800;  // cursore di SteamVR alto: proporzioni mantenute
+    FitRecommendedSize(w, h, 4032);
+    CHECK(h == 4032 && w == 3696);
+    w = 5000; h = 3000;
+    FitRecommendedSize(w, h, 4032);
+    CHECK(w == 4032 && h == 2416);
+    w = 2115; h = 2301;
+    FitRecommendedSize(w, h, 4032);
+    CHECK(w == 2112 && h == 2296);
+}
+
 int main() {
     TestParseVersion();
     TestJson();
@@ -143,6 +158,7 @@ int main() {
     TestDll32();
     TestNormalize();
     TestMigrate();
+    TestFitRecommendedSize();
     std::printf("unit tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed ? 1 : 0;
 }

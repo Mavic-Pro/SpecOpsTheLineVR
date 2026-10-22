@@ -220,4 +220,20 @@ inline bool MigrateConfigLines(std::vector<std::string>& lines, int targetVersio
     return true;
 }
 
+// Dimensione consigliata da SteamVR per un occhio -> back buffer: ridotta in
+// proporzione finche' sta in maxSide (non lato per lato), multipla di 8. Prima
+// ogni lato era limitato da solo a 4096: con il cursore della risoluzione di
+// SteamVR alto (Quest 3 a 120 Hz, tester 22/10) diventava 4096x4096 invece di
+// ~0,92:1, e la finestra con i bordi non ci stava (4067x4067).
+inline void FitRecommendedSize(uint32_t& w, uint32_t& h, uint32_t maxSide) {
+    if (!w || !h) return;
+    uint32_t big = w > h ? w : h;
+    if (big > maxSide) {
+        w = static_cast<uint32_t>(static_cast<uint64_t>(w) * maxSide / big);
+        h = static_cast<uint32_t>(static_cast<uint64_t>(h) * maxSide / big);
+    }
+    w &= ~7u;
+    h &= ~7u;
+}
+
 }  // namespace vr::pure
