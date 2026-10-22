@@ -5,6 +5,7 @@
 #include "vr_toast.h"
 #include "vr_menu.h"
 #include "vr_wrist.h"
+#include "audio_diag.h"
 #include "hooks.h"
 
 #include <windows.h>
@@ -1082,6 +1083,7 @@ void WorkerLoop() {
         }
         vr::toast::Tick();  // avvisi nel visore (R-U1)
         vr::wrist::Tick();  // HUD al polso (R-U3)
+        vr::audio::Tick();  // predefinito audio cambiato -> audio del gioco spostato li'
         CinemaLaserTick(cinema);  // laser sui menu del gioco (R-U5)
         vr::menu::Tick(cinema);  // menu del mod: eventi del puntatore a ogni frame (dal thread della sessione erano ogni 0,5 s)
         if (!tex[0] || !tex[1]) {

@@ -853,6 +853,25 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   engine's `CalcComponentToFrameMatrix` (0x00583610) and bone quaternions
   do not survive a reflection (IK controls simply stop acting; Ghidra, vtable
   slot 84 = `USkelControlLimb::CalculateNewBoneTransforms` 0x00CE6EA0).
+- **Audio on the PC speakers (22/10):** FMOD opens the Windows default
+  playback device at start and never follows it; Virtual Desktop makes its
+  own device the default only when the stream starts, so a game launched
+  before that (from the desktop, for tests) played on the PC ("Realtek
+  Digital Output" in the log at start, no audio in the headset). The mod
+  polls the default every 2 s and, when it changes, moves the game process
+  to the new device with the per-app routing of Windows
+  (`Windows.Media.Internal.AudioPolicyConfig`, the API behind Settings >
+  Sound > app preferences, used by EarTrumpet; IIDs for 1803+ and 21H2+);
+  the preference is removed at exit or when the default goes back.
+  `audioroute test` tries the API on the current default.
+- **Two-handed aim (22/10):** with a pistol the hands are 3-6 cm apart, the
+  controller-to-controller line is not a barrel (1 cm of shake = 15
+  degrees): the grip only poses the support hand and lowers the spread, the
+  aim stays with the gun hand. With a rifle the engage offset (gun direction
+  minus hand line, remembered so the gun does not jump) decays to zero in
+  0.7 s: the grip engages exactly on the 12 cm boundary, so the remembered
+  offset was 17-40 degrees and the gun pointed that far from the hand line
+  once the hand settled on the handguard ("aim shifted").
 - **Executions (22/10):** `YPlayerController.CheckExecute` (script) compares
   the camera pitch with `m_executionMaxCamPitchAngle` (+0xB90, -1000 =
   -5.5 degrees) and below it calls `StartMeleeAttack`: in VR the downed enemy
@@ -866,7 +885,13 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   its pick: two different ones never completed ("not taken by the game"),
   which only agreed along the barrel. The function is hooked and, while the
   mod has a pick, calls with another markable are ignored. The "not taken"
-  log line now prints the validation fields.
+  log line now prints the validation fields. Those fields also showed that
+  the mod's own call through `ProcessEvent` never ran (candidate +0xEA0
+  stayed "none": the function is an opcode native, which this game's
+  `ProcessEvent` ignores, so the "selected" results along the barrel were
+  the game validating its own identical candidate). The mod now calls the
+  implementation directly through the hook's original pointer; `uprops
+  func:Class.Function` prints a function's `iNative` to spot such cases.
 - **Pistol support grip (22/10):** no two-handed pistol animation to measure
   (IK_Hand_L 30+ units away), so the support hand takes a synthetic pose next
   to the gun hand: `cuprel` units in the gun-hand bone frame (X forward, Y

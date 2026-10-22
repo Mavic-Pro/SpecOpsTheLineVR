@@ -1,4 +1,5 @@
 #include "control.h"
+#include "audio_diag.h"
 #include "default_ini.h"
 #include "logger.h"
 #include "pure_utils.h"
@@ -61,6 +62,15 @@ std::atomic<bool> g_turretAimHand{true};
 std::atomic<bool> g_adsEnabled{true};
 std::atomic<bool> g_adsActive{false};
 std::atomic<bool> g_twoHandEngaged{false};
+std::atomic<int> g_squadValidateLog{0};
+std::mutex g_squadPickMutex;
+std::string g_squadPickRequest;
+std::string TakeSquadPickRequest() {
+    std::lock_guard<std::mutex> lock(g_squadPickMutex);
+    std::string r;
+    r.swap(g_squadPickRequest);
+    return r;
+}
 std::atomic<float> g_cupRel[3] = {0.5f, 2.5f, -4.5f};  // Z negativo = a sinistra dell'arma, Y sotto: scelta sugli screenshot (22/10)
 std::atomic<bool> g_leftOnGun{false};
 std::atomic<bool> g_headSampleOnDraw{true};
@@ -903,6 +913,16 @@ void ExecuteNormalized(const std::string& line) {
         std::string ev;
         in >> ev;
         if (!ev.empty()) vr::script::QueueCall("pc ServerCauseEvent " + ev);
+    } else if (cmd == "squadpick") {
+        // squadpick <parte della classe>: chiama la convalida del bersaglio su un Pawn vivo di quella classe (diagnostica)
+        std::string v;
+        in >> v;
+        std::lock_guard<std::mutex> lock(g_squadPickMutex);
+        g_squadPickRequest = v;
+        g_squadValidateLog = 120;
+    } else if (cmd == "audioroute") {
+        // audioroute test: prova dell'instradamento audio per app (diagnostica)
+        vr::audio::RouteTest();
     } else if (cmd == "cuprel") {
         // cuprel <x> <y> <z>: presa avvolgente delle pistole, taratura (unita' nel riferimento della mano destra)
         float x = 0, y = 0, z = 0;

@@ -65,9 +65,9 @@ void* FindFunction(const char* outerClass, const char* name) {
         uint32_t o = 0;
         if (!SafeRead(reinterpret_cast<void*>(data + 4 * i), &o, 4) || !o) continue;
         void* obj = reinterpret_cast<void*>(o);
-        if (ObjectName(obj) != name) continue;
+        if (_stricmp(ObjectName(obj).c_str(), name) != 0) continue;  // i comandi arrivano in minuscolo
         if (ClassName(obj) != "Function") continue;
-        if (ObjectName(reinterpret_cast<void*>(Field(obj, kOffOuter))) != outerClass) continue;
+        if (_stricmp(ObjectName(reinterpret_cast<void*>(Field(obj, kOffOuter))).c_str(), outerClass) != 0) continue;
         return obj;
     }
     return nullptr;
@@ -492,7 +492,15 @@ void RunProps(void* pc, void* pawn, const std::string& line) {
     std::istringstream in(line);
     std::string tok, part;
     in >> tok >> part;
-    void* obj = ResolveObject(pc, pawn, tok);
+    // "func:Classe.Funzione": parametri della funzione (offset nel buffer di ProcessEvent).
+    bool funcMode = tok.rfind("func:", 0) == 0;
+    void* obj = nullptr;
+    if (funcMode) {
+        size_t dot = tok.find('.', 5);
+        if (dot != std::string::npos) obj = FindFunction(tok.substr(5, dot - 5).c_str(), tok.substr(dot + 1).c_str());
+    } else {
+        obj = ResolveObject(pc, pawn, tok);
+    }
     if (!obj) {
         vr::log::Line("UPROPS: object \"" + tok + "\" not found.");
         return;
@@ -500,8 +508,16 @@ void RunProps(void* pc, void* pawn, const std::string& line) {
     std::string partLow = part;
     for (char& ch : partLow) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
     int shown = 0;
-    void* c = reinterpret_cast<void*>(Field(obj, kOffClass));
-    vr::log::Line("UPROPS: " + ClassName(obj) + " " + ObjectName(obj) + " (filter \"" + part + "\")");
+    void* c = funcMode ? obj : reinterpret_cast<void*>(Field(obj, kOffClass));
+    if (funcMode) {
+        uint32_t fflags = Field(obj, 0x94), inative = Field(obj, kOffFuncINative) & 0xFFFF;
+        char hb[160];
+        snprintf(hb, sizeof(hb), "UPROPS: Function %s (flags 0x%X, iNative %u%s)", ObjectName(obj).c_str(), fflags, inative,
+                 inative ? ": ProcessEvent ignores it, call the native directly" : "");
+        vr::log::Line(hb);
+    } else {
+        vr::log::Line("UPROPS: " + ClassName(obj) + " " + ObjectName(obj) + " (filter \"" + part + "\")");
+    }
     for (int depth = 0; c && depth < 32 && shown < 300; ++depth) {
         std::string cls = ObjectName(c);
         for (void* f = reinterpret_cast<void*>(Field(c, kOffChildren)); f && shown < 300; f = reinterpret_cast<void*>(Field(f, kOffNext))) {
@@ -516,6 +532,15 @@ void RunProps(void* pc, void* pawn, const std::string& line) {
             uint32_t off = Field(f, kOffPropOffset);
             char* p = static_cast<char*>(obj) + off;
             char val[200] = "?";
+            if (funcMode) {
+                uint32_t pflags = Field(f, kOffPropFlags);
+                snprintf(val, sizeof(val), "parm flags 0x%X%s", pflags, (pflags & kCpfReturn) ? " (return)" : "");
+                char b[300];
+                snprintf(b, sizeof(b), "UPROPS %s.%s (%s) +0x%X = %s", cls.c_str(), name.c_str(), type.c_str(), off, val);
+                vr::log::Line(b);
+                ++shown;
+                continue;
+            }
             uint32_t u = 0;
             float fl = 0.0f;
             if (type == "IntProperty" && SafeRead(p, &u, 4)) snprintf(val, sizeof(val), "%d", static_cast<int32_t>(u));
@@ -538,7 +563,7 @@ void RunProps(void* pc, void* pawn, const std::string& line) {
             vr::log::Line(b);
             ++shown;
         }
-        c = reinterpret_cast<void*>(Field(c, kOffSuper));
+        c = funcMode ? nullptr : reinterpret_cast<void*>(Field(c, kOffSuper));
     }
     vr::log::Line("UPROPS: " + std::to_string(shown) + " properties shown.");
 }

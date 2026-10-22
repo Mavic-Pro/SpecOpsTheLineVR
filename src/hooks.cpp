@@ -2500,16 +2500,36 @@ void ApplyTwoHandAim(const float* right, const float* left) {
         applyBlend(false);
         return;
     }
+    if (shortGun) {
+        // Pistola: le mani sono affiancate (3-6 cm): la linea tra i controller
+        // non e' una canna (1 cm di tremore = 15 gradi). La presa conta per
+        // la posa della sinistra e per la dispersione; la mira resta quella
+        // della mano dell'arma (22/10: "mira spostata con la presa a due mani").
+        if (!wasActive) vr::log::Line("AIM: two-handed grip on a short weapon: aim stays with the gun hand.");
+        wasActive = true;
+        applyBlend(false);
+        g_twoHandActive = true;
+        vr::control::g_twoHandEngaged = true;
+        return;
+    }
     float horiz = std::sqrt(d[0] * d[0] + d[1] * d[1]);
     float lineYaw = std::atan2(d[1], d[0]), linePitch = std::atan2(d[2], horiz);
     // All'aggancio si ricorda lo scarto tra la direzione della mano destra
     // (con aimpitch del calcio) e la linea tra le mani, e lo si mantiene:
     // l'arma non salta verso la sinistra (fino a ~15 gradi con la tolleranza
     // di 8 cm) e la calibrazione del calcio resta valida (audit 19/10).
+    // Lo scarto si azzera in ~0,7 s: l'aggancio avviene sempre sul bordo
+    // della tolleranza (sinistra a 12 cm dalla canna, log 22/10), quindi lo
+    // scarto misurato li' valeva 17-40 gradi e, tenendolo, l'arma puntava
+    // lontano dalla linea delle mani una volta posata la sinistra sull'astina
+    // ("mira spostata"). Con lo scarto che decade, la mira converge sulla
+    // linea tra i controller (il calcio virtuale) senza salto all'aggancio.
     static float offYaw = 0.0f, offPitch = 0.0f;
+    static double offSince = 0.0;
     if (!wasActive) {
         offYaw = std::remainder(yawR - lineYaw, 6.28318530718f);
         offPitch = pitchR - linePitch;
+        offSince = ProfMs() * 0.001;
         char b[96];
         std::snprintf(b, sizeof(b), "AIM: two-handed grip (%s, left hand %.0f cm along the barrel, %.0f cm off the line).",
                       shortGun ? "short weapon" : "rifle", along * 100.0f, off * 100.0f);
@@ -2526,7 +2546,8 @@ void ApplyTwoHandAim(const float* right, const float* left) {
         double nowSm = ProfMs() * 0.001;
         float dtSm = lastSm > 0.0 ? static_cast<float>(nowSm - lastSm) : 1.0f;
         lastSm = nowSm;
-        float ty = lineYaw + offYaw, tp = linePitch + offPitch;
+        float decay = std::exp(-static_cast<float>(nowSm - offSince) / 0.7f);
+        float ty = lineYaw + offYaw * decay, tp = linePitch + offPitch * decay;
         if (!smValid || dtSm > 0.5f) {
             smYaw = ty;
             smPitch = tp;
@@ -7864,6 +7885,25 @@ SelectMarkable_t g_SelectMarkable_Original = nullptr;
 std::atomic<void*> g_squadModPick{nullptr};
 void __fastcall Hooked_SelectMarkable(void* pc, void* /*edx*/, void* markable, float screenDist) {
     void* pick = g_squadModPick.load();
+    if (vr::control::g_squadValidateLog > 0) {
+        // Diagnostica ("squadpick"): ogni chiamata, con il candidato prima e dopo.
+        vr::control::g_squadValidateLog.fetch_sub(1);
+        uint32_t before = 0, after = 0, sel = 0;
+        TrySafeReadUint32(static_cast<char*>(pc) + 0xEA0, &before);
+        bool dropped = pick && markable != pick;
+        if (!dropped) g_SelectMarkable_Original(pc, markable, screenDist);
+        TrySafeReadUint32(static_cast<char*>(pc) + 0xEA0, &after);
+        TrySafeReadUint32(static_cast<char*>(pc) + 0xE98, &sel);
+        char b[300];
+        snprintf(b, sizeof(b), "SQUAD validate: %s dist=%.1f (%s) candidate before=%s after=%s selected=%s",
+                 markable ? vr::script::ClassName(markable).c_str() : "none", screenDist,
+                 dropped ? "dropped" : (markable == pick ? "mod" : "game"),
+                 before ? vr::script::ClassName(reinterpret_cast<void*>(before)).c_str() : "none",
+                 after ? vr::script::ClassName(reinterpret_cast<void*>(after)).c_str() : "none",
+                 sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
+        vr::log::Line(b);
+        return;
+    }
     if (pick && markable != pick) {
         static void* loggedFor = nullptr;
         if (loggedFor != pick) {
@@ -8107,6 +8147,62 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         }
         vr::log::Line(b);
     }
+    static void* squadPickTarget = nullptr;
+    static int squadPickFrames = 0;
+    // Diagnostica "squadpick <classe>": convalida chiamata dal mod su un Pawn
+    // vivo di quella classe, senza tasto; le righe "SQUAD validate" dicono se
+    // il candidato viene accettato.
+    {
+        std::string req = vr::control::TakeSquadPickRequest();
+        if (!req.empty() && pawn && HasCameraSignature(cam)) {
+            uint32_t wi = 0, pp = 0;
+            void* found = nullptr;
+            if (TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &wi) && wi &&
+                TrySafeReadUint32(reinterpret_cast<char*>(wi) + kOffWorldInfoPawnList, &pp)) {
+                for (int guard = 0; pp && guard < 512 && !found; ++guard) {
+                    char* other = reinterpret_cast<char*>(pp);
+                    int32_t hp = 0;
+                    std::string cn = vr::script::ClassName(other);
+                    for (char& ch : cn) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+                    if (other != pawn && TrySafeReadUint32(other + kOffPawnHealth, reinterpret_cast<uint32_t*>(&hp)) && hp > 0 &&
+                        cn.find(req) != std::string::npos)  // i comandi arrivano in minuscolo
+                        found = other;
+                    TrySafeReadUint32(other + kOffPawnNextPawn, &pp);
+                }
+            }
+            if (found && g_SelectMarkable_Original) {
+                vr::log::Line("SQUAD: squadpick -> " + vr::script::ClassName(found) + " (held for 60 frames)");
+                squadPickTarget = found;
+                squadPickFrames = 60;
+                vr::control::g_squadValidateLog = 6;
+            } else {
+                vr::log::Line("SQUAD: squadpick: no live pawn matching \"" + req + "\".");
+            }
+        }
+        // Emulazione del tasto tenuto: il nostro candidato a ogni frame, quelli
+        // del gioco scartati; alla fine lo stato della convalida.
+        if (squadPickFrames > 0 && HasCameraSignature(cam)) {
+            char* pc = cam - 0x77C;
+            g_squadModPick = squadPickTarget;
+            Hooked_SelectMarkable(pc, nullptr, squadPickTarget, 0.0f);
+            if (--squadPickFrames == 0) {
+                uint32_t sel = 0, cand = 0, st = 0;
+                uint8_t ci = 0, cf = 0;
+                TrySafeReadUint32(pc + 0xE98, &sel);
+                TrySafeReadUint32(pc + 0xEA0, &cand);
+                TrySafeReadUint32(pc + 0x5E8, &st);
+                SafeCopy(&ci, pc + 0x74C, 1);
+                SafeCopy(&cf, pc + 0x74D, 1);
+                char b[260];
+                snprintf(b, sizeof(b), "SQUAD: squadpick result after 60 frames: selected=%s candidate=%s visible=%d checkIndex=%u failCount=%u",
+                         sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none",
+                         cand ? vr::script::ClassName(reinterpret_cast<void*>(cand)).c_str() : "none", (st >> 31) & 1, ci, cf);
+                vr::log::Line(b);
+                g_squadModPick = nullptr;
+                squadPickTarget = nullptr;
+            }
+        }
+    }
     // m_squadCommandModeOn non si accende tenendo il tasto (la selezione del
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
     if (vr::control::g_commandAimMode == 0 || !pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
@@ -8308,7 +8404,12 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
                       (reinterpret_cast<void*>(sel) == pending ? " (selected)" : " (not taken by the game)") + why);
         pending = nullptr;
     }
-    vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
+    // Chiamata diretta all'implementazione (vtable +0x550): via ProcessEvent
+    // la funzione nativa non veniva mai eseguita (22/10: candidato +0xEA0
+    // sempre "none" dopo la nostra chiamata; i "selected" lungo la canna
+    // erano la convalida del gioco sul suo stesso candidato).
+    if (g_SelectMarkable_Original) g_SelectMarkable_Original(cam - 0x77C, best, 0.0f);
+    else vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
     everPicked = best;
     {
         float tl[3];

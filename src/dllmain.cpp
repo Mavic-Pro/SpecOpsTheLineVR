@@ -1,3 +1,4 @@
+#include "audio_diag.h"
 #include <windows.h>
 #include <d3d9.h>
 
@@ -69,6 +70,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         vr::haptics::Start();
     } else if (reason == DLL_PROCESS_DETACH) {
         vr::updater::OnCleanExit();  // uscita normale: non conta come avvio fallito
+        vr::audio::Shutdown();       // via la preferenza audio per app
     }
     return TRUE;
 }
