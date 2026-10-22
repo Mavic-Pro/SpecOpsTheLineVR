@@ -8319,6 +8319,62 @@ std::vector<void*> CheapShooters() {
     return cache;
 }
 
+// Segnaposto tattici del livello (YTacticalMarker): bersagli degli ordini che
+// non sono nemici, es. lo stordimento del tutorial del cap. 1 (cp01-cp02:
+// m_contextCommand YCTX_StunEnemies = 18 mentre l'attacco e' vietato).
+// Bytecode del 22/10: GetContextCommandFor di un nemico da' 0 con l'attacco
+// vietato, il comando viene solo dal marker. Stessa scansione di CheapShooters.
+constexpr uintptr_t kOffMarkerFlags = 0x210;    // m_enabled 0x1
+constexpr uintptr_t kOffMarkerCommand = 0x21C;  // m_contextCommand (YE_ContextCommand)
+std::vector<void*> TacticalMarkers() {
+    static uint32_t cls = 0;
+    static std::vector<void*> cache;
+    static ULONGLONG nextScan = 0;
+    if (GetTickCount64() < nextScan) return cache;
+    nextScan = GetTickCount64() + 2000;
+    cache.clear();
+    uint32_t data = 0, num = 0;
+    if (!TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data) ||
+        !TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num) || !data || num > 2000000)
+        return cache;
+    if (!cls) {
+        for (uint32_t i = 0; i < num && !cls; ++i) {
+            uint32_t o = 0;
+            if (TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) && o &&
+                vr::script::ObjectName(reinterpret_cast<void*>(o)) == "YTacticalMarker" &&
+                vr::script::ClassName(reinterpret_cast<void*>(o)) == "Class")
+                cls = o;
+        }
+        if (!cls) {
+            nextScan = GetTickCount64() + 60000;
+            return cache;
+        }
+    }
+    for (uint32_t i = 0; i < num; ++i) {
+        uint32_t o = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
+        uint32_t c = ObjClass(reinterpret_cast<void*>(o));
+        for (int depth = 0; c && depth < 4; ++depth) {
+            if (c == cls) {
+                if (vr::script::ObjectName(reinterpret_cast<void*>(o)).rfind("Default__", 0) != 0)
+                    cache.push_back(reinterpret_cast<void*>(o));
+                break;
+            }
+            uint32_t super = 0;
+            if (!TrySafeReadUint32(reinterpret_cast<char*>(c) + 0x3C, &super)) break;
+            c = super;
+        }
+    }
+    return cache;
+}
+
+bool MarkerUsable(void* m) {
+    uint32_t flags = 0;
+    uint8_t cmd = 0;
+    return TrySafeReadUint32(static_cast<char*>(m) + kOffMarkerFlags, &flags) && (flags & 1) &&
+           SafeCopy(&cmd, static_cast<char*>(m) + kOffMarkerCommand, 1) && cmd != 0 && cmd != 7 && cmd != 8;
+}
+
 // Dati per l'HUD al polso (R-U3): solo in gioco, in prima persona, Walker vivo.
 void PublishWristData(char* cam) {
     void* pawn = HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr;
@@ -8352,15 +8408,20 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
             // impostato = azione vietata; m_squadControl 0x8000). Al cap. 1
             // restano vietati in alcune fasi: il tester premeva il grip senza
             // alcuna risposta (22/10). Lo si dice nel visore.
-            uint32_t restr = 0;
+            uint32_t restr = 0, squadObj = 0;
+            int squadCmd = -1;
+            uint8_t sc = 0;
+            if (HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xE7C, &squadObj) && squadObj &&
+                SafeCopy(&sc, reinterpret_cast<char*>(squadObj) + 0x2E0, 1))
+                squadCmd = sc;
             if (HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xC30, &restr) && (restr & 0x8000)) {
                 vr::toast::Notify("Squad orders are not available yet at this point of the game");
                 vr::log::Line("SQUAD: orders locked by the game here (control restrictions " + std::to_string(restr) + ").");
             }
             snprintf(b, sizeof(b),
-                     "SQUAD: button pressed (head, restrictions %08X, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
+                     "SQUAD: button pressed (head, restrictions %08X, squad doing command %d, pawn=%d, aim hand=%d, arms=%d, barrel aim=%d, cheap "
                      "shooters=%u); game target %s",
-                     restr, pawn != nullptr, (int)vr::control::g_aimHand.load(),
+                     restr, squadCmd, pawn != nullptr, (int)vr::control::g_aimHand.load(),
                      (int)g_armsActive.load(), (int)g_muzzleAimValid.load(), (unsigned)CheapShooters().size(),
                      sel ? vr::script::ClassName(reinterpret_cast<void*>(sel)).c_str() : "none");
         } else {
@@ -8433,13 +8494,13 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
     // Attacco vietato dal gioco (m_squadCommandAttack 0x200000) ma ordini
     // permessi: e' un altro comando del tutorial (stordimento a cp01). La
-    // convalida del gioco esce subito con questo bit, e il bersaglio della
-    // mod scartava quello del gioco ("ignored while the mod points at",
-    // 22/10): si lascia scegliere al gioco (centro della vista).
+    // convalida (0x008389D0) esce subito solo se il comando che la squadra
+    // sta eseguendo (pc+0xE7C YAIPlayerSquad, +0x2E0) e' un attacco (7/8):
+    // i nemici restano bersagli validi (letto con Ghidra il 22/10).
     uint32_t restrNow = 0;
-    bool attackLocked = HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xC30, &restrNow) &&
-                        (restrNow & (0x8000 | 0x200000));
-    if (!pawn || !held || attackLocked) {
+    bool readRestr = HasCameraSignature(cam) && TrySafeReadUint32(cam - 0x77C + 0xC30, &restrNow);
+    bool attackLocked = readRestr && (restrNow & 0x200000);
+    if (!pawn || !held || (readRestr && (restrNow & 0x8000))) {
         lastPick = nullptr;
         g_squadModPick = nullptr;
         return;
@@ -8479,10 +8540,12 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     for (int pass = 0; pass < 1 && !best; ++pass) {
         const float* dir = rayD[pass];
         const float* o = rayO[pass];
-        // 3 gradi sui Pawn; i nemici semplificati (cecchino sul cartellone)
-        // sono bersagli scriptati per gli ordini: 10 gradi (con 4 lo sguardo
-        // a 9 gradi dal cecchino non bastava, 22/10).
-        const float tolPawn = 0.0524f, tolCheap = 0.1763f;
+        // 7 gradi sui Pawn: la testa punta meno precisa della canna (3 gradi,
+        // ereditati dalla mira con l'arma: allo stordente del cap. 1 il nemico
+        // era a 4-11 gradi e la mod non lo sceglieva, 22/10). I nemici
+        // semplificati (cecchino sul cartellone) sono bersagli scriptati per
+        // gli ordini: 10 gradi.
+        const float tolPawn = 0.1228f, tolCheap = 0.1763f;
         p = pawnList;
         for (int guard = 0; p && guard < 512; ++guard) {
             char* other = reinterpret_cast<char*>(p);
@@ -8502,7 +8565,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
                 if (!friendOrCivil && along > 50.0f) {
                     float perp[3] = {v[0] - dir[0] * along, v[1] - dir[1] * along, v[2] - dir[2] * along};
                     float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
-                    // Tolleranza: 3 gradi, e almeno ~45 unita' (un corpo) da vicino.
+                    // Tolleranza: 7 gradi, e almeno ~45 unita' (un corpo) da vicino.
                     float tol = std::fmax(along * tolPawn, 45.0f);
                     float score = off / along;
                     if (pass == 0 && std::atan2(off, along) * 57.2957795f < g_squadClosestDeg) {
@@ -8564,6 +8627,62 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
             }
         }
     }
+    (void)attackLocked;  // i nemici restano: la convalida la fa il gioco (vedi Hooked_SelectMarkable)
+    // Compagni a terra (Adams, Lugo): l'ordine di cura (GetHealCommand,
+    // bytecode 22/10: m_isDownButNotOut e cura non vietata, 0x800000) ha la
+    // precedenza sui nemici vicini allo sguardo. Prima i compagni erano
+    // esclusi e con un nemico accanto la mod sceglieva il nemico.
+    if (!(readRestr && (restrNow & 0x800000))) {
+        uint32_t q = pawnList;
+        void* healBest = nullptr;
+        float healScore = 1e9f;
+        for (int guard = 0; q && guard < 512; ++guard) {
+            char* other = reinterpret_cast<char*>(q);
+            uint32_t next = 0, flags = 0;
+            float loc[3];
+            TrySafeReadUint32(other + kOffPawnNextPawn, &next);
+            if (other != pawn && TrySafeReadUint32(other + kOffPawnDbnoFlags, &flags) && (flags & 0x40000) &&
+                SafeCopy(loc, other + 0x54, 12)) {
+                std::string cls = vr::script::ClassName(other);
+                if (cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos) {
+                    float v[3] = {loc[0] - eo[0], loc[1] - eo[1], loc[2] - eo[2]};
+                    float along = v[0] * rayD[0][0] + v[1] * rayD[0][1] + v[2] * rayD[0][2];
+                    if (along > 30.0f) {
+                        float perp[3] = {v[0] - rayD[0][0] * along, v[1] - rayD[0][1] * along, v[2] - rayD[0][2] * along};
+                        float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+                        if (off < std::fmax(along * 0.1405f, 60.0f) && off / along < healScore) {
+                            healBest = other;
+                            healScore = off / along;
+                        }
+                    }
+                }
+            }
+            q = next;
+        }
+        if (healBest) {
+            best = healBest;
+            bestScore = healScore;
+        }
+    }
+    if (!best) {
+        // Segnaposto tattici lungo lo sguardo (10 gradi, almeno 80 unita':
+        // sono aree, non corpi). Visibilita' non controllata: li piazza il livello.
+        for (void* m : TacticalMarkers()) {
+            float loc[3];
+            if (!MarkerUsable(m) || !SafeCopy(loc, static_cast<char*>(m) + 0x54, 12)) continue;
+            float v[3] = {loc[0] - eo[0], loc[1] - eo[1], loc[2] - eo[2]};
+            float along = v[0] * rayD[0][0] + v[1] * rayD[0][1] + v[2] * rayD[0][2];
+            if (along <= 50.0f) continue;
+            float perp[3] = {v[0] - rayD[0][0] * along, v[1] - rayD[0][1] * along, v[2] - rayD[0][2] * along};
+            float off = std::sqrt(perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]);
+            float tol = std::fmax(along * 0.1763f, 80.0f);
+            if (m == lastPick && off < 1.5f * tol) lastPickScore = off / along;
+            if (off < tol && off / along < bestScore) {
+                best = m;
+                bestScore = off / along;
+            }
+        }
+    }
     // Si cambia bersaglio solo se il nuovo e' nettamente piu' centrato.
     if (lastPick && lastPickScore >= 0.0f && best != lastPick && (!best || bestScore > 0.6f * lastPickScore)) {
         best = lastPick;
@@ -8578,8 +8697,11 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
         bool alive = false;
         int32_t hp = 0;
         float fhp = 0.0f;
-        if (vr::script::ClassName(lastPick).find("CheapShooter") != std::string::npos)
+        std::string lcls = vr::script::ClassName(lastPick);
+        if (lcls.find("CheapShooter") != std::string::npos)
             alive = SafeCopy(&fhp, static_cast<char*>(lastPick) + kOffCheapShooterHealth, 4) && fhp > 0.0f;
+        else if (lcls.find("TacticalMarker") != std::string::npos)
+            alive = MarkerUsable(lastPick);
         else
             alive = TrySafeReadUint32(static_cast<char*>(lastPick) + kOffPawnHealth, reinterpret_cast<uint32_t*>(&hp)) &&
                     hp > 0;
