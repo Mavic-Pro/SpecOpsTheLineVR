@@ -34,6 +34,9 @@ bool CallFunction(void* obj, const char* name, void* parms);
 // "ucall <oggetto> <Funzione> [argomenti]": chiamata generica a una funzione
 // UnrealScript (oggetto = pc|pawn|cheat|world|0x...|Classe[#k]).
 void QueueCall(const std::string& line);
+// "uprops <oggetto> [<parte del nome>]": proprieta' della classe dell'oggetto
+// (nome, tipo, offset, valore) nel log, per riflessione. Diagnostica.
+void QueueProps(const std::string& line);
 void Tick(void* pc, void* pawn);
 
 }  // namespace vr::script

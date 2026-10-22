@@ -123,6 +123,15 @@ static void TestMigrate() {
     // Gia' aggiornato: niente da fare.
     lines = {"configversion 5", "hud 0.6 150"};
     CHECK(!MigrateConfigLines(lines, 5, kChanges, 2, &done));
+    {
+        std::vector<std::string> l = {"# ---- Arms ----", "# Two-handed aiming: ...", "# more", "twohand on 12 0.08", "hand right",
+                                      "# left hand", "leftgrip on 20", "configversion 6"};
+        const char* const keys[] = {"twohand", "leftgrip"};
+        CHECK(ConfigVersionOf(l) == 6);
+        CHECK(RemoveRetiredKeys(l, keys, 2) == 2);
+        CHECK(l.size() == 3 && l[0] == "# ---- Arms ----" && l[1] == "hand right" && l[2] == "configversion 6");
+        CHECK(RemoveRetiredKeys(l, keys, 2) == 0);
+    }
     CHECK(lines[1] == "hud 0.6 150");
 }
 

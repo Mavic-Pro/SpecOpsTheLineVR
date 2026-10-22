@@ -7,6 +7,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <sstream>
 #include <map>
 #include <set>
 #include <vector>
@@ -88,6 +89,7 @@ std::mutex g_mutex;
 std::string g_giveWeapon;
 std::string g_console;
 std::string g_call;
+std::string g_props;
 
 constexpr uintptr_t kOffChildren = 0x4C, kOffNext = 0x40;
 constexpr uintptr_t kOffFuncINative = 0x98;  // UFunction::iNative (WORD), FunctionFlags a +0x94
@@ -482,21 +484,87 @@ bool CallFunction(void* obj, const char* name, void* parms) {
     return false;
 }
 
+// Proprieta' di una classe (e delle superclassi) con offset e valore
+// nell'oggetto: "uprops pawn execution", "uprops pc Markable". Niente
+// chiamate al gioco: solo letture della riflessione (UProperty.Offset +0x64,
+// BoolProperty.BitMask +0x84).
+void RunProps(void* pc, void* pawn, const std::string& line) {
+    std::istringstream in(line);
+    std::string tok, part;
+    in >> tok >> part;
+    void* obj = ResolveObject(pc, pawn, tok);
+    if (!obj) {
+        vr::log::Line("UPROPS: object \"" + tok + "\" not found.");
+        return;
+    }
+    std::string partLow = part;
+    for (char& ch : partLow) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    int shown = 0;
+    void* c = reinterpret_cast<void*>(Field(obj, kOffClass));
+    vr::log::Line("UPROPS: " + ClassName(obj) + " " + ObjectName(obj) + " (filter \"" + part + "\")");
+    for (int depth = 0; c && depth < 32 && shown < 300; ++depth) {
+        std::string cls = ObjectName(c);
+        for (void* f = reinterpret_cast<void*>(Field(c, kOffChildren)); f && shown < 300; f = reinterpret_cast<void*>(Field(f, kOffNext))) {
+            std::string type = ClassName(f);
+            if (type.size() < 9 || type.compare(type.size() - 8, 8, "Property") != 0) continue;
+            std::string name = ObjectName(f);
+            if (!partLow.empty()) {
+                std::string low = name;
+                for (char& ch : low) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+                if (low.find(partLow) == std::string::npos) continue;
+            }
+            uint32_t off = Field(f, kOffPropOffset);
+            char* p = static_cast<char*>(obj) + off;
+            char val[200] = "?";
+            uint32_t u = 0;
+            float fl = 0.0f;
+            if (type == "IntProperty" && SafeRead(p, &u, 4)) snprintf(val, sizeof(val), "%d", static_cast<int32_t>(u));
+            else if (type == "FloatProperty" && SafeRead(p, &fl, 4)) snprintf(val, sizeof(val), "%.4g", fl);
+            else if (type == "ByteProperty" && SafeRead(p, &u, 1)) snprintf(val, sizeof(val), "%u", u & 0xFF);
+            else if (type == "BoolProperty" && SafeRead(p, &u, 4)) {
+                uint32_t mask = Field(f, kOffBoolMask);
+                snprintf(val, sizeof(val), "%s (mask 0x%X)", (u & mask) ? "true" : "false", mask);
+            } else if ((type == "ObjectProperty" || type == "ClassProperty" || type == "ComponentProperty") && SafeRead(p, &u, 4))
+                snprintf(val, sizeof(val), "%08X %s", u, u ? ClassName(reinterpret_cast<void*>(u)).c_str() : "");
+            else if (type == "NameProperty" && SafeRead(p, &u, 4)) snprintf(val, sizeof(val), "%s", NameText(static_cast<int32_t>(u)).c_str());
+            else if (type == "ArrayProperty" && SafeRead(p + 4, &u, 4)) snprintf(val, sizeof(val), "array of %u", u);
+            else if (type == "StructProperty") {
+                float v[6] = {};
+                SafeRead(p, v, sizeof(v));
+                snprintf(val, sizeof(val), "struct: %.4g %.4g %.4g %.4g %.4g %.4g", v[0], v[1], v[2], v[3], v[4], v[5]);
+            }
+            char b[400];
+            snprintf(b, sizeof(b), "UPROPS %s.%s (%s) +0x%X = %s", cls.c_str(), name.c_str(), type.c_str(), off, val);
+            vr::log::Line(b);
+            ++shown;
+        }
+        c = reinterpret_cast<void*>(Field(c, kOffSuper));
+    }
+    vr::log::Line("UPROPS: " + std::to_string(shown) + " properties shown.");
+}
+
+void QueueProps(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_props = line;
+}
+
 void QueueCall(const std::string& line) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_call = line;
 }
 
 void Tick(void* pc, void* pawn) {
-    std::string cls, console, call;
+    std::string cls, console, call, props;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         cls.swap(g_giveWeapon);
         console.swap(g_console);
         call.swap(g_call);
+        props.swap(g_props);
     }
     if (!console.empty()) RunConsole(pc, console);
     if (!call.empty()) RunCall(pc, pawn, call);
+    if (!props.empty()) RunProps(pc, pawn, props);
     if (cls.empty()) return;
     // Le classi "_Scnd" (modalita' secondaria di un'arma) e "_AI" non sono armi
     // da dare al giocatore: GiveWeapon con YWeapon_SCAR_Scnd va in eccezione.

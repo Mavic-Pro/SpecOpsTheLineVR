@@ -234,6 +234,7 @@ extern std::atomic<bool> g_adsActive;
 // Mano sinistra sulla canna (mira a due mani): il grip sinistro non lancia
 // la granata (LB) mentre si tiene l'arma.
 extern std::atomic<bool> g_twoHandEngaged;
+extern std::atomic<float> g_cupRel[3];  // pistole: mano di supporto rispetto all'osso della mano dell'arma (X avanti, Y giu', Z sinistra, unita')
 // Mano sinistra agganciata all'arma (presa sull'astina, hooks UpdateArms):
 // come g_twoHandEngaged, il grip sinistro non e' una granata.
 extern std::atomic<bool> g_leftOnGun;

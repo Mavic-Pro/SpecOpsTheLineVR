@@ -29,10 +29,9 @@ virtual cinema screen.
   barrel of the gun you hold, with the game's own spread scaled by your
   stance (sights at the eye = practically none, two hands = half, long gun in
   one hand = more). Use the weapon's sights; `marker on` adds a green marker
-  where the barrel points, `laser on` a visible beam. Two-handed aiming with the left hand
-  on the barrel (within 12 cm of the gun line, `twohand on <cm>` to widen it;
-  the log says when it engages). **Aim down the sights** by bringing the gun
-  to your eye.
+  where the barrel points, `laser on` a visible beam. Two-handed aiming engages
+  by itself: left hand on the barrel of a rifle, or wrapped around the gun
+  hand with a pistol. **Aim down the sights** by bringing the gun to your eye.
   Gamepad aim assist is disabled while aiming by hand.
 - **Gunstock support**: one-button calibration of the gun angle.
 - **VR cover**: the world does not spin when Walker takes cover; lean out
@@ -192,9 +191,9 @@ there is plenty of headroom:
 documented in the file (aiming, arms, cover, comfort, cinema screen, haptics,
 performance, updates). The same commands can be sent while the game runs by
 writing them to `specopsvr_cmd.txt` in the same folder. If something looks
-wrong, most features can be switched off one by one (`submitpose off`,
-`ads off`, `coverpeek off`, `coversnap off`, `turretaim stick`,
-`cinemawalker screen`, `gesture melee off`, `vrinput legacy`).
+wrong, most features can be switched off one by one (`ads off`,
+`coverpeek off`, `turretaim stick`, `cinemawalker screen`, `gesture melee off`,
+`vrinput legacy`).
 
 ## Reporting bugs
 

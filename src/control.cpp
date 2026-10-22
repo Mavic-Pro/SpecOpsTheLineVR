@@ -48,7 +48,7 @@ std::atomic<bool> g_cinemaForce{false};
 std::atomic<float> g_cinemaWidthM{3.2f}, g_cinemaDistM{2.6f};
 std::atomic<int> g_outputTest{0};
 std::atomic<float> g_outputScale{1.0f};
-std::atomic<bool> g_submitWithPose{true};
+std::atomic<bool> g_submitWithPose{false};  // 19/10: con la posa, bande nere e fisheye muovendo la testa
 std::atomic<bool> g_pairCheck{false};
 std::atomic<bool> g_commandFollowsGun{true};
 std::atomic<float> g_turnWithHeadDeg{45.0f};
@@ -61,6 +61,7 @@ std::atomic<bool> g_turretAimHand{true};
 std::atomic<bool> g_adsEnabled{true};
 std::atomic<bool> g_adsActive{false};
 std::atomic<bool> g_twoHandEngaged{false};
+std::atomic<float> g_cupRel[3] = {0.5f, 2.5f, -4.5f};  // Z negativo = a sinistra dell'arma, Y sotto: scelta sugli screenshot (22/10)
 std::atomic<bool> g_leftOnGun{false};
 std::atomic<bool> g_headSampleOnDraw{true};
 std::atomic<float> g_turnSpeedDeg{150.0f};
@@ -157,7 +158,7 @@ std::atomic<uint64_t> g_lastStereoDrawMs{0};
 std::atomic<bool> g_firstPerson{true};
 std::atomic<float> g_fpEyeHeight{40.0f};
 std::atomic<float> g_fpForward{15.0f};
-std::atomic<float> g_fpNearPlane{18.0f};
+std::atomic<float> g_fpNearPlane{3.0f};  // con fpbody braccia e arma vicine agli occhi restano visibili
 std::atomic<bool> g_aimFollowsBody{true};
 std::atomic<bool> g_aimHand{true};
 std::atomic<float> g_aimPitchOffsetDeg{0.0f};
@@ -902,6 +903,20 @@ void ExecuteNormalized(const std::string& line) {
         std::string ev;
         in >> ev;
         if (!ev.empty()) vr::script::QueueCall("pc ServerCauseEvent " + ev);
+    } else if (cmd == "cuprel") {
+        // cuprel <x> <y> <z>: presa avvolgente delle pistole, taratura (unita' nel riferimento della mano destra)
+        float x = 0, y = 0, z = 0;
+        if (in >> x >> y >> z) {
+            g_cupRel[0] = x;
+            g_cupRel[1] = y;
+            g_cupRel[2] = z;
+        }
+    } else if (cmd == "uprops") {
+        // uprops <oggetto> [<parte del nome>]: proprieta' per riflessione nel log (diagnostica)
+        std::string rest;
+        std::getline(in, rest);
+        size_t a = rest.find_first_not_of(' ');
+        if (a != std::string::npos) vr::script::QueueProps(rest.substr(a));
     } else if (cmd == "ucall") {
         std::string rest;
         std::getline(in, rest);
@@ -1188,7 +1203,14 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // in basso col corpo avanti si vedeva l'interno del colletto).
 // 5 (0.9.7): "hud 0.6 150" -> "hud 0.5 100" (angoli dell'HUD fuori dalla zona nitida delle lenti, HUD a 3 m
 // davanti a ripari a 30 cm; audit 19/10).
-constexpr int kConfigVersion = 6;
+// 7 (22/10): options that must simply work (two-handed grip, left grip, cover
+// snap, ...) and the experiments (menu169, cinema3d, ham) are no longer in
+// the ini: they stay as hidden commands, out of the in-headset menu.
+constexpr int kConfigVersion = 7;
+const char* const kRetiredKeys[] = {"twohand", "leftgrip", "menu169", "cinema3d", "ham", "mode", "gun", "arms", "muzzleaim",
+                                    "aimassist", "gamecrosshair", "6dof", "bodyfollow", "posscale", "near", "viewport",
+                                    "offcenter", "eyestate", "submitpose", "handpredict", "coversnap", "cinemaalign",
+                                    "keepfocus", "execassist", "bodyback", "eyesmooth", "bodyfacing", "fp"};
 
 void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
     // Ogni cambio vale solo per gli ini piu' vecchi della sua versione: chi era
@@ -1198,8 +1220,12 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
         {4, "bodyback -10 10", "bodyback -10 26"}, {5, "hud 0.6 150", "hud 0.5 100"},
         {6, "marker on", "marker off"}};  // 21/10: mirino verde spento di default (mirini veri + laser opzionale)
     std::string done;
+    int removed = 0;
+    if (vr::pure::ConfigVersionOf(lines) < 7)
+        removed = vr::pure::RemoveRetiredKeys(lines, kRetiredKeys, sizeof(kRetiredKeys) / sizeof(kRetiredKeys[0]));
     if (!vr::pure::MigrateConfigLines(lines, kConfigVersion, kChanges, sizeof(kChanges) / sizeof(kChanges[0]), &done))
         return;
+    if (removed) done += " " + std::to_string(removed) + " retired options removed;";
     WriteIniLines(path, lines);
     vr::log::Line("CONFIG: specopsvr.ini updated to version " + std::to_string(kConfigVersion) + ":" +
                   (done.empty() ? std::string(" no default to change") : done));

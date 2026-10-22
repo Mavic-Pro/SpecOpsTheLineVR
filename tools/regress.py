@@ -110,6 +110,16 @@ def main():
     ls.backup_saves()
     try:
         ls.gamectl('kill')
+        # The gate tests the dll just built, not whatever is in the game folder
+        # (22/10: two commits were "PASS" with a stale dll, the copy had failed
+        # on the locked file of a running game).
+        time.sleep(1.5)
+        g.deploy()
+        built = os.path.join(ROOT, 'deploy', 'Release', 'd3d9.dll')
+        installed = os.path.join(g.GAME_DIR, 'd3d9.dll')
+        if open(built, 'rb').read() != open(installed, 'rb').read():
+            print('RESULT: FAIL (deploy/Release/d3d9.dll not installed in the game folder)')
+            sys.exit(1)
         g.launch(['-nostartupmovies', '-windowed', 'ResX=2400', 'ResY=2500'])
         time.sleep(55)
         g.focus()

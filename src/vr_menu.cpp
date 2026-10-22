@@ -39,7 +39,6 @@ struct Item {
 std::vector<Item> BasicItems() {
     return {
         {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: the gun buttons move to the left controller and Walker holds the gun in his left hand.", Kind::Choice, {"right", "left"}},
-        {"cinemalaser", "Laser on the screen", "Point the gun controller at the virtual screen to move the game's cursor on its menus; trigger = click.", Kind::OnOff},
         {"wristhud", "Wrist HUD", "Ammo, weapon and health on the support-hand wrist, like a watch.", Kind::OnOff},
         {"commandaim", "Squad orders aim", "Who the squad order targets while the squad button is held: along the gun barrel, the centre of the view (game), or where the support hand points.", Kind::Choice, {"gun", "head", "support"}},
         {"height", "Standing height", "auto = your real height measured while playing; hold both sticks 3 s to set it.", Kind::Choice, {"auto", "fixed"}},
@@ -48,7 +47,6 @@ std::vector<Item> BasicItems() {
         {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.4 100", "0.5 100", "0.6 100"}},
         {"fpbody", "Walker's body", "Show Walker's body and arms (off = floating hands and gun).", Kind::OnOff},
         {"reload", "Reload", "physical = grip the magazine, belt, push it in; simple = press X.", Kind::Choice, {"physical", "simple"}},
-        {"twohand", "Two-handed aiming", "Support hand on the barrel (rifles) or around the gun hand (pistols) steadies the gun.", Kind::OnOff},
         {"marker", "Green aim marker", "A marker where the barrel points. Off: use the weapon's own sights.", Kind::OnOff},
         {"laser", "Laser beam", "A visible beam from the barrel to the point of impact.", Kind::OnOff},
         {"spread", "Bullet spread", "on = the game's spread scaled by stance; off = laser-straight shots.", Kind::OnOff},

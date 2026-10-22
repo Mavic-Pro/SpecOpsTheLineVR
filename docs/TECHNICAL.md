@@ -853,6 +853,36 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   engine's `CalcComponentToFrameMatrix` (0x00583610) and bone quaternions
   do not survive a reflection (IK controls simply stop acting; Ghidra, vtable
   slot 84 = `USkelControlLimb::CalculateNewBoneTransforms` 0x00CE6EA0).
+- **Executions (22/10):** `YPlayerController.CheckExecute` (script) compares
+  the camera pitch with `m_executionMaxCamPitchAngle` (+0xB90, -1000 =
+  -5.5 degrees) and below it calls `StartMeleeAttack`: in VR the downed enemy
+  is looked at from above (-28 degrees in the log, ten punches, no
+  execution). The assist now writes -16384 (-90 degrees) every tick.
+- **Squad orders with the support hand (22/10):** the game validates the
+  target in the virtual at vtable +0x550 (0x008389D0): the candidate (+0xEA0)
+  becomes `m_currentSelectedTacticalMarkable` (+0xE98) only after two async
+  visibility traces; a different candidate resets the counters. The game
+  calls it every frame with its own centre-of-view candidate and the mod with
+  its pick: two different ones never completed ("not taken by the game"),
+  which only agreed along the barrel. The function is hooked and, while the
+  mod has a pick, calls with another markable are ignored. The "not taken"
+  log line now prints the validation fields.
+- **Pistol support grip (22/10):** no two-handed pistol animation to measure
+  (IK_Hand_L 30+ units away), so the support hand takes a synthetic pose next
+  to the gun hand: `cuprel` units in the gun-hand bone frame (X forward, Y
+  down, Z right; default 0.5 2.5 -4.5 = left of and under the grip, chosen on headless screenshots) with the hand
+  axes Y and Z negated (palms facing each other, as two controllers held side
+  by side); engages within `leftgrip` cm like the rifle grip. Before, the
+  left hand went through the pistol.
+- **Options retired from the ini and the menu (22/10):** the player asked
+  for no switches for things that must simply work (two-handed grip engages
+  by proximity) and none for dead experiments; see "Hidden settings" under
+  Developer commands. Code defaults now equal the old ini defaults
+  (`submitpose off`, `near 3`).
+- **Deploy (22/10):** `gamectl.py deploy` is the install command; the copy
+  fails on the locked dll while the game runs, so `regress.py` now kills the
+  game, deploys and fails if the installed dll differs from the built one
+  (two commits had passed the gate with a stale dll).
 - **Two-handed grip with pistols (22/10):** the grip needed the support
   hand 12-70 cm ahead of the gun hand along the barrel, which fits a rifle's
   handguard but never a pistol (the support hand wraps the gun hand, the
@@ -1106,6 +1136,18 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
   (`cp01`, `CP03`, ...).
 - `console <command>` - `PlayerController.ConsoleCommand`; missions load with
   `open TheLine_P?mission=SP_Gorge01_P?game=SRAssets.YGameInfo_SP_Content`.
+- `uprops <object> [<part of name>]` - properties of the object's class
+  (and superclasses) with type, offset and current value, by reflection
+  (`uprops pc markable`, `uprops pawn execut`): the fastest way to name an
+  offset seen in Ghidra or to read a game threshold.
+- Hidden settings (not in the ini nor in the menu, 22/10: things that must
+  simply work or experiments): `twohand on|off [cm] [s]`, `leftgrip on|off [cm]`,
+  `cuprel x y z` (pistol support-hand pose), `coversnap`, `cinemaalign`,
+  `keepfocus`, `execassist`, `muzzleaim`, `aimassist`, `gamecrosshair`,
+  `arms`, `gun`, `6dof`, `bodyfollow`, `bodyfacing`, `bodyback`, `eyesmooth`,
+  `fp`, `near`, `posscale`, `viewport`, `offcenter`, `eyestate`, `submitpose`,
+  `handpredict`, `mode`, `menu169`, `cinema3d`, `ham`, `cinemalaser`.
+  `configversion 7` removes their lines (and comments) from older inis.
 - `armdebug`, `armbones`, `firelog on`, `inputlog N`, `gesturelog N`,
   `dumpcam`, `shot <name>`, `vischeck on` (enemies in front of the view but
   not drawn, every 0.5 s), `gesturesim melee|throw|reload|reloadlost|duck|weapon`
@@ -1119,6 +1161,14 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
 - `loadouttest.py` / `weapontest.py` - fire the weapons and measure the shot
   direction against the barrel.
 - `ue3.py` - engine object browser.
+- `ghq.py` - decompiles functions of the persistent Ghidra project (needs
+  `JAVA_HOME`); `FindImm.java` (same scripts folder) lists the functions that
+  use an immediate, e.g. a field offset (`0xE98` -> the squad target
+  validation).
+- Script packages (`SRGame/ScriptFinalRelease/*.u`) are plain UE3 packages:
+  the name table gives property and function names (`m_executionMaxCamPitchAngle`,
+  `CheckExecute`) and the objects a function references can be listed from
+  its bytecode without a decompiler (session scripts `unames.py`, `urefs.py`).
 - `hmdwindow.py` - captures the SteamVR null driver window for headset-free
   tests.
 - `package.py` - builds the release zip, `companions.json` and prints the

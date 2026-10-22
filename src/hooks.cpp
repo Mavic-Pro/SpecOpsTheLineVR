@@ -10,6 +10,7 @@
 #include "script_call.h"
 #include "display_spoof.h"
 #include "haptics_ext.h"
+#include "audio_diag.h"
 #include "vr_input.h"
 
 #include <tlhelp32.h>
@@ -5519,7 +5520,22 @@ bool SupportGripRelation(void* mesh, float pos[3], float rot[3][3]) {
     // Pistole e Micro Uzi (a una mano: IK_Hand_L a ~30 unita') e animazioni
     // senza la sinistra sull'arma (corsa, lancio): nessuna presa. Fucili,
     // fucili a pompa, P90, RPG: 9-23 unita'.
-    return pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2] < 26.0f * 26.0f;
+    float d2 = pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2];
+    if (vr::control::g_fireLog) {
+        // Diagnostica ("firelog on"): la distanza tra le mani dell'animazione
+        // quando cambia di 2 unita' (pistole: in quali animazioni la sinistra
+        // sta sull'arma?).
+        static float lastD = -1.0f;
+        float dn = std::sqrt(d2);
+        if (std::fabs(dn - lastD) > 2.0f) {
+            lastD = dn;
+            char b[160];
+            snprintf(b, sizeof(b), "ARMS grip relation: left hand %.1f units from the right in the animation, rel=(%.1f %.1f %.1f)%s",
+                     dn, pos[0], pos[1], pos[2], dn < 26.0f ? "" : " (no grip)");
+            vr::log::Line(b);
+        }
+    }
+    return d2 < 26.0f * 26.0f;
 }
 
 // Spalla (osso Arm_Left / Arm_Right) nel mondo e portata massima del braccio
@@ -6569,6 +6585,16 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
             SafeCopy(gm, static_cast<char*>(gunComp) + kOffCompLocalToWorld, sizeof(gm))) {
             float dx = gm[12] - hp.ret[0], dy = gm[13] - hp.ret[1], dz = gm[14] - hp.ret[2];
             gunInHand = dx * dx + dy * dy + dz * dz < 20.0f * 20.0f;
+            if (!gunInHand && vr::control::g_fireLog) {
+                static ULONGLONG lastLog = 0;
+                if (GetTickCount64() - lastLog > 2000) {
+                    lastLog = GetTickCount64();
+                    char b[120];
+                    snprintf(b, sizeof(b), "ARMS: gun mesh origin %.0f units from the hand bone: no grip measurements.",
+                             std::sqrt(dx * dx + dy * dy + dz * dz));
+                    vr::log::Line(b);
+                }
+            }
         }
     }
     if (++remeasure >= 30) {
@@ -6682,8 +6708,23 @@ void UpdateArms(const float* base, int32_t bodyYaw) {
                 std::memcpy(candPos, relPos, sizeof(candPos));
             }
         }
-        if (relValid) haveLastRel = true;
-        bool canGrip = vr::control::g_leftGrip && gunInHand && relValid && !ArmsSwapped();
+        // Pistole e Uzi: nessuna animazione a due mani da misurare (IK_Hand_L
+        // a 30+ unita'). Presa avvolgente sintetica: la sinistra accanto alla
+        // destra, palmi uno verso l'altro (stesso orientamento della destra con
+        // Y e Z invertiti: e' cosi' che le due mani stanno coi controller
+        // affiancati), e sta attaccata finche' il controller sinistro e'
+        // entro leftgrip. Prima la sinistra attraversava la pistola (22/10).
+        bool synthCup = false;
+        if (!relValid && gunInHand && g_weaponShort.load() && !ArmsSwapped()) {
+            cPos[0] = vr::control::g_cupRel[0];
+            cPos[1] = vr::control::g_cupRel[1];
+            cPos[2] = vr::control::g_cupRel[2];
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) cRot[r][c] = (r == c) ? (r == 0 ? 1.0f : -1.0f) : 0.0f;
+            synthCup = true;
+        }
+        if (relValid || synthCup) haveLastRel = true;
+        bool canGrip = vr::control::g_leftGrip && gunInHand && (relValid || synthCup) && !ArmsSwapped();
         bool canPose = canGrip || (gripBlend > 0.0f && haveLastRel);
         if (canPose) {
             std::memcpy(relPos, cPos, sizeof(relPos));
@@ -7671,6 +7712,19 @@ void ExecutionAssist(void* pc, void* pawn) {
     }
     if (!pawn || !pc || !vr::control::g_execAssist) return;
     {
+        // YPlayerController.CheckExecute confronta il pitch della camera con
+        // m_executionMaxCamPitchAngle (+0xB90, -1000 = -5,5 gradi) e sotto
+        // quella soglia chiama StartMeleeAttack: in VR si guarda il nemico a
+        // terra dall'alto (-28 gradi nel log del 22/10, dieci pugni e nessuna
+        // esecuzione). Soglia a -90 gradi, riscritta a ogni tick.
+        int32_t maxPitch = 0;
+        if (TrySafeReadUint32(static_cast<char*>(pc) + 0xB90, reinterpret_cast<uint32_t*>(&maxPitch)) && maxPitch != -16384) {
+            int32_t v = -16384;
+            if (SafeCopy(static_cast<char*>(pc) + 0xB90, &v, 4))
+                vr::log::Line("EXECUTE: camera pitch limit for executions " + std::to_string(maxPitch) + " -> -16384 (-90 deg).");
+        }
+    }
+    {
         // Riquadro di rilevamento dell'esecuzione: deciso dai valori a ogni
         // tick, non una volta per Pawn (il gioco puo' rimetterlo; L16).
         float cur[6] = {};
@@ -7796,6 +7850,31 @@ float HitAngleFromHead(void* pawn) {
 // linea della canna e lo si passa al gioco con SetAsCurrentSelectedMarkable
 // (distanza dal centro 0: vince sulla scelta dello schermo).
 constexpr uintptr_t kOffPcSelectedMarkable = 0xE98;  // m_currentSelectedTacticalMarkable
+// Convalida del bersaglio (YPlayerController vtable +0x550, 0x008389D0,
+// Ghidra 22/10): il candidato +0xEA0 viene confermato in +0xE98 solo dopo
+// due tracce asincrone di visibilita'; se cambia, contatori e tracce
+// ripartono. Il gioco la chiama ogni frame col proprio candidato (centro
+// dello schermo) e la mod con il suo: con due candidati diversi (ordine con
+// la mano di supporto) la convalida non finiva mai ("not taken by the
+// game", log 22/10). Con un bersaglio della mod, le chiamate del gioco con
+// un altro candidato si scartano.
+constexpr uintptr_t kSelectMarkableAddr = 0x008389D0;
+typedef void(__thiscall* SelectMarkable_t)(void* pc, void* markable, float screenDist);
+SelectMarkable_t g_SelectMarkable_Original = nullptr;
+std::atomic<void*> g_squadModPick{nullptr};
+void __fastcall Hooked_SelectMarkable(void* pc, void* /*edx*/, void* markable, float screenDist) {
+    void* pick = g_squadModPick.load();
+    if (pick && markable != pick) {
+        static void* loggedFor = nullptr;
+        if (loggedFor != pick) {
+            loggedFor = pick;
+            vr::log::Line("SQUAD: game's own candidate " + (markable ? vr::script::ClassName(markable) : std::string("none")) +
+                          " ignored while the mod points at " + vr::script::ClassName(pick) + ".");
+        }
+        return;
+    }
+    g_SelectMarkable_Original(pc, markable, screenDist);
+}
 
 // Bersagli degli ordini che non sono Pawn: YCheapShooter (nemici semplificati
 // che sparano da lontano, es. il cecchino sul cartellone del capitolo 1, che
@@ -8032,6 +8111,7 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     // gioco gira sempre, per l'HUD): conta il tasto squadra passato al gioco.
     if (vr::control::g_commandAimMode == 0 || !pawn || !vr::control::g_aimHand || !g_armsActive || !held) {
         lastPick = nullptr;
+        g_squadModPick = nullptr;
         return;
     }
     // Raggio dagli occhi verso il punto in cui arriva la canna (il mirino
@@ -8184,12 +8264,14 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     }
     if (!best) {
         lastPick = nullptr;
+        g_squadModPick = nullptr;
         return;
     }
     struct {
         void* markable;
         float screenDist;
     } parms = {best, 0.0f};
+    g_squadModPick = best;
     // Il gioco convalida la scelta in modo asincrono (traccia di visibilita'):
     // l'esito si controlla qualche frame dopo, non subito.
     static void* pending = nullptr;
@@ -8197,8 +8279,33 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
     if (pending && ++pendingFrames >= 10) {
         uint32_t sel = 0;
         TrySafeReadUint32(cam - 0x77C + kOffPcSelectedMarkable, &sel);
+        std::string why;
+        if (reinterpret_cast<void*>(sel) != pending) {
+            // Perche' il gioco non l'ha preso? Campi della convalida (FUN_008389d0,
+            // Ghidra 22/10): flag di stato +0xC30/+0xC34, bit 31 di +0x5E8
+            // (visibile), contatori +0x74C/+0x74D (check index / fail count),
+            // candidato +0xEA0, miglior distanza a schermo +0xE94.
+            char* pc = cam - 0x77C;
+            uint32_t f0 = 0, f1 = 0, st = 0, cand = 0, bufm = 0;
+            uint8_t ci = 0, cf = 0;
+            float bestD = 0.0f;
+            TrySafeReadUint32(pc + 0xC30, &f0);
+            TrySafeReadUint32(pc + 0xC34, &f1);
+            TrySafeReadUint32(pc + 0x5E8, &st);
+            TrySafeReadUint32(pc + 0xEA0, &cand);
+            TrySafeReadUint32(pc + 0xE9C, &bufm);
+            SafeCopy(&ci, pc + 0x74C, 1);
+            SafeCopy(&cf, pc + 0x74D, 1);
+            SafeCopy(&bestD, pc + 0xE94, 4);
+            char b[260];
+            snprintf(b, sizeof(b), " [flags C30=%08X C34=%08X visible=%d checkIndex=%u failCount=%u bestDist=%.3g candidate=%s buffer=%s]",
+                     f0, f1, (st >> 31) & 1, ci, cf, bestD,
+                     cand ? vr::script::ClassName(reinterpret_cast<void*>(cand)).c_str() : "none",
+                     bufm ? vr::script::ClassName(reinterpret_cast<void*>(bufm)).c_str() : "none");
+            why = b;
+        }
         vr::log::Line("SQUAD: command target along the barrel: " + vr::script::ClassName(pending) +
-                      (reinterpret_cast<void*>(sel) == pending ? " (selected)" : " (not taken by the game)"));
+                      (reinterpret_cast<void*>(sel) == pending ? " (selected)" : " (not taken by the game)") + why);
         pending = nullptr;
     }
     vr::script::CallFunction(cam - 0x77C, "SetAsCurrentSelectedMarkable", &parms);
@@ -8959,6 +9066,15 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
             MH_EnableHook(target) == MH_OK)
             vr::log::Line("Hook on UCanvas::execProject installed (HUD projection count).");
     }
+    {
+        void* smTarget = reinterpret_cast<void*>(kSelectMarkableAddr);
+        if (MH_CreateHook(smTarget, reinterpret_cast<void*>(&Hooked_SelectMarkable),
+                          reinterpret_cast<void**>(&g_SelectMarkable_Original)) == MH_OK &&
+            MH_EnableHook(smTarget) == MH_OK)
+            vr::log::Line("Hook on the squad target validation installed (mod target kept).");
+        else
+            vr::log::Line("ERROR: hook on the squad target validation failed.");
+    }
     void* cwfTarget = reinterpret_cast<void*>(kCalcWeaponFireAddr);
     if (MH_CreateHook(cwfTarget, reinterpret_cast<void*>(&Hooked_CalcWeaponFire),
                       reinterpret_cast<void**>(&g_CalcWeaponFire_Original)) == MH_OK &&
@@ -8979,6 +9095,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
 
     PatchIat(kIatMemcpy, "memcpy", reinterpret_cast<void*>(&Hooked_memcpy), &g_memcpyReal);
     InstallAudioListenerHook();
+    vr::audio::LogDefaultDevice("at start");
     PatchIat(kIatMemmove, "memmove", reinterpret_cast<void*>(&Hooked_memmove), &g_memmoveReal);
 
     g_openVrReady = InitOpenVR();

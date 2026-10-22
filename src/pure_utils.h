@@ -166,6 +166,34 @@ struct ConfigChange {
     const char* from;
     const char* to;
 };
+inline int ConfigVersionOf(const std::vector<std::string>& lines) {
+    int version = 1;
+    for (const auto& l : lines)
+        if (l.rfind("configversion ", 0) == 0) version = std::atoi(l.c_str() + 14);
+    return version;
+}
+// Toglie le righe delle chiavi ritirate e i commenti contigui sopra di esse
+// (non le intestazioni "# ----"). Ritorna quante chiavi ha tolto.
+inline int RemoveRetiredKeys(std::vector<std::string>& lines, const char* const* keys, size_t keyCount) {
+    std::vector<std::string> out;
+    int removed = 0;
+    for (const auto& l : lines) {
+        std::string key = ConfigKey(l);
+        size_t sp = key.find(' ');
+        if (sp != std::string::npos) key = key.substr(0, sp);
+        bool retired = false;
+        if (!l.empty() && l[0] != '#')
+            for (size_t i = 0; i < keyCount && !retired; ++i) retired = key == keys[i];
+        if (!retired) {
+            out.push_back(l);
+            continue;
+        }
+        ++removed;
+        while (!out.empty() && !out.back().empty() && out.back()[0] == '#' && out.back().rfind("# ----", 0) != 0) out.pop_back();
+    }
+    if (removed) lines.swap(out);
+    return removed;
+}
 inline bool MigrateConfigLines(std::vector<std::string>& lines, int targetVersion, const ConfigChange* changes,
                                size_t changeCount, std::string* done) {
     int version = 1;
