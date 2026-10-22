@@ -299,6 +299,29 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 HWND GameWindow() { return g_gameWindow; }
 
+// Con OpenXR nessuno riporta il gioco davanti (SteamVR lo faceva da solo):
+// 22/10 nel visore il pad era morto perche' davanti c'era un terminale.
+// SetForegroundWindow da un processo in secondo piano e' permesso solo con
+// l'input agganciato al thread in primo piano (o dopo un tasto simulato).
+void BringToForeground(const char* why) {
+    HWND h = g_gameWindow;
+    if (!h || vr::control::g_exiting || GetForegroundWindow() == h) return;
+    HWND fg = GetForegroundWindow();
+    DWORD fgTid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0, me = GetCurrentThreadId();
+    bool attached = fgTid && fgTid != me && AttachThreadInput(me, fgTid, TRUE);
+    if (IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
+    bool ok = SetForegroundWindow(h) != FALSE;
+    if (!ok) {
+        keybd_event(VK_MENU, 0, 0, 0);  // un tasto simulato sblocca SetForegroundWindow
+        ok = SetForegroundWindow(h) != FALSE;
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    }
+    BringWindowToTop(h);
+    if (attached) AttachThreadInput(me, fgTid, FALSE);
+    PostMessageW(h, kMsgTakeFocus, 0, 0);
+    vr::log::Line(std::string("DISPLAY: game window brought to the foreground (") + why + (ok ? ")." : "): refused by Windows."));
+}
+
 // 20/10: con "wndinfo" si e' visto che poco dopo l'avvio il gioco installa
 // una sua procedura (0x00F59DF0) al posto della nostra e non la richiama piu'
 // (10 messaggi ricevuti in tutto): keepfocus, WM_GETMINMAXINFO e il ripristino

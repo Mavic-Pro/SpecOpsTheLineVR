@@ -1,4 +1,5 @@
 #include "vr_session.h"
+#include "display_spoof.h"
 #include "control.h"
 #include "vr_toast.h"
 #include "vr_menu.h"
@@ -365,6 +366,7 @@ void MonitorLoop() {
                 bool inputNow = vr::rt::System()->IsInputAvailable();
                 if (inputNow != inputWas) {
                     inputWas = inputNow;
+                    if (inputNow) vr::display::BringToForeground("VR input focus back");
                     vr::log::Line(inputNow ? "OpenVR: input available again." : "OpenVR: input not available (another app has the focus).");
                 }
             }
@@ -459,6 +461,12 @@ void MonitorLoop() {
             else if (standby && t - standbySince > 3000) g_present = false;
             else if (level == vr::k_EDeviceActivityLevel_Idle && (!lastActive || t - lastActive > 120000)) g_present = false;
             active = g_present;
+            {
+                // Visore appena indossato: il gioco davanti, o il pad non arriva.
+                static bool wasActive = false;
+                if (active && !wasActive) vr::display::BringToForeground("headset worn");
+                wasActive = active;
+            }
             static int lastLevel = -99;
             if (level != lastLevel) {
                 lastLevel = level;

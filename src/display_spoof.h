@@ -27,6 +27,10 @@ void KeepSubclass();
 // CreateDevice e UE3 poteva tornare alla vecchia; audit 20/10).
 void SetWantedClientSize(int w, int h);
 
+// Porta la finestra del gioco in primo piano (il gioco ignora il pad senza
+// focus): all'arrivo del visore e al ritorno del focus VR. Da qualsiasi thread.
+void BringToForeground(const char* why);
+
 // Diagnostica ("wndinfo"): procedura di finestra attiva e messaggi ricevuti.
 void LogWindowInfo();
 
