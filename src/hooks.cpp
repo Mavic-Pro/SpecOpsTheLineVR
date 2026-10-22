@@ -1710,7 +1710,8 @@ struct CanvasMatrixState {
     bool adjusted = false;
     UINT reg = 0;
     float orig[16], adj[16];
-    float full[16];  // originale ristretta come la scena (risoluzione dinamica)
+    float full[16];  // effetti a tutta vista: nello spazio dell'occhio, ristretta come la scena
+    bool fullEye = false;  // "full" gia' calcolata da AdjustCanvasMatrix (proiezione decentrata)
 };
 CanvasMatrixState g_canvasState;
 
@@ -1774,7 +1775,15 @@ bool IsCanvasMatrix(const float* m) {
            std::fabs(m[9]) < 1e-3f && std::fabs(m[11] - 1.0f) < 1e-3f;
 }
 
-bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
+// fullOut (facoltativo): matrice per gli effetti a tutta vista (sangue ai
+// bordi, lampi) con la proiezione decentrata: come l'HUD ma a scala 1 e a
+// distanza infinita. Prima si usava la matrice originale, uguale in pixel nei
+// due occhi: con i centri ottici in punti diversi del back buffer il sangue
+// aveva una disparita' enorme, si vedeva doppio e copriva la mira (tester
+// 22/10, "aiming impossible when there is blood in my eyes", "cross-eyed").
+bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out, float* fullOut = nullptr,
+                        bool* fullOk = nullptr) {
+    if (fullOk) *fullOk = false;
     // Il Canvas carica la matrice in c0-c3 o in c6-c9 a seconda dello shader.
     if ((start != 0 && start != 6) || count != 4 || !IsCanvasMatrix(data)) return false;
     if (vr::control::g_cinemaActive) return false;  // schermo virtuale: HUD/sottotitoli come sul monitor (la Scaleform dei menu non passa di qui)
@@ -1833,6 +1842,17 @@ bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out) {
             par += cr[0] / cf[0];
             parY = cu[0] / cf[0];
         }
+        if (fullOut && fullOk) {
+            float parInf = par - ((depth > 0.0f && half > 0.0f) ? (eye == 0 ? 1.0f : -1.0f) * half / depth : 0.0f);
+            std::memcpy(fullOut, data, sizeof(float) * 16);
+            for (int i = 0; i < 4; ++i) {
+                fullOut[4 * i + 0] = fullOut[4 * i + 0] * th * pj.m00 + (parInf * pj.m00 + pj.m20) * fullOut[4 * i + 3];
+                fullOut[4 * i + 1] = fullOut[4 * i + 1] * tv * pj.m11 + (parY * pj.m11 + pj.m21) * fullOut[4 * i + 3];
+                fullOut[4 * i + 0] *= pk;
+                fullOut[4 * i + 1] *= pk;
+            }
+            *fullOk = true;
+        }
         for (int i = 0; i < 4; ++i) {
             out[4 * i + 0] = out[4 * i + 0] * th * pj.m00 + (par * pj.m00 + pj.m20) * out[4 * i + 3];
             out[4 * i + 1] = out[4 * i + 1] * tv * pj.m11 + (parY * pj.m11 + pj.m21) * out[4 * i + 3];
@@ -1859,13 +1879,17 @@ HRESULT WINAPI Hooked_SetVertexShaderConstantF(
     if (StartRegister == 0 && Vector4fCount >= 4) g_canvasMatrixActive = IsCanvasMatrix(pConstantData);
     if (StartRegister == 0 && Vector4fCount >= 2) std::memcpy(g_lastC0, pConstantData, sizeof(g_lastC0));
     for (UINT i = 0; i < Vector4fCount && StartRegister + i < 16; ++i) std::memcpy(g_vsShadow[StartRegister + i], pConstantData + 4 * i, 16);
-    float hud[16];
-    if (AdjustCanvasMatrix(StartRegister, pConstantData, Vector4fCount, hud)) {
+    float hud[16], fullEye[16];
+    bool fullEyeOk = false;
+    if (AdjustCanvasMatrix(StartRegister, pConstantData, Vector4fCount, hud, fullEye, &fullEyeOk)) {
         g_canvasState.adjusted = true;
         g_canvasState.reg = StartRegister;
         std::memcpy(g_canvasState.orig, pConstantData, sizeof(g_canvasState.orig));
         std::memcpy(g_canvasState.adj, hud, sizeof(g_canvasState.adj));
-        {
+        g_canvasState.fullEye = fullEyeOk;
+        if (fullEyeOk) {
+            std::memcpy(g_canvasState.full, fullEye, sizeof(g_canvasState.full));
+        } else {
             FrameTag cur;
             bool tagOk = PeekRenderingTag(&cur);
             float pk = (tagOk ? cur.screenPercent : g_presentPercent.load()) / 100.0f;
