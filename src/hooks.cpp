@@ -7236,8 +7236,31 @@ public:
                     char* camForTrace = static_cast<char*>(g_cameraPtr.load());
                     void* self = HasCameraSignature(camForTrace) ? PlayerPawnIfViewTarget(camForTrace) : nullptr;
                     float hitTime;
-                    if (TraceLine(self, origin, end, &hitTime)) {
-                        want = fl - (hitTime * probe - kWallGap);  // fino a fl + kWallGap
+                    bool hit = TraceLine(self, origin, end, &hitTime);
+                    if (hit) want = fl - (hitTime * probe - kWallGap);  // fino a fl + kWallGap
+                    // Dietro un riparo basso (cassa del cap. 1, cp01, tester
+                    // 22/10) gli occhi stanno appena sopra il bordo: il trace
+                    // all'altezza degli occhi passa sopra e la vista restava
+                    // fp unita' avanti, sopra la cassa ("almost in the crate").
+                    // Si controlla anche 10 e 22 unita' sotto l'occhio vero
+                    // (base + altezza della testa u): un bordo all'altezza del
+                    // mento, tenuto a kLowGap (piu' di un muro: con 12 il
+                    // coperchio riempiva meta' della vista). Non solo "in
+                    // copertura": accucciati dietro la cassa il gioco non segna
+                    // la copertura. Un parapetto alla vita, in piedi, resta ~40
+                    // unita' sotto e non conta.
+                    const float kLowGap = 20.0f, lowProbe = fl + kLowGap;
+                    for (float drop : {10.0f, 22.0f}) {
+                        float z = origin[2] + u - drop;
+                        float lo[3] = {origin[0], origin[1], z};
+                        float loEnd[3] = {origin[0] + fx * lowProbe, origin[1] + fy * lowProbe, z};
+                        float lt;
+                        if (TraceLine(self, lo, loEnd, &lt)) {
+                            want = (std::max)(want, fl - (lt * lowProbe - kLowGap));
+                            hit = true;
+                        }
+                    }
+                    if (hit) {
                         if (want > fl) {
                             // Dietro il centro: solo se alle spalle c'e' spazio.
                             float maxBack = kMaxBehind;
