@@ -7867,16 +7867,19 @@ void ExecutionAssist(void* pc, void* pawn) {
     }
     if (!pawn || !pc || !vr::control::g_execAssist) return;
     {
-        // YPlayerController.CheckExecute confronta il pitch della camera con
-        // m_executionMaxCamPitchAngle (+0xB90, -1000 = -5,5 gradi) e sotto
-        // quella soglia chiama StartMeleeAttack: in VR si guarda il nemico a
-        // terra dall'alto (-28 gradi nel log del 22/10, dieci pugni e nessuna
-        // esecuzione). Soglia a -90 gradi, riscritta a ogni tick.
+        // YPlayerController.CheckExecute (bytecode letto il 22/10):
+        //   if (m_playerCam.Rotation.Pitch > m_executionMaxCamPitchAngle) return false;
+        // cioe' esecuzione solo guardando piu' in basso del limite (+0xB90,
+        // -1000 = -5,5 gradi; "Look down and press B"). La versione precedente
+        // lo portava a -16384 (-90 gradi) col ragionamento invertito: bisognava
+        // guardare esattamente in verticale e B dava solo pugni (tester 22/10,
+        // nemico a terra visto dall'alto). In VR la testa non deve decidere:
+        // limite al massimo, decide il nemico giustiziabile.
         int32_t maxPitch = 0;
-        if (TrySafeReadUint32(static_cast<char*>(pc) + 0xB90, reinterpret_cast<uint32_t*>(&maxPitch)) && maxPitch != -16384) {
-            int32_t v = -16384;
+        if (TrySafeReadUint32(static_cast<char*>(pc) + 0xB90, reinterpret_cast<uint32_t*>(&maxPitch)) && maxPitch != 0x7FFFFFFF) {
+            int32_t v = 0x7FFFFFFF;
             if (SafeCopy(static_cast<char*>(pc) + 0xB90, &v, 4))
-                vr::log::Line("EXECUTE: camera pitch limit for executions " + std::to_string(maxPitch) + " -> -16384 (-90 deg).");
+                vr::log::Line("EXECUTE: camera pitch limit for executions " + std::to_string(maxPitch) + " -> none (any head pitch).");
         }
     }
     {
@@ -7931,7 +7934,18 @@ void ExecutionAssist(void* pc, void* pawn) {
                 continue;
             }
             int32_t rel = static_cast<int16_t>(RadiansToUnreal(std::atan2(loc[1] - me[1], loc[0] - me[0])) - viewYaw);
-            bool downed = (flags & kDbnoBits) != 0;
+            // Giustiziabile per YGamePawn.CheckExecute (script, letto dal
+            // bytecode 22/10): m_deathDBNOState (+0x48A) 1..3 oppure
+            // m_canBeExecutedInDBNO sul PlayerReplicationInfo (+0x36C ->
+            // +0x2D4 bit 0x20). I flag di knock-down (+0x5FC) non bastano al
+            // gioco, ma restano per girare il corpo.
+            uint8_t dbnoState = 0;
+            uint32_t pri = 0, priFlags = 0;
+            SafeCopy(&dbnoState, other + 0x48A, 1);
+            bool executable = (dbnoState >= 1 && dbnoState <= 3) ||
+                              (TrySafeReadUint32(other + 0x36C, &pri) && pri &&
+                               TrySafeReadUint32(reinterpret_cast<char*>(pri) + 0x2D4, &priFlags) && (priFlags & 0x20));
+            bool downed = (flags & kDbnoBits) != 0 || executable;
             if (!downed) {
                 if (d < 150.0f && std::abs(rel) <= 65536 / 8 && !IsFriendOrCivilian(vr::script::ClassName(other)))
                     standingInFront = true;
@@ -8001,9 +8015,47 @@ void ExecutionAssist(void* pc, void* pawn) {
             SafeCopy(static_cast<char*>(pawn) + 0xDE8 + 4, &pawnYaw, 4);
         }
     }
-    char b[160];
-    snprintf(b, sizeof(b), "EXECUTE: B near %s %.0f units away, body turned %.0f degrees toward it",
-             vr::script::ClassName(best).c_str(), bestD, delta * 360.0f / 65536.0f);
+    // CheckExecute rifiuta l'esecuzione con Walker in copertura (IsInCover):
+    // in VR ci si china sul nemico a terra e il gesto "abbassarsi vicino a un
+    // riparo" mette Walker in copertura, poi B da' solo pugni (22/10). Si esce
+    // dalla copertura senza animazione (LeaveCoverInternal(true), script)
+    // prima che B arrivi al gioco.
+    {
+        uint32_t coverNow = 0;
+        if (TrySafeReadUint32(static_cast<char*>(pawn) + 0x498, &coverNow) && (coverNow & 0xFF)) {
+            struct {
+                uint32_t noLeaveCoverSpecialMove;
+                uint32_t ret;
+            } lp = {1, 0};
+            bool ok = vr::script::CallFunction(pc, "LeaveCoverInternal", &lp);
+            vr::log::Line(std::string("EXECUTE: Walker was in cover, left it for the execution (") +
+                          (ok ? ((lp.ret & 1) ? "done" : "refused by the game") : "call failed") + ")");
+        }
+    }
+    // Condizioni di CheckExecute (YPlayerController / YGamePawn, script):
+    // restrizione m_execution, pitch della camera, stato DBNO del nemico,
+    // m_canBeExecutedInDBNO sul suo PlayerReplicationInfo (+0x2D4 bit 0x20),
+    // Walker in copertura o in una mossa speciale. Il 22/10 (tester e nel
+    // visore) il nemico a terra era riconosciuto ma il gioco dava solo pugni.
+    uint32_t restr = 0, pri = 0, priFlags = 0, cover = 0, special = 0, flags5FC = 0;
+    uint8_t dbnoState = 0;
+    int32_t maxPitch = 0;
+    TrySafeReadUint32(static_cast<char*>(pc) + 0xC30, &restr);
+    TrySafeReadUint32(static_cast<char*>(pc) + 0xB90, reinterpret_cast<uint32_t*>(&maxPitch));
+    SafeCopy(&dbnoState, best + 0x48A, 1);
+    TrySafeReadUint32(best + kOffPawnDbnoFlags, &flags5FC);
+    bool priOk = TrySafeReadUint32(best + 0x36C, &pri) && pri &&
+                 TrySafeReadUint32(reinterpret_cast<char*>(pri) + 0x2D4, &priFlags);
+    TrySafeReadUint32(static_cast<char*>(pawn) + 0x498, &cover);
+    TrySafeReadUint32(static_cast<char*>(pawn) + 0x490, &special);
+    char b[400];
+    snprintf(b, sizeof(b),
+             "EXECUTE: B near %s %.0f units away (dz %.0f), body turned %.0f degrees toward it | execution %s, cam pitch "
+             "%.0f deg (limit %d), DBNO state %u flags5FC %08X, canBeExecutedInDBNO %s, Walker cover %u special move %u",
+             vr::script::ClassName(best).c_str(), bestD, bestLoc[2] - me[2], delta * 360.0f / 65536.0f,
+             (restr & 0x10000000) ? "FORBIDDEN by the game" : "allowed",
+             static_cast<float>(static_cast<int16_t>(g_bodyPitch.load() + g_deltaPitch.load())) * 360.0f / 65536.0f, maxPitch,
+             dbnoState, flags5FC, priOk ? ((priFlags & 0x20) ? "yes" : "NO") : "no PRI", cover & 0xFF, (special >> 8) & 0xFF);
     vr::log::Line(b);
 }
 

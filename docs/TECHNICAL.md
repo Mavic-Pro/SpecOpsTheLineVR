@@ -916,11 +916,16 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   0.7 s: the grip engages exactly on the 12 cm boundary, so the remembered
   offset was 17-40 degrees and the gun pointed that far from the hand line
   once the hand settled on the handguard ("aim shifted").
-- **Executions (22/10):** `YPlayerController.CheckExecute` (script) compares
-  the camera pitch with `m_executionMaxCamPitchAngle` (+0xB90, -1000 =
-  -5.5 degrees) and below it calls `StartMeleeAttack`: in VR the downed enemy
-  is looked at from above (-28 degrees in the log, ten punches, no
-  execution). The assist now writes -16384 (-90 degrees) every tick.
+- **Executions (22/10, corrected the same day):** `YPlayerController.CheckExecute`
+  (script, bytecode disassembled) returns false when
+  `m_playerCam.Rotation.Pitch > m_executionMaxCamPitchAngle` (+0xB90, -1000 =
+  -5.5 degrees): the game executes only when looking down. A first fix wrote
+  -16384 (-90 degrees), which made executions practically impossible (only
+  punches, tester report); the assist now writes INT_MAX (no pitch condition).
+  `YGamePawn.CheckExecute` also refuses in cover, on a turret or during a
+  special move, and needs a target in the detection box with
+  `m_deathDBNOState` 1..3, `m_canBeExecutedInDBNO` on its PRI, or a melee
+  take-hit move that is executable ("Meleed enemies will stand up again").
 - **Squad orders with the support hand (22/10):** the game validates the
   target in the virtual at vtable +0x550 (0x008389D0): the candidate (+0xEA0)
   becomes `m_currentSelectedTacticalMarkable` (+0xE98) only after two async
