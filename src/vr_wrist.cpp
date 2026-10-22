@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 
 #include <cmath>
 #include <mutex>
@@ -141,8 +142,8 @@ void Tick() {
     if (!lock.owns_lock()) return;
     vr::session::Shared session(true);
     if (!session.ok() || !vr::session::Ready()) return;
-    vr::IVROverlay* ov = vr::VROverlay();
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVROverlay* ov = vr::rt::Overlay();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!ov || !sys) return;
     Data d;
     {

@@ -18,6 +18,7 @@
 #include <intrin.h>
 #include <MinHook.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 #include <algorithm>
 #include <atomic>
 #include <deque>
@@ -481,7 +482,7 @@ unsigned g_hamGen = 0;
 void BuildHam(int eye) {
     HamRows& h = g_ham[eye];
     h = HamRows();
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!sys) return;
     vr::HiddenAreaMesh_t m = sys->GetHiddenAreaMesh(eye == 0 ? vr::Eye_Left : vr::Eye_Right, vr::k_eHiddenAreaMesh_Standard);
     if (!m.pVertexData || m.unTriangleCount == 0) return;
@@ -3236,8 +3237,8 @@ void UpdateAutoResolution(char* cam) {
     uint32_t w = 0, h = 0;
     {
         vr::session::Shared vrLock(true);
-        if (!vrLock.ok() || !vr::session::IsScene() || !vr::VRSystem()) return;
-        vr::VRSystem()->GetRecommendedRenderTargetSize(&w, &h);
+        if (!vrLock.ok() || !vr::session::IsScene() || !vr::rt::System()) return;
+        vr::rt::System()->GetRecommendedRenderTargetSize(&w, &h);
     }
     if (w < 640 || h < 640) return;
     // Desktop finto a 4096: la finestra con i bordi deve starci (64 px di margine).
@@ -4109,27 +4110,22 @@ int32_t RadiansToUnreal(float rad) {
 // pipeline (thread di rendering, lettura del frame, thread di uscita).
 float PredictedSecondsToPhotons(vr::IVRSystem* sys) {
     if (vr::control::g_predictFrames < 0.0f && !vr::control::g_predictAuto) return 0.0f;  // "predict off" (predefinito)
-    static float hz = 0.0f, vsyncToPhotons = 0.0f;
+    static float hz = 0.0f;
     static ULONGLONG lastProps = 0;
     if (GetTickCount64() - lastProps > 2000) {
         lastProps = GetTickCount64();
         hz = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
-        vsyncToPhotons = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
-                                                            vr::Prop_SecondsFromVsyncToPhotons_Float);
     }
     float frame = hz > 30.0f ? 1.0f / hz : 1.0f / 90.0f;
-    float sinceVsync = 0.0f;
-    uint64_t counter = 0;
-    if (!sys->GetTimeSinceLastVsync(&sinceVsync, &counter)) sinceVsync = 0.0f;
-    // Con Link il valore puo' crescere oltre un frame (vsync non aggiornato):
-    // conta solo la posizione dentro il frame corrente.
-    sinceVsync = std::fmod(sinceVsync < 0.0f ? 0.0f : sinceVsync, frame);
-    float s = frame - sinceVsync + vsyncToPhotons + frame * vr::control::g_predictFrames;
+    // Tempo fino ai fotoni del frame in preparazione secondo il runtime
+    // (SteamVR: prossimo vsync + vsync->fotoni; OpenXR: predictedDisplayTime).
+    float toPhotons = vr::rt::SecondsToPhotons();
+    float s = toPhotons + frame * vr::control::g_predictFrames;
     if (vr::control::g_predictAuto) {
         // Ritardo reale misurato dall'uscita (campionamento -> fotoni), diverso
         // per ogni PC, visore e collegamento; finche' non c'e', un frame in piu'.
         float measured = vr::output::PhotonLatencyMs();
-        s = measured > 0.0f ? measured * 0.001f : frame - sinceVsync + vsyncToPhotons + frame;
+        s = measured > 0.0f ? measured * 0.001f : toPhotons + frame;
     }
     return s < 0.0f ? 0.0f : (s > 0.1f ? 0.1f : s);
 }
@@ -4255,7 +4251,7 @@ void UpdateHeadTracking() {
 
     // kModeHmd
     vr::session::Shared vrLock(true);  // durante un cambio di tipo: questo tick senza testa
-    vr::IVRSystem* const vrsys = vrLock.ok() ? vr::VRSystem() : nullptr;
+    vr::IVRSystem* const vrsys = vrLock.ok() ? vr::rt::System() : nullptr;
     if (!vr::session::Ready() || !vrsys) {
         static ULONGLONG lastNotReady = 0;
         if (GetTickCount64() - lastNotReady > 60000) {

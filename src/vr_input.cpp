@@ -9,6 +9,7 @@
 
 #include <windows.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -282,7 +283,7 @@ bool Ensure() {
     if (gen == g_gen) return g_ready;
     g_gen = gen;
     g_ready = false;
-    vr::IVRInput* in = vr::VRInput();
+    vr::IVRInput* in = vr::rt::Input();
     if (!in) return false;
     static std::string manifest = WriteFiles();
     if (manifest.empty()) {
@@ -391,7 +392,7 @@ Mat34 FromHmd(const vr::HmdMatrix34_t& h) {
 // Componente "tip" di un modello (false se il modello non lo ha o non e'
 // ancora caricato: il caricamento parte qui e si riprova al frame dopo).
 bool TipOf(const char* model, Mat34* out) {
-    vr::IVRRenderModels* rm = vr::VRRenderModels();
+    vr::IVRRenderModels* rm = vr::rt::RenderModels();
     if (!rm || !model || !*model) return false;
     if (rm->GetComponentCount(model) == 0) {
         vr::RenderModel_t* m = nullptr;
@@ -468,7 +469,7 @@ void UpdateHaptics(vr::IVRSystem* sys) {
         if (now < g_hapticUntil[h]) us = 3500;
         if (!us) continue;
         if (act::g_ready) {
-            vr::VRInput()->TriggerHapticVibrationAction(act::g_haptic[vr::control::PhysicalHand(h)], 0.0f, 0.02f, 150.0f,
+            vr::rt::Input()->TriggerHapticVibrationAction(act::g_haptic[vr::control::PhysicalHand(h)], 0.0f, 0.02f, 150.0f,
                                                         us > 3900 ? 1.0f : us / 3900.0f, vr::k_ulInvalidInputValueHandle);
             continue;
         }
@@ -494,7 +495,7 @@ double NowSec();
 bool ReadTouchControllers(XGamepad* out) {
     vr::session::Shared vrLock(true);
     if (!vrLock.ok()) return false;
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!sys) return false;
     vr::TrackedDeviceIndex_t left = sys->GetTrackedDeviceIndexForControllerRole(vr::control::SupportRole());
     vr::TrackedDeviceIndex_t right = sys->GetTrackedDeviceIndexForControllerRole(vr::control::GunRole());
@@ -543,7 +544,7 @@ bool ReadTouchControllers(XGamepad* out) {
         haveR = g_handStateValid[1];
     } else if (act::Ensure()) {
         lastActionRead = nowMs;
-        vr::IVRInput* in = vr::VRInput();
+        vr::IVRInput* in = vr::rt::Input();
         vr::VRActiveActionSet_t set = {};
         set.ulActionSet = act::g_set;
         set.ulRestrictedToDevice = vr::k_ulInvalidInputValueHandle;
@@ -615,7 +616,7 @@ bool ReadTouchControllers(XGamepad* out) {
         // riavvio di SteamVR la sonda usava handle vecchi, L27).
         if (g_autoLegacy && vr::session::IsScene() && GetTickCount64() - lastProbe > 3000 && act::Ensure()) {
             lastProbe = GetTickCount64();
-            vr::IVRInput* in = vr::VRInput();
+            vr::IVRInput* in = vr::rt::Input();
             vr::VRControllerState_t probe;
             if (in) {
                 vr::VRActiveActionSet_t set = {};
@@ -1234,7 +1235,7 @@ double NowSec() {
 bool ReadGestureSample(GestureSample* s) {
     vr::session::Shared vrLock(true);
     if (!vrLock.ok()) return false;
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!sys) return false;
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
     sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, poses, vr::k_unMaxTrackedDeviceCount);

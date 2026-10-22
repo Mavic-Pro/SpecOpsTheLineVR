@@ -339,6 +339,8 @@ extern std::atomic<bool> g_gestureGunMelee;
 extern std::atomic<int> g_vrMenu;
 extern std::atomic<bool> g_vrMenuOpen;
 extern std::atomic<bool> g_vdDetected;
+// Eseguibile diverso da quello Steam analizzato (copia non Steam): avviso nel visore.
+extern std::atomic<bool> g_nonSteamExe;
 extern std::atomic<bool> g_vrMenuFlipY;  // "vrmenu flipy on": asse Y del puntatore invertito (diagnostica)
 // "waitbeforesubmit on|off": attesa del compositor dopo la copia, subito prima dell'invio (pacing).
 extern std::atomic<bool> g_waitBeforeSubmit;

@@ -61,6 +61,11 @@ add_library(d3d9proxy SHARED
     src/display_spoof.h
     src/vr_input.cpp
     src/vr_session.cpp
+    src/vr_runtime.cpp
+    src/vr_runtime.h
+    src/vr_openxr.cpp
+    src/vr_openxr.h
+    src/xr_shim_ifaces.h
     src/script_call.cpp
     src/updater.cpp
     src/pure_utils.h
@@ -85,6 +90,7 @@ set_target_properties(d3d9proxy PROPERTIES
 
 target_include_directories(d3d9proxy PRIVATE
     ${CMAKE_SOURCE_DIR}/vendor/openvr/headers
+    ${CMAKE_SOURCE_DIR}/vendor/openxr/include
     ${CMAKE_BINARY_DIR}/generated
     ${CMAKE_SOURCE_DIR}/src
 )

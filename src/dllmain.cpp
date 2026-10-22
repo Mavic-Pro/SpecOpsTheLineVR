@@ -13,16 +13,19 @@
 #include "vr_input.h"
 #include "updater.h"
 #include "haptics_ext.h"
+#include "control.h"
+#include "vr_toast.h"
 
 namespace {
 
 std::atomic<bool> g_createDeviceHookInstalled = false;
 
 // La mod usa indirizzi fissi dell'eseguibile Steam analizzato (build del
-// 12/07/2012): con un altro eseguibile (altra versione, copia modificata) gli
-// agganci finirebbero nel punto sbagliato e il gioco crasherebbe. Si
-// controlla l'impronta (data di compilazione PE e dimensione dell'immagine);
-// se non corrisponde la mod non aggancia nulla e il gioco resta normale.
+// 12/07/2012). Con un altro eseguibile (copia non Steam, altra versione) gli
+// agganci possono finire nel punto sbagliato: fino alla 0.9.13 la mod restava
+// inattiva; dal 22/10 (richiesta dell'utente) aggancia comunque e mostra un
+// avviso nel visore "copia non Steam, non testata in questa versione"
+// (vr::control::g_nonSteamExe). L'impronta resta nel log.
 constexpr DWORD kSupportedTimeDateStamp = 0x50041F0C;
 constexpr DWORD kSupportedSizeOfImage = 0x012C7000;
 bool g_supportedExe = true;
@@ -42,7 +45,6 @@ bool CheckGameExecutable() {
 }
 
 void EnsureCreateDeviceHooked(IDirect3D9* d3d9) {
-    if (!g_supportedExe) return;
     bool already = g_createDeviceHookInstalled.exchange(true);
     if (already || !d3d9) return;
     vr::hooks::InstallIDirect3D9Hook(d3d9);
@@ -61,9 +63,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         vr::updater::Start();  // anche con un eseguibile non supportato: una versione nuova potrebbe supportarlo
         g_supportedExe = CheckGameExecutable();
         if (!g_supportedExe) {
-            vr::log::Line("ERROR: unsupported game version (the Steam executable of Spec Ops: The Line is required). "
-                          "The mod stays inactive and the game runs normally, without VR.");
-            return TRUE;
+            vr::control::g_nonSteamExe = true;
+            vr::log::Line("WARNING: this is not the Steam executable the mod was built against (non-Steam copy or "
+                          "other version): untested in this version, the hooks are installed anyway.");
         }
         vr::display::InstallDesktopSizeSpoof();
         vr::input::InstallXInputHooks();
@@ -80,7 +82,7 @@ IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion) {
         vr::log::Line("ERROR: real Direct3DCreate9 not available.");
         return nullptr;
     }
-    if (g_supportedExe && vr::hooks::GpuShareRequested() && vr::realdll::Direct3DCreate9Ex_Real) {
+    if (vr::hooks::GpuShareRequested() && vr::realdll::Direct3DCreate9Ex_Real) {
         IDirect3D9Ex* ex = nullptr;
         if (SUCCEEDED(vr::realdll::Direct3DCreate9Ex_Real(SDKVersion, &ex)) && ex) {
             vr::log::Line("GPUSHARE: D3D9 object created as D3D9Ex.");

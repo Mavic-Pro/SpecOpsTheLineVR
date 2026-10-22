@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 
 #include <atomic>
 #include <cmath>
@@ -53,6 +54,7 @@ std::vector<Item> BasicItems() {
         {"seated", "Seated play", "Playing sitting down: the view keeps Walker's standing eye height from where your head is when you recenter.", Kind::OnOff},
         {"hints", "Controller hints", "Short hints in the headset during the first sessions.", Kind::Choice, {"auto", "on", "off"}},
         {"vrmenu", "This menu at start", "Open this menu on the game's main menu at every start.", Kind::Choice, {"on", "off"}},
+        {"runtime", "VR runtime", "steamvr = through SteamVR; openxr = Quest Link or Virtual Desktop (VDXR) directly, no SteamVR; auto = openxr unless SteamVR is the OpenXR runtime. Restart the game.", Kind::Choice, {"steamvr", "openxr", "auto"}},
     };
 }
 
@@ -349,8 +351,8 @@ bool Render(std::vector<uint32_t>* rgba) {
 }
 
 bool EnsureOverlay() {
-    vr::IVROverlay* ov = vr::VROverlay();
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVROverlay* ov = vr::rt::Overlay();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!ov || !sys) return false;
     unsigned gen = vr::session::Generation();
     if (gen != g_overlayGen) {
@@ -375,8 +377,8 @@ bool EnsureOverlay() {
 
 // Davanti a dove guarda il giocatore (solo yaw), a 1,6 m, all'altezza degli occhi.
 void Place() {
-    vr::IVROverlay* ov = vr::VROverlay();
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVROverlay* ov = vr::rt::Overlay();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!ov || !sys || g_overlay == vr::k_ulOverlayHandleInvalid) return;
     vr::TrackedDevicePose_t pose;
     sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, &pose, 1);
@@ -399,7 +401,7 @@ void Place() {
 void Redraw() {
     std::vector<uint32_t> px;
     if (!Render(&px) || g_overlay == vr::k_ulOverlayHandleInvalid) return;
-    vr::VROverlay()->SetOverlayRaw(g_overlay, px.data(), kW, kH, 4);
+    vr::rt::Overlay()->SetOverlayRaw(g_overlay, px.data(), kW, kH, 4);
     g_dirty = false;
 }
 
@@ -444,17 +446,17 @@ void DoShow(bool show) {
         // Puntatore di SteamVR solo con il menu aperto: da chiuso l'overlay
         // tratteneva il focus dei controller e i tasti (A) non arrivavano al
         // gioco finche' non si premeva Meta (21/10).
-        vr::VROverlay()->SetOverlayInputMethod(g_overlay, vr::VROverlayInputMethod_Mouse);
-        vr::VROverlay()->SetOverlayFlag(g_overlay, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
-        vr::VROverlay()->ShowOverlay(g_overlay);
+        vr::rt::Overlay()->SetOverlayInputMethod(g_overlay, vr::VROverlayInputMethod_Mouse);
+        vr::rt::Overlay()->SetOverlayFlag(g_overlay, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
+        vr::rt::Overlay()->ShowOverlay(g_overlay);
         g_open = true;
         vr::control::g_vrMenuOpen = true;
         vr::log::Line("VRMENU: shown.");
     } else {
-        if (vr::VROverlay() && g_overlay != vr::k_ulOverlayHandleInvalid) {
-            vr::VROverlay()->SetOverlayFlag(g_overlay, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, false);
-            vr::VROverlay()->SetOverlayInputMethod(g_overlay, vr::VROverlayInputMethod_None);
-            vr::VROverlay()->HideOverlay(g_overlay);
+        if (vr::rt::Overlay() && g_overlay != vr::k_ulOverlayHandleInvalid) {
+            vr::rt::Overlay()->SetOverlayFlag(g_overlay, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, false);
+            vr::rt::Overlay()->SetOverlayInputMethod(g_overlay, vr::VROverlayInputMethod_None);
+            vr::rt::Overlay()->HideOverlay(g_overlay);
         }
         g_open = false;
         vr::control::g_vrMenuOpen = false;
@@ -491,11 +493,11 @@ void Tick(bool cinema) {
             DoShow(true);
         }
     }
-    if (!g_open || !vr::VROverlay() || g_overlay == vr::k_ulOverlayHandleInvalid) return;
+    if (!g_open || !vr::rt::Overlay() || g_overlay == vr::k_ulOverlayHandleInvalid) return;
     // Menu fuori dalla vista (testa girata di oltre 50 gradi per 0,7 s, p.es.
     // visore indossato guardando altrove): lo si rimette davanti.
     {
-        vr::IVRSystem* sys = vr::VRSystem();
+        vr::IVRSystem* sys = vr::rt::System();
         vr::TrackedDevicePose_t pose;
         if (sys) {
             sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, &pose, 1);
@@ -515,7 +517,7 @@ void Tick(bool cinema) {
         }
     }
     vr::VREvent_t ev;
-    while (vr::VROverlay()->PollNextOverlayEvent(g_overlay, &ev, sizeof(ev))) {
+    while (vr::rt::Overlay()->PollNextOverlayEvent(g_overlay, &ev, sizeof(ev))) {
         // Coordinate del mouse dell'overlay con SetOverlayMouseScale: origine
         // in basso a sinistra (verificato nel visore 21/10: senza inversione
         // nessun clic arrivava ai pulsanti); "vrmenu flipy off" per provare.

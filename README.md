@@ -68,12 +68,16 @@ virtual cinema screen.
 ## Requirements
 
 - Windows 10/11, a recent NVIDIA/AMD GPU.
-- *Spec Ops: The Line* (Steam version; the mod checks the executable and stays
-  inactive on unsupported versions).
-- SteamVR and a SteamVR headset with two motion controllers. Developed and
-  tested with a Meta Quest 3 over Link; Virtual Desktop works too. Default
-  bindings for Quest/Rift Touch, Valve Index, Vive, Vive Cosmos, HP Reverb G2
-  and Windows Mixed Reality controllers.
+- *Spec Ops: The Line*. Developed and tested on the Steam version; other
+  copies (non-Steam executables) are untested: the mod still starts and shows
+  a notice in the headset, but it may not work on them.
+- A PC VR headset with two motion controllers, through **SteamVR** (default)
+  or, with `runtime openxr` in `specopsvr.ini` or the in-headset menu,
+  through the **OpenXR runtime** active on your PC (Meta Quest Link, Virtual
+  Desktop VDXR, Pimax, SteamVR...), without SteamVR. Developed and tested
+  with a Meta Quest 3 over Link; Virtual Desktop works too. Default bindings
+  for Quest/Rift Touch, Valve Index, Vive, Vive Cosmos, HP Reverb G2, Pico and
+  Windows Mixed Reality controllers.
 
 ## Install
 
@@ -87,7 +91,11 @@ virtual cinema screen.
    `-windowed ResX=2400 ResY=2500`. Once the headset is on, the mod switches
    the game to the resolution SteamVR recommends for your headset: to change
    sharpness, use the SteamVR resolution slider.
-4. Start SteamVR, put the headset on, start the game.
+4. Start SteamVR, put the headset on, start the game. With `runtime openxr`
+   SteamVR is not needed: the game talks to the OpenXR runtime set as active
+   in the Oculus app / Virtual Desktop Streamer (restart the game after
+   changing the setting; the resolution then follows that runtime's own
+   setting instead of the SteamVR slider).
 
 The game files are never modified: the mod only adds `d3d9.dll` and
 `openvr_api.dll` next to `SpecOpsTheLine.exe`. `uninstall.bat` removes them.

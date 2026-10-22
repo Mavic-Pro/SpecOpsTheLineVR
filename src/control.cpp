@@ -1,4 +1,6 @@
 #include "control.h"
+#include "vr_runtime.h"
+#include "vr_openxr.h"
 #include "audio_diag.h"
 #include "default_ini.h"
 #include "logger.h"
@@ -118,6 +120,7 @@ std::atomic<bool> g_gestureGunMelee{false};
 std::atomic<int> g_vrMenu{1};
 std::atomic<bool> g_vrMenuOpen{false};
 std::atomic<bool> g_vdDetected{false};
+std::atomic<bool> g_nonSteamExe{false};
 std::atomic<bool> g_vrMenuFlipY{true};  // origine in basso a sinistra (verificato nel visore 21/10)
 std::atomic<bool> g_waitBeforeSubmit{true};
 std::atomic<unsigned long long> g_interactSimUntil[2]{0, 0};
@@ -343,7 +346,35 @@ bool OnOff(const std::string& cmd, const std::string& v, bool def) {
 }
 
 bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
-    if (cmd == "audiolog") {
+    if (cmd == "runtime") {
+        // runtime steamvr|openxr|auto: backend VR, letto all'avvio (vr_runtime.cpp);
+        // qui si registra solo la preferenza per il prossimo avvio.
+        std::string v;
+        in >> v;
+        for (auto& c : v) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (v == "openvr") v = "steamvr";
+        if (v == "steamvr" || v == "openxr" || v == "auto") {
+            vr::rt::Configure(v, "");
+            if (vr::rt::Active() != vr::rt::Backend::None &&
+                (v == "openxr") != (vr::rt::Active() == vr::rt::Backend::OpenXR) && v != "auto")
+                vr::log::Line("CONFIG: runtime " + v + " takes effect at the next game start (now: " +
+                              std::string(vr::rt::BackendName()) + ").");
+        } else {
+            vr::log::Line("CONFIG: runtime " + v + " not understood (steamvr, openxr or auto).");
+        }
+    } else if (cmd == "openxrjson") {
+        std::string rest;
+        std::getline(in, rest);
+        size_t a = rest.find_first_not_of(" 	");
+        rest = a == std::string::npos ? "" : rest.substr(a);
+        while (!rest.empty() && (rest.back() == ' ' || rest.back() == '	')) rest.pop_back();
+        vr::rt::Configure("", rest == "auto" || rest == "off" ? std::string() : rest);
+    } else if (cmd == "openxrgrip") {
+        std::string v;
+        in >> v;
+        if (v == "off") vr::xr::SetGripFix(false, 20.6f);
+        else vr::xr::SetGripFix(true, v.empty() || v == "on" ? 20.6f : static_cast<float>(std::atof(v.c_str())));
+    } else if (cmd == "audiolog") {
         int n = 10;
         in >> n;
         g_audioLog = n;
@@ -1347,6 +1378,16 @@ void Poll() {
     ULONGLONG now = GetTickCount64();
     if (now - lastPoll < 500) return;
     lastPoll = now;
+    // Copia non Steam: avviso nel visore all'avvio e dopo 90 s (la prima volta
+    // la sessione VR puo' non esserci ancora).
+    if (g_nonSteamExe) {
+        static int shown = 0;
+        static ULONGLONG firstPoll = now;
+        if ((shown == 0) || (shown == 1 && now - firstPoll > 90000)) {
+            ++shown;
+            vr::toast::Notify("Non-Steam copy of the game: untested in this version of the mod");
+        }
+    }
 
     std::string path = ModuleDirectory() + "\\specopsvr_cmd.txt";
     std::string contents;

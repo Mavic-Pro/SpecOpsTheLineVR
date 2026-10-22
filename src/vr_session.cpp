@@ -5,9 +5,9 @@
 #include "logger.h"
 
 #include <windows.h>
-#include <tlhelp32.h>
 #include <delayimp.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 
 #include <atomic>
 #include <string>
@@ -41,43 +41,22 @@ std::atomic<bool> g_reconnectPending{false};
 
 const char* TypeName(vr::EVRApplicationType t) { return t == vr::VRApplication_Scene ? "Scene" : "Background"; }
 
-// openvr_api.dll e' caricata a richiesta (/DELAYLOAD): se manca o e' stata
-// messa in quarantena il gioco parte lo stesso e il mod resta inattivo, invece
-// di non avviarsi affatto per un import mancante (M6). Si carica dalla
-// cartella del mod prima della prima chiamata a OpenVR.
-bool OpenVrDllAvailable() {
-    static int state = 0;  // 0 non provato, 1 ok, -1 mancante
-    if (state) return state > 0;
-    std::string path = vr::control::GameDirectory() + "\\openvr_api.dll";
-    HMODULE h = LoadLibraryA(path.c_str());
-    if (!h) h = LoadLibraryA("openvr_api.dll");
-    state = h ? 1 : -1;
-    if (!h) vr::log::Line("ERROR: openvr_api.dll not found next to d3d9.dll (error " + std::to_string(GetLastError()) +
-                          "): no VR, the game runs normally. Reinstall the mod.");
-    return h != nullptr;
-}
-
 // Da chiamare con il lock esclusivo (o prima che esistano altri utenti).
 bool InitAs(vr::EVRApplicationType type) {
-    if (!OpenVrDllAvailable()) {
-        g_ready = false;
-        g_scene = false;
-        return false;
-    }
-    vr::EVRInitError err = vr::VRInitError_None;
-    vr::VR_Init(&err, type);
-    if (err != vr::VRInitError_None) {
-        vr::log::Line(std::string("OpenVR ") + TypeName(type) + " not available (" +
-                      vr::VR_GetVRInitErrorAsEnglishDescription(err) + ").");
+    // OpenXR non ha applicazioni Background: la sessione e' sempre completa.
+    if (vr::rt::SceneOnly()) type = vr::VRApplication_Scene;
+    std::string err;
+    if (!vr::rt::Init(type, &err)) {
+        vr::log::Line(std::string(vr::rt::BackendName()) + " " + TypeName(type) + " not available (" + err + ").");
         g_ready = false;
         g_scene = false;
         return false;
     }
     g_ready = true;
     ++g_generation;
-    g_scene = (type == vr::VRApplication_Scene);
-    vr::log::Line(std::string("OpenVR initialised as ") + TypeName(type) + ".");
-    if (g_reconnectPending.exchange(false)) vr::toast::Notify("SteamVR reconnected");
+    g_scene = (type == vr::VRApplication_Scene) || vr::rt::SceneOnly();  // OpenXR: sempre sessione completa
+    vr::log::Line(std::string(vr::rt::BackendName()) + " initialised as " + TypeName(type) + ".");
+    if (g_reconnectPending.exchange(false)) vr::toast::Notify(std::string(vr::rt::BackendName()) + " reconnected");
     if (g_scene) {
         // Visore appena indossato: direzione e altezza di riferimento da qui
         // (seduti il riferimento verticale e' questa altezza; prima restava la
@@ -132,10 +111,10 @@ void ConfigureReprojection() {
     char system[64] = {}, model[128] = {}, appKey[128] = {};
     {
         Shared s;
-        if (!vr::VRSystem()) return;
-        vr::VRSystem()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String,
+        if (!vr::rt::System()) return;
+        vr::rt::System()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String,
                                                        system, sizeof(system));
-        vr::VRSystem()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_ModelNumber_String, model,
+        vr::rt::System()->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_ModelNumber_String, model,
                                                        sizeof(model));
         // Gioco avviato senza SteamVR: al primo controllo il driver del visore
         // non ha ancora pubblicato le proprieta' e "system" e' vuoto; si
@@ -143,14 +122,14 @@ void ConfigureReprojection() {
         if (!system[0]) return;
         done = true;
         vr::log::Line(std::string("VR: headset ") + model + ", tracking system " + system + ".");
-        if (vr::control::g_motionSmoothingOff && vr::VRSettings() && vr::VRApplications() &&
-            vr::VRApplications()->GetApplicationKeyByProcessId(GetCurrentProcessId(), appKey, sizeof(appKey)) ==
+        if (vr::control::g_motionSmoothingOff && vr::rt::Settings() && vr::rt::Applications() &&
+            vr::rt::Applications()->GetApplicationKeyByProcessId(GetCurrentProcessId(), appKey, sizeof(appKey)) ==
                 vr::VRApplicationError_None &&
             appKey[0]) {
             vr::EVRSettingsError e = vr::VRSettingsError_None;
-            int32_t cur = vr::VRSettings()->GetInt32(appKey, vr::k_pch_SteamVR_MotionSmoothingOverride_Int32, &e);
+            int32_t cur = vr::rt::Settings()->GetInt32(appKey, vr::k_pch_SteamVR_MotionSmoothingOverride_Int32, &e);
             if (e != vr::VRSettingsError_None || cur != 2) {
-                vr::VRSettings()->SetInt32(appKey, vr::k_pch_SteamVR_MotionSmoothingOverride_Int32, 2, &e);
+                vr::rt::Settings()->SetInt32(appKey, vr::k_pch_SteamVR_MotionSmoothingOverride_Int32, 2, &e);
                 vr::log::Line(std::string("VR: SteamVR Motion Smoothing forced off for ") + appKey +
                               (e == vr::VRSettingsError_None ? "." : " FAILED (" + std::to_string(e) + ")."));
             }
@@ -167,7 +146,7 @@ void ConfigureReprojection() {
         Shared s;
         char drv[128] = {};
         vr::EVRSettingsError e = vr::VRSettingsError_None;
-        if (vr::VRSettings()) vr::VRSettings()->GetString("LastKnown", "ActualHMDDriver", drv, sizeof(drv), &e);
+        if (vr::rt::Settings()) vr::rt::Settings()->GetString("LastKnown", "ActualHMDDriver", drv, sizeof(drv), &e);
         std::string d(e == vr::VRSettingsError_None ? drv : "");
         for (char& c : d) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
         if (d.find("virtualdesktop") != std::string::npos) vd = true;
@@ -245,7 +224,7 @@ void ConfigureReprojection() {
 void Switch(vr::EVRApplicationType type) {
     AcquireSRWLockExclusive(&g_lock);
     vr::log::Line(std::string("OpenVR: switching to ") + TypeName(type) + "...");
-    if (g_ready) vr::VR_Shutdown();
+    if (g_ready) vr::rt::Shutdown();
     g_ready = false;
     if (!InitAs(type) && type == vr::VRApplication_Scene) InitAs(vr::VRApplication_Background);
     // Visore appena indossato: "avanti" = dove si sta guardando adesso.
@@ -271,7 +250,7 @@ std::atomic<bool> g_present{false};
 // Ritorna false se la sessione va chiusa.
 bool PollEvents() {
     if (!g_ready) return true;
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!sys) return true;
     vr::VREvent_t ev;
     bool keep = true;
@@ -348,18 +327,6 @@ bool PollEvents() {
     return keep;
 }
 
-// vrserver.exe in esecuzione (per accorgersi di SteamVR morto senza evento).
-bool VrServerRunning() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return true;  // nel dubbio: vivo
-    PROCESSENTRY32W e = {sizeof(e)};
-    bool found = false;
-    for (BOOL ok = Process32FirstW(snap, &e); ok && !found; ok = Process32NextW(snap, &e))
-        found = _wcsicmp(e.szExeFile, L"vrserver.exe") == 0;
-    CloseHandle(snap);
-    return found;
-}
-
 void MonitorLoop() {
     ULONGLONG inactiveSince = 0, lastActive = 0, standbySince = 0, lastRetry = 0;
     for (;;) {
@@ -389,13 +356,13 @@ void MonitorLoop() {
             // allo stato vero (audit 20/10). Solo la dashboard visibile: su
             // Link IsInputAvailable() resta falso per tutta la partita (22/10).
             static ULONGLONG lastSync = 0;
-            if (!quit && g_scene && vr::VROverlay() && vr::VRSystem() && GetTickCount64() - lastSync > 1000) {
+            if (!quit && g_scene && vr::rt::Overlay() && vr::rt::System() && GetTickCount64() - lastSync > 1000) {
                 lastSync = GetTickCount64();
-                bool open = vr::VROverlay()->IsDashboardVisible();
+                bool open = vr::rt::Overlay()->IsDashboardVisible();
                 if (vr::control::g_vrDashboard.exchange(open) != open)
                     vr::log::Line(open ? "OpenVR: dashboard open (state resync)." : "OpenVR: dashboard closed (state resync).");
                 static bool inputWas = true;
-                bool inputNow = vr::VRSystem()->IsInputAvailable();
+                bool inputNow = vr::rt::System()->IsInputAvailable();
                 if (inputNow != inputWas) {
                     inputWas = inputNow;
                     vr::log::Line(inputNow ? "OpenVR: input available again." : "OpenVR: input not available (another app has the focus).");
@@ -410,12 +377,12 @@ void MonitorLoop() {
             ULONGLONG t = GetTickCount64();
             if (t - lastCheck > 2000) {
                 lastCheck = t;
-                if (VrServerRunning()) {
+                if (vr::rt::Alive()) {
                     serverMissingSince = 0;
                 } else {
                     if (!serverMissingSince) serverMissingSince = t;
                     if (t - serverMissingSince > 5000) {
-                        vr::log::Line("OpenVR: vrserver.exe is gone (SteamVR crashed or was closed), VR session ended.");
+                        vr::log::Line(std::string(vr::rt::BackendName()) + ": runtime gone (crashed or closed), VR session ended.");
                         serverMissingSince = 0;
                         quit = true;
                     }
@@ -424,7 +391,7 @@ void MonitorLoop() {
         }
         if (quit) {
             AcquireSRWLockExclusive(&g_lock);
-            vr::VR_Shutdown();
+            vr::rt::Shutdown();
             g_ready = false;
             g_scene = false;
             ++g_generation;
@@ -442,7 +409,7 @@ void MonitorLoop() {
         bool active = false;
         {
             Shared s;
-            vr::IVRSystem* sys = vr::VRSystem();
+            vr::IVRSystem* sys = vr::rt::System();
             if (!sys) continue;
             vr::EDeviceActivityLevel level = sys->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd);
             ULONGLONG t = GetTickCount64();

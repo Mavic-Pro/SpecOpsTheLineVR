@@ -12,6 +12,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -193,7 +194,7 @@ bool OutputDisabled() {
 bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
     float aspect = static_cast<float>(bbW) / static_cast<float>(bbH);
     vr::session::Shared vrLock(true);
-    vr::IVRSystem* sys = vrLock.ok() ? vr::VRSystem() : nullptr;
+    vr::IVRSystem* sys = vrLock.ok() ? vr::rt::System() : nullptr;
     if (!sys) return false;
     float l[2], r[2], t[2], b[2];
     float maxH = 0.0f, maxV = 0.0f;
@@ -296,10 +297,19 @@ bool UpdateFovAndBounds(UINT bbW, UINT bbH) {
 }
 
 bool InitD3D11() {
+    // Backend OpenXR: il device l'ha gia' creato lui sulla scheda del visore
+    // (la sessione OpenXR e' legata a quel device): si condivide.
+    if (ID3D11Device* shared = vr::rt::SharedD3D11()) {
+        shared->AddRef();
+        g_d3d11 = shared;
+        g_d3d11->GetImmediateContext(&g_d3d11Ctx);
+        vr::log::Line("VR-OUTPUT: using the OpenXR backend's D3D11 device.");
+        return true;
+    }
     int32_t adapterIndex = 0;
     {
         vr::session::Shared vrLock;
-        vr::IVRSystem* sys = vr::VRSystem();
+        vr::IVRSystem* sys = vr::rt::System();
         if (sys) sys->GetDXGIOutputInfo(&adapterIndex);
     }
     IDXGIFactory1* factory = nullptr;
@@ -476,8 +486,8 @@ vr::VROverlayHandle_t g_cursorOverlay = vr::k_ulOverlayHandleInvalid;
 bool g_cursorVisible = false;
 vr::HmdMatrix34_t g_cinemaXform = {};
 void HideLaserCursor() {
-    if (g_cursorVisible && vr::VROverlay() && g_cursorOverlay != vr::k_ulOverlayHandleInvalid)
-        vr::VROverlay()->HideOverlay(g_cursorOverlay);
+    if (g_cursorVisible && vr::rt::Overlay() && g_cursorOverlay != vr::k_ulOverlayHandleInvalid)
+        vr::rt::Overlay()->HideOverlay(g_cursorOverlay);
     g_cursorVisible = false;
 }
 void ShowLaserCursor(vr::IVROverlay* ov, const vr::HmdVector3_t& point) {
@@ -517,7 +527,7 @@ void CinemaLaserTick(bool cinema) {
         HideLaserCursor();
         return;
     }
-    vr::IVROverlay* ov = vr::VROverlay();
+    vr::IVROverlay* ov = vr::rt::Overlay();
     HWND h = vr::display::GameWindow();
     if (!ov || !h) return;
     float m[12];
@@ -586,8 +596,8 @@ void CinemaLaserTick(bool cinema) {
 // all'inizio della scena (solo yaw), all'altezza degli occhi, fisso nella
 // stanza. L'overlay e' un quadrato nel piano XY visibile da +Z.
 void ShowCinemaOverlay() {
-    vr::IVROverlay* ov = vr::VROverlay();
-    vr::IVRSystem* sys = vr::VRSystem();
+    vr::IVROverlay* ov = vr::rt::Overlay();
+    vr::IVRSystem* sys = vr::rt::System();
     if (!ov || !sys) return;
     if (g_cinemaOverlay == vr::k_ulOverlayHandleInvalid) {
         vr::EVROverlayError err = ov->CreateOverlay("specopsvr.cinema", "SpecOpsVR schermo", &g_cinemaOverlay);
@@ -645,7 +655,7 @@ void DetectContentRows(const uint8_t* bits, UINT pitch, UINT w, UINT h, UINT* to
 
 void HideCinemaOverlay() {
     if (!g_cinemaShown) return;
-    if (vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->HideOverlay(g_cinemaOverlay);
+    if (vr::rt::Overlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) vr::rt::Overlay()->HideOverlay(g_cinemaOverlay);
     HideLaserCursor();
     g_cinemaShown = false;
     vr::log::Line("CINEMA: virtual screen hidden.");
@@ -851,7 +861,7 @@ void WorkerLoop() {
         }
         if (g_workerStop) break;
         vr::session::Shared vrLock;
-        vr::IVRCompositor* compositor = vr::session::IsScene() ? vr::VRCompositor() : nullptr;
+        vr::IVRCompositor* compositor = vr::session::IsScene() ? vr::rt::Compositor() : nullptr;
         if (!compositor || (g_disabled && GetTickCount64() < g_disabledUntil)) {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_frameReady = false;  // niente compositor (Background): coppia scartata
@@ -942,9 +952,9 @@ void WorkerLoop() {
                 DetectContentRows(pk[0].bits, pk[0].pitch, pk[0].w, pk[0].h, &top, &bottom);
                 fed = true;
             }
-            if (fed && vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid && g_cinemaSbs != sbs) {
+            if (fed && vr::rt::Overlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid && g_cinemaSbs != sbs) {
                 g_cinemaSbs = sbs;
-                vr::VROverlay()->SetOverlayFlag(g_cinemaOverlay, vr::VROverlayFlags_SideBySide_Parallel, sbs);
+                vr::rt::Overlay()->SetOverlayFlag(g_cinemaOverlay, vr::VROverlayFlags_SideBySide_Parallel, sbs);
                 vr::log::Line(sbs ? "CINEMA: stereo screen (side by side)." : "CINEMA: flat screen.");
             }
             if (fed) {
@@ -1067,14 +1077,14 @@ void WorkerLoop() {
             // Ricentramento durante lo schermo virtuale: lo schermo si rimette
             // davanti (prima restava dov'era stato aperto).
             if (!g_cinemaShown || vr::control::g_cinemaRecenter.exchange(false)) ShowCinemaOverlay();
-            if (vr::VROverlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) {
+            if (vr::rt::Overlay() && g_cinemaOverlay != vr::k_ulOverlayHandleInvalid) {
                 vr::Texture_t ot = {g_cinemaTex, vr::TextureType_DirectX, vr::ColorSpace_Gamma};
-                vr::VROverlay()->SetOverlayTexture(g_cinemaOverlay, &ot);
+                vr::rt::Overlay()->SetOverlayTexture(g_cinemaOverlay, &ot);
                 // Solo l'area con contenuto: 16:9 nelle cinematiche, intera nei menu.
                 if (cinemaBottom > cinemaTop + 16) {
                     vr::VRTextureBounds_t ob = {0.0f, float(cinemaTop) / g_cinemaTexH, 1.0f,
                                                 float(cinemaBottom) / g_cinemaTexH};
-                    vr::VROverlay()->SetOverlayTextureBounds(g_cinemaOverlay, &ob);
+                    vr::rt::Overlay()->SetOverlayTextureBounds(g_cinemaOverlay, &ob);
                 }
             }
         } else if (!cinema) {
@@ -1162,20 +1172,9 @@ void WorkerLoop() {
         // trasmissione). Media mobile per "predict auto": ogni PC e visore ha
         // il suo valore.
         if (!cinema && pk[0].sampleMs > 0.0) {
-            vr::IVRSystem* sys = vr::VRSystem();
-            static float hz = 0.0f, vsyncToPhotons = 0.0f;
-            static int propsAge = 0;
-            if (sys && (propsAge++ % 600 == 0 || hz < 30.0f)) {
-                hz = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
-                vsyncToPhotons = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd,
-                                                                    vr::Prop_SecondsFromVsyncToPhotons_Float);
-            }
-            float sinceVsync = 0.0f;
-            uint64_t counter = 0;
-            if (sys && hz > 30.0f && sys->GetTimeSinceLastVsync(&sinceVsync, &counter)) {
-                float frame = 1.0f / hz;
-                sinceVsync = std::fmod(sinceVsync < 0.0f ? 0.0f : sinceVsync, frame);
-                double total = (QpcMs() - pk[0].sampleMs) + 1000.0 * (frame - sinceVsync + vsyncToPhotons);
+            float photons = vr::rt::SecondsToPhotons();
+            if (photons > 0.0f) {
+                double total = (QpcMs() - pk[0].sampleMs) + 1000.0 * photons;
                 if (total > 0.0 && total < 200.0) {
                     float old = g_photonLatencyMs.load();
                     g_photonLatencyMs = old <= 0.0f ? static_cast<float>(total) : old + (static_cast<float>(total) - old) * 0.02f;
@@ -1353,7 +1352,7 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         vr::session::Shared vrLock(true);
         if (!vrLock.ok()) return;  // OpenVR in riapertura: frame solo sul monitor
         vr::EDeviceActivityLevel level =
-            vr::VRSystem() ? vr::VRSystem()->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd)
+            vr::rt::System() ? vr::rt::System()->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd)
                            : vr::k_EDeviceActivityLevel_Unknown;
         bool active = vr::session::HmdPresent();
         static int lastLevel = -99;

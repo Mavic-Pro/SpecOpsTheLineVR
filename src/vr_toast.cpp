@@ -5,6 +5,7 @@
 
 #include <windows.h>
 #include <openvr.h>
+#include "vr_runtime.h"
 
 #include <deque>
 #include <mutex>
@@ -76,7 +77,7 @@ bool RenderText(const std::string& text, std::vector<uint32_t>* rgba) {
 }
 
 bool Show(const std::string& text) {
-    vr::IVROverlay* ov = vr::VROverlay();
+    vr::IVROverlay* ov = vr::rt::Overlay();
     if (!ov) return false;
     unsigned gen = vr::session::Generation();
     if (gen != g_overlayGen) {  // nuova connessione a SteamVR: handle vecchio non valido
@@ -159,7 +160,7 @@ void Tick() {
     if (!session.ok() || !vr::session::Ready()) return;
     ULONGLONG now = GetTickCount64();
     if (g_visible && now >= g_shownUntil) {
-        if (vr::VROverlay() && g_overlay != vr::k_ulOverlayHandleInvalid) vr::VROverlay()->HideOverlay(g_overlay);
+        if (vr::rt::Overlay() && g_overlay != vr::k_ulOverlayHandleInvalid) vr::rt::Overlay()->HideOverlay(g_overlay);
         g_visible = false;
     }
     if (g_visible) return;
