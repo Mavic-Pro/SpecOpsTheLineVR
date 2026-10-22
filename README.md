@@ -18,6 +18,9 @@ virtual cinema screen.
   Walker walks with you. Your real height sets the eye height (seated mode
   available). The game's recoil, camera shakes and crouching never move your
   view; cuts, checkpoints and death fade from black.
+- **Audio in the headset**: the game's sound follows the Windows default
+  playback device, so it reaches the headset even when Virtual Desktop or
+  Link starts streaming after the game is already running.
 - **Wrist HUD and laser**: ammo, weapon and health on your support-hand
   wrist like a watch (`wristhud`); on the virtual screen the gun controller
   is a laser pointer for the game's menus, trigger to click (`cinemalaser`).

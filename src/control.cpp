@@ -921,8 +921,18 @@ void ExecuteNormalized(const std::string& line) {
         g_squadPickRequest = v;
         g_squadValidateLog = 120;
     } else if (cmd == "audioroute") {
-        // audioroute test: prova dell'instradamento audio per app (diagnostica)
-        vr::audio::RouteTest();
+        // audioroute where: su quale dispositivo sta la sessione audio del gioco (diagnostica);
+        // audioroute reopen [driver]: riapre l'uscita FMOD (0 = predefinito di Windows)
+        std::string what;
+        in >> what;
+        if (what == "reopen") {
+            int driver = 0;
+            in >> driver;
+            vr::audio::RequestReopen(driver);
+        } else {
+            vr::log::Line("AUDIO: game audio session on " + vr::audio::GameAudioDevices() + "; Windows default: " +
+                          vr::audio::DefaultDeviceName() + ".");
+        }
     } else if (cmd == "cuprel") {
         // cuprel <x> <y> <z>: presa avvolgente delle pistole, taratura (unita' nel riferimento della mano destra)
         float x = 0, y = 0, z = 0;

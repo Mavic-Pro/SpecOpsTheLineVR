@@ -853,17 +853,33 @@ H/M/L/R-*), each item verified in isolation (A/B tests in the scratchpad,
   engine's `CalcComponentToFrameMatrix` (0x00583610) and bone quaternions
   do not survive a reflection (IK controls simply stop acting; Ghidra, vtable
   slot 84 = `USkelControlLimb::CalculateNewBoneTransforms` 0x00CE6EA0).
-- **Audio on the PC speakers (22/10):** FMOD opens the Windows default
-  playback device at start and never follows it; Virtual Desktop makes its
-  own device the default only when the stream starts, so a game launched
-  before that (from the desktop, for tests) played on the PC ("Realtek
-  Digital Output" in the log at start, no audio in the headset). The mod
-  polls the default every 2 s and, when it changes, moves the game process
-  to the new device with the per-app routing of Windows
-  (`Windows.Media.Internal.AudioPolicyConfig`, the API behind Settings >
-  Sound > app preferences, used by EarTrumpet; IIDs for 1803+ and 21H2+);
-  the preference is removed at exit or when the default goes back.
-  `audioroute test` tries the API on the current default.
+- **Audio on the PC speakers (22/10):** the game's FMOD Ex 4.32 opens the
+  Windows default playback device at start (WASAPI, output type 8, on an
+  explicit endpoint) and never follows it; Virtual Desktop makes its own
+  device the default only when the stream starts, so a game launched before
+  that played on the PC ("Realtek Digital Output" in the log at start, no
+  audio in the headset). Neither the per-app routing of Windows
+  (`AudioPolicyConfig`, tried first) nor a default-device change moves such
+  a stream (headless test with `IPolicyConfig::SetDefaultEndpoint`: the
+  game's session stayed on the start device). FMOD can reopen its output
+  after init (`System::setDriver`, Ghidra on fmodex.dll: stop, close,
+  re-enumerate, init on the driver, driver 0 = the current default) but
+  refuses the new device when the mix format differs from the one at init
+  (result 0x3e: Realtek 7.1 = 8 channels, Virtual Desktop / Oculus = 2).
+  `src/audio_diag.cpp` therefore hooks the process-wide `IAudioClient`
+  vtable (`GetMixFormat`, `IsFormatSupported`, `Initialize`): while FMOD
+  runs `System::init` (hooked export) or `setDriver` the client reports a
+  fixed 48 kHz float stereo format and the stream is opened with
+  `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, so Windows
+  converts to any device and every reopen succeeds. An
+  `IMMNotificationClient` (own MTA thread) turns a default-device change
+  into a reopen request executed on the game thread inside the FMOD
+  listener hook (`EventSystem::getSystemObject` + `setDriver(0)`). Headless
+  check: the game's active audio session follows Realtek -> HDMI -> Realtek
+  -> Oculus headphones. Diagnostics: `audioroute where` (device with the
+  game's active session, from `IAudioSessionManager2`), `audioroute reopen
+  [driver]`. The game therefore always mixes in stereo (what the headset
+  plays).
 - **Two-handed aim (22/10):** with a pistol the hands are 3-6 cm apart, the
   controller-to-controller line is not a barrel (1 cm of shake = 15
   degrees): the grip only poses the support hand and lowers the spread, the
@@ -1175,12 +1191,15 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
   `configversion 7` removes their lines (and comments) from older inis.
 - `armdebug`, `armbones`, `firelog on`, `inputlog N`, `gesturelog N`,
   `dumpcam`, `shot <name>`, `vischeck on` (enemies in front of the view but
-  not drawn, every 0.5 s), `gesturesim melee|throw|reload|reloadlost|duck|weapon`
-  - diagnostics in the log.
+  not drawn, every 0.5 s), `gesturesim melee|throw|reload|reloadlost|duck|weapon`,
+  `audioroute where|reopen [driver]` (device of the game's audio session /
+  reopen FMOD's output) - diagnostics in the log.
 
 ## Test tools (`tools/`)
 
 - `gamectl.py` - launch/close the game, send commands, screenshots.
+- `mirrorrec.py start|stop` - records what the headset shows over Meta Link
+  (OculusMirror captured by ffmpeg into an mp4).
 - `levelsweep.py` - loads every campaign level and checks the VR state.
 - `deepsweep.py` - jumps through every checkpoint of every level.
 - `loadouttest.py` / `weapontest.py` - fire the weapons and measure the shot

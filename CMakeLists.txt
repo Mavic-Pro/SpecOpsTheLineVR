@@ -91,7 +91,7 @@ target_include_directories(d3d9proxy PRIVATE
 add_dependencies(d3d9proxy protube_bridge)
 set_source_files_properties(${CMAKE_BINARY_DIR}/generated/resources.rc PROPERTIES OBJECT_DEPENDS "${PROTUBE_BRIDGE_EXE}")
 
-target_link_libraries(d3d9proxy PRIVATE minhook d3d11 dxgi winhttp bcrypt delayimp ole32 runtimeobject
+target_link_libraries(d3d9proxy PRIVATE minhook d3d11 dxgi winhttp bcrypt delayimp ole32
     ${CMAKE_SOURCE_DIR}/vendor/openvr/lib/win32/openvr_api.lib)
 # openvr_api.dll caricata alla prima chiamata (vr_session.cpp la cerca accanto
 # al mod): se manca, il gioco parte senza VR invece di non avviarsi.

@@ -3846,6 +3846,9 @@ constexpr uintptr_t kIatFmodSetListener = 0x01109878;
 
 int __stdcall Hooked_SetListener(void* self, int listener, const FmodVec* pos, const FmodVec* vel, const FmodVec* fwd,
                                  const FmodVec* up) {
+    // Dispositivo predefinito cambiato: l'uscita FMOD si riapre qui, sul
+    // thread del gioco, con il suo EventSystem.
+    if (vr::audio::ReopenPending()) vr::audio::ReopenOutput(self);
     if (vr::control::g_audioLog > 0 && pos && fwd && up) {
         static ULONGLONG last = 0;
         if (GetTickCount64() - last > 2000) {
@@ -9366,6 +9369,9 @@ bool InstallIDirect3D9Hook(IDirect3D9* realD3D9) {
         vr::log::Line("ERROR: MH_Initialize failed.");
         return false;
     }
+    // Prima che il motore inizializzi FMOD (dopo il D3D): l'audio del gioco
+    // segue il predefinito di Windows.
+    vr::audio::InstallAudioHooks();
 
     void* createDeviceTarget = VTableEntry(realD3D9, kIDirect3D9_CreateDevice);
 
