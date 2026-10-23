@@ -1259,6 +1259,11 @@ ones listed in the script are implemented by hand, the rest return defaults).
   the backend from the controller ray (right hand first): `MouseMove` in GL
   coordinates (bottom-left origin, like SteamVR), trigger = button, stick up/
   down = `ScrollDiscrete`; a 2 cm dot (internal overlay) marks the hit point.
+  The ray comes from the runtime's `aim/pose` (the pointing pose SteamVR's own
+  laser uses; the grip/raw pose made players hold the controller flat, 23/10)
+  and a 4 mm beam quad (internal overlay, turned toward the head) is drawn
+  from the controller to the hit point, or 1 m ahead of the last pointing
+  hand while a menu is open but not hit.
   `ComputeOverlayIntersection` is the same ray/plane test (cinema laser).
 - **Input**: one action set with per-hand stick/trigger/grip/primary/
   secondary/stickclick/menu/haptic/grip-pose actions and suggested bindings

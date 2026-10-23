@@ -264,9 +264,9 @@ void Load(XrInstance inst, const char* name, T* out) {
 
 constexpr vr::TrackedDeviceIndex_t kHmd = 0, kLeft = 1, kRight = 2;
 constexpr int kActStick = 0, kActTrigger = 1, kActGrip = 2, kActPrimary = 3, kActSecondary = 4, kActStickClick = 5,
-              kActMenu = 6, kActDpadL = 7, kActDpadR = 8, kActHaptic = 9, kActPose = 10, kActCount = 11;
+              kActMenu = 6, kActDpadL = 7, kActDpadR = 8, kActHaptic = 9, kActPose = 10, kActAim = 11, kActCount = 12;
 const char* const kActNames[kActCount] = {"stick", "trigger", "grip", "primary", "secondary", "stickclick", "menu",
-                                          "dpadleft", "dpadright", "haptic", "pose"};
+                                          "dpadleft", "dpadright", "haptic", "pose", "aim"};
 
 struct Swap {
     XrSwapchain sc = XR_NULL_HANDLE;
@@ -298,7 +298,8 @@ struct OverlayItem {
     ID3D11Texture2D* tex = nullptr;
     bool dirty = false;
     Swap swap;
-    bool internal = false;  // puntino del laser
+    bool internal = false;  // puntino e raggio del laser
+    float beamLen = 0.0f;   // raggio: altezza del quad in metri (non dalle proporzioni della texture)
     // Puntatore.
     bool hovered = false;
     float lastU = -1.0f, lastV = -1.0f;
@@ -329,7 +330,7 @@ struct State {
     std::string runtimeName, systemName;
     char runtimeVersion[64] = {};
     bool extPerfCounter = false, extVisMask = false, extRefreshRate = false, extPresence = false;
-    XrSpace stage = XR_NULL_HANDLE, view = XR_NULL_HANDLE, handSpace[2] = {};
+    XrSpace stage = XR_NULL_HANDLE, view = XR_NULL_HANDLE, handSpace[2] = {}, aimSpace[2] = {};
     XrReferenceSpaceType stageType = XR_REFERENCE_SPACE_TYPE_STAGE;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
@@ -366,7 +367,7 @@ struct State {
     // OverlayItem.
     std::map<vr::VROverlayHandle_t, OverlayItem> overlays;
     vr::VROverlayHandle_t nextOverlay = 1;
-    vr::VROverlayHandle_t cursor = 0;  // puntino del laser (overlay interno)
+    vr::VROverlayHandle_t cursor = 0, beam = 0;  // puntino e raggio del laser (overlay interni)
     // Dissolvenze.
     float fadeFrom = 0.0f, fadeTo = 0.0f, fadeAlpha = 0.0f;
     double fadeStartMs = 0.0, fadeDurMs = 0.0;
@@ -384,6 +385,7 @@ struct State {
     float gripPitch = 20.6f;
     bool gripFixDirty = false;
     // Puntatore.
+    int pointerHand = 1;  // ultima mano che ha colpito un menu (raggio senza bersaglio)
     bool triggerWas[2] = {};
     int scrollLatch[2] = {};
     double scrollRepeatMs[2] = {};
@@ -439,6 +441,11 @@ bool CreateHandSpaces() {
         ci.subactionPath = g.handPath[h];
         ci.poseInActionSpace = g.gripFix ? ToPose(GripToRaw(h)) : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
         if (!Check(fn.xrCreateActionSpace(g.session, &ci, &g.handSpace[h]), "xrCreateActionSpace")) return false;
+        if (!g.aimSpace[h]) {
+            ci.action = g.action[h][kActAim];
+            ci.poseInActionSpace = XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
+            Check(fn.xrCreateActionSpace(g.session, &ci, &g.aimSpace[h]), "xrCreateActionSpace (aim)");
+        }
     }
     g.gripFixDirty = false;
     return true;
@@ -512,7 +519,7 @@ bool CreateActions() {
         XR_ACTION_TYPE_VECTOR2F_INPUT, XR_ACTION_TYPE_FLOAT_INPUT,   XR_ACTION_TYPE_FLOAT_INPUT,
         XR_ACTION_TYPE_BOOLEAN_INPUT,  XR_ACTION_TYPE_BOOLEAN_INPUT, XR_ACTION_TYPE_BOOLEAN_INPUT,
         XR_ACTION_TYPE_BOOLEAN_INPUT,  XR_ACTION_TYPE_BOOLEAN_INPUT, XR_ACTION_TYPE_BOOLEAN_INPUT,
-        XR_ACTION_TYPE_VIBRATION_OUTPUT, XR_ACTION_TYPE_POSE_INPUT};
+        XR_ACTION_TYPE_VIBRATION_OUTPUT, XR_ACTION_TYPE_POSE_INPUT, XR_ACTION_TYPE_POSE_INPUT};
     for (int h = 0; h < 2; ++h)
         for (int a = 0; a < kActCount; ++a) {
             XrActionCreateInfo ci = {XR_TYPE_ACTION_CREATE_INFO};
@@ -543,6 +550,7 @@ bool CreateActions() {
             add(h, kActMenu, h ? p.menuR : p.menuL);
             add(h, kActHaptic, "output/haptic");
             add(h, kActPose, "input/grip/pose");
+            add(h, kActAim, "input/aim/pose");  // raggio di puntamento (come il laser di SteamVR)
         }
         XrInteractionProfileSuggestedBinding sb = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         sb.interactionProfile = Path(p.path);
@@ -952,6 +960,21 @@ bool LocateHand(int h, XrTime t, Mat34* out) {
     return true;
 }
 
+// Raggio di puntamento: posa aim del runtime (la stessa direzione del laser di
+// SteamVR); senza, la posa della mano (-Z del raw, va tenuta piu' bassa).
+bool LocateAim(int h, XrTime t, Mat34* out) {
+    if (g.aimSpace[h] && g.running) {
+        XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+        if (XR_SUCCEEDED(fn.xrLocateSpace(g.aimSpace[h], g.stage, t, &loc)) &&
+            (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+            (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+            *out = FromPose(loc.pose);
+            return true;
+        }
+    }
+    return LocateHand(h, t, out);
+}
+
 bool LocateHmd(XrTime t, Mat34* out) {
     if (!g.view || !g.running) return false;
     XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
@@ -974,6 +997,7 @@ bool OverlayInStage(const OverlayItem& o, XrTime t, Mat34* out) {
 }
 
 float OverlayHeight(const OverlayItem& o) {
+    if (o.beamLen > 0.0f) return o.beamLen;
     float tw = o.tex ? static_cast<float>(o.swap.w) : static_cast<float>(o.pixW);
     float th = o.tex ? static_cast<float>(o.swap.h) : static_cast<float>(o.pixH);
     float bw = (o.bounds.uMax - o.bounds.uMin), bh = (o.bounds.vMax - o.bounds.vMin);
@@ -1026,8 +1050,71 @@ OverlayItem* EnsureCursor() {
     return &g.overlays[o.handle];
 }
 
+// Raggio del laser: striscia sottile (16x64 RGBA) con nucleo chiaro e bordi
+// sfumati, allungata dal controller al punto colpito.
+OverlayItem* EnsureBeam() {
+    if (g.beam && g.overlays.count(g.beam)) return &g.overlays[g.beam];
+    OverlayItem o;
+    o.handle = g.nextOverlay++;
+    o.key = "specopsvr.xr.beam";
+    o.internal = true;
+    o.width = 0.004f;
+    o.sortOrder = 9998;
+    o.pixW = 16;
+    o.pixH = 64;
+    o.pixels.assign(16 * 64 * 4, 0);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 16; ++x) {
+            float d = std::fabs(x - 7.5f) / 8.0f;  // 0 al centro, 1 al bordo
+            uint8_t* p = &o.pixels[(y * 16 + x) * 4];
+            p[0] = static_cast<uint8_t>(0x60 + 0x9F * (1.0f - d));  // azzurro, bianco al centro
+            p[1] = static_cast<uint8_t>(0xB0 + 0x4F * (1.0f - d));
+            p[2] = 0xFF;
+            p[3] = static_cast<uint8_t>(230.0f * (1.0f - d * d));
+        }
+    o.dirty = true;
+    g.beam = o.handle;
+    g.overlays[o.handle] = o;
+    return &g.overlays[o.handle];
+}
+
+// Posa il raggio da org lungo dir per len metri, girato verso la testa.
+void PlaceBeam(OverlayItem* b, const float* org, const float* dir, float len, XrTime t) {
+    float y[3] = {dir[0], dir[1], dir[2]};
+    float c[3] = {org[0] + dir[0] * len * 0.5f, org[1] + dir[1] * len * 0.5f, org[2] + dir[2] * len * 0.5f};
+    float z[3] = {0.0f, 1.0f, 0.0f};
+    Mat34 hm;
+    if (LocateHmd(t, &hm)) {
+        z[0] = hm.m[0][3] - c[0];
+        z[1] = hm.m[1][3] - c[1];
+        z[2] = hm.m[2][3] - c[2];
+    }
+    float k = z[0] * y[0] + z[1] * y[1] + z[2] * y[2];
+    for (int i = 0; i < 3; ++i) z[i] -= k * y[i];
+    float zl = std::sqrt(z[0] * z[0] + z[1] * z[1] + z[2] * z[2]);
+    if (zl < 1e-4f) {  // testa sull'asse del raggio: una perpendicolare qualsiasi
+        z[0] = -y[1]; z[1] = y[0]; z[2] = 0.0f;
+        zl = std::sqrt(z[0] * z[0] + z[1] * z[1]);
+        if (zl < 1e-4f) { z[0] = 1.0f; z[1] = z[2] = 0.0f; zl = 1.0f; }
+    }
+    for (float& v : z) v /= zl;
+    float x[3] = {y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2], y[0] * z[1] - y[1] * z[0]};
+    Mat34& m = b->xform;
+    for (int i = 0; i < 3; ++i) {
+        m.m[i][0] = x[i];
+        m.m[i][1] = y[i];
+        m.m[i][2] = z[i];
+        m.m[i][3] = c[i];
+    }
+    b->attach = Attach::Absolute;
+    b->bounds = {0, 0, 1, 1};
+    b->visible = len > 0.01f;
+    b->beamLen = len;
+}
+
 // Puntatore laser sugli overlay interattivi (menu del mod): eventi mouse come
-// SteamVR, dal controller che li colpisce (destro per primo).
+// SteamVR, dal controller che li colpisce (destro per primo). Raggio dalla
+// posa aim (come SteamVR), visibile verso il menu o 1 m in avanti.
 void UpdatePointer(XrTime t) {
     std::vector<OverlayItem*> targets;
     for (auto& kv : g.overlays)
@@ -1035,8 +1122,10 @@ void UpdatePointer(XrTime t) {
             (kv.second.flags & vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible))
             targets.push_back(&kv.second);
     OverlayItem* cursor = g.cursor ? &g.overlays[g.cursor] : nullptr;
+    OverlayItem* beam = g.beam ? &g.overlays[g.beam] : nullptr;
     if (targets.empty()) {
         if (cursor) cursor->visible = false;
+        if (beam) beam->visible = false;
         for (auto& kv : g.overlays) kv.second.hovered = false;
         return;
     }
@@ -1045,10 +1134,15 @@ void UpdatePointer(XrTime t) {
     float hu = 0, hv = 0, hp[3] = {}, hd = 0;
     Mat34 hitM = {};
     int hitHand = -1;
+    float rayOrg[2][3] = {}, rayDir[2][3] = {};
+    bool rayOk[2] = {false, false};
     for (int h : {1, 0}) {
         Mat34 hm;
-        if (!g.hand[h].poseActive || !LocateHand(h, t, &hm)) continue;
+        if (!g.hand[h].poseActive || !LocateAim(h, t, &hm)) continue;
         float org[3] = {hm.m[0][3], hm.m[1][3], hm.m[2][3]}, dir[3] = {-hm.m[0][2], -hm.m[1][2], -hm.m[2][2]};
+        std::memcpy(rayOrg[h], org, sizeof(org));
+        std::memcpy(rayDir[h], dir, sizeof(dir));
+        rayOk[h] = true;
         for (OverlayItem* o : targets) {
             Mat34 om;
             float u, v, d, p[3];
@@ -1070,9 +1164,15 @@ void UpdatePointer(XrTime t) {
     }
     if (!hit) {
         if (cursor) cursor->visible = false;
+        // Raggio corto dall'ultima mano usata, per trovare il menu.
+        int bh = rayOk[g.pointerHand] ? g.pointerHand : (rayOk[1] ? 1 : (rayOk[0] ? 0 : -1));
+        if (bh >= 0) PlaceBeam(EnsureBeam(), rayOrg[bh], rayDir[bh], 1.0f, t);
+        else if (beam) beam->visible = false;
         for (int h = 0; h < 2; ++h) g.triggerWas[h] = g.hand[h].trigger > 0.5f;
         return;
     }
+    g.pointerHand = hitHand;
+    PlaceBeam(EnsureBeam(), rayOrg[hitHand], rayDir[hitHand], hd, t);
     float mx = hu * hit->mouseScale.v[0], my = hv * hit->mouseScale.v[1];
     auto push = [&](uint32_t type, float dy) {
         vr::VREvent_t ev = {};
@@ -1114,7 +1214,6 @@ void UpdatePointer(XrTime t) {
     for (int i = 0; i < 3; ++i) c->xform.m[i][3] = hp[i] + hitM.m[i][2] * 0.01f;
     c->attach = Attach::Absolute;
     c->visible = true;
-    (void)hd;
 }
 
 float FadeAlphaNow() {
@@ -1473,7 +1572,7 @@ void DestroyAll() {
         if (kv.second.tex) kv.second.tex->Release();
     }
     g.overlays.clear();
-    g.cursor = 0;
+    g.cursor = g.beam = 0;
     DestroySwap(g.eye[0]);
     DestroySwap(g.eye[1]);
     DestroySwap(g.fadeSwap);
@@ -1482,7 +1581,8 @@ void DestroyAll() {
     g.submit[0] = g.submit[1] = State::EyeSubmit();
     for (int h = 0; h < 2; ++h) {
         if (g.handSpace[h]) fn.xrDestroySpace(g.handSpace[h]);
-        g.handSpace[h] = XR_NULL_HANDLE;
+        if (g.aimSpace[h]) fn.xrDestroySpace(g.aimSpace[h]);
+        g.handSpace[h] = g.aimSpace[h] = XR_NULL_HANDLE;
         g.hand[h] = HandState();
     }
     if (g.stage) fn.xrDestroySpace(g.stage);
