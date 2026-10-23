@@ -6132,9 +6132,15 @@ float GameCrouchDrop(void* pawn) {
 constexpr uintptr_t kOffPawnAnimtreeManager = 0xB30;  // YGamePawn.m_animtreeManager
 constexpr uintptr_t kOffAtmCurrentPosture = 0x98;      // YAnimtreeManager.m_currentPosture (YE_PostureID)
 constexpr uint8_t kPostureStand = 1, kPostureCrouch = 2;
-// Quanto la postura del gioco ha gia' abbassato la testa di Walker (unita'):
-// la mesh scende solo per la parte di accucciata vera che resta.
-std::atomic<float> g_crouchPoseDrop{0.0f};
+// Testa di Walker nello spazio della mesh (unita' sopra l'origine della mesh,
+// -1000 = non letta) e postura attuale: per tenere gli occhi fuori dal corpo
+// (UpdateFirstPersonBody).
+std::atomic<float> g_meshHeadUp{-1000.0f};
+std::atomic<int> g_walkerPosture{0};
+// Quanto la postura accucciata ha portato avanti la testa (unita', ~14): il
+// corpo arretra di altrettanto, se no il collo (testa nascosta) finiva davanti
+// agli occhi e si vedeva il corpo decapitato (utente 23/10).
+std::atomic<float> g_crouchPoseFwd{0.0f};
 
 bool PlayPosture(void* atm, uint8_t posture) {
     struct {
@@ -6148,55 +6154,74 @@ bool PlayPosture(void* atm, uint8_t posture) {
     return vr::script::CallFunction(atm, "PlayPosture", &parms) && parms.ret;
 }
 
-// Altezza della testa di Walker nello spazio della mesh (asse su = -Y): non
-// dipende dallo spostamento della mesh fatto qui sotto, niente retroazione.
-bool MeshHeadHeight(void* mesh, float* h) {
+// Testa di Walker nello spazio della mesh (X = avanti dell'attore, -Y = su,
+// Z = destra): non dipende dallo spostamento della mesh fatto qui sotto,
+// niente retroazione.
+bool MeshHeadPos(void* mesh, float* fwd, float* up) {
     struct {
         int32_t name[2];
         int32_t space;
         float ret[3];
     } hp = {{vr::script::NameIndex("head"), 0}, 1, {0, 0, 0}};
     if (hp.name[0] < 0 || !vr::script::CallFunction(mesh, "GetBoneLocation", &hp)) return false;
-    *h = -hp.ret[1];
+    *fwd = hp.ret[0];
+    *up = -hp.ret[1];
     return true;
 }
 
 void UpdatePhysicalCrouch(void* pawn) {
     static void* ownPawn = nullptr;
     static bool byUs = false, gameRecrouched = false;
-    static double lastReq = 0.0, lastCrouchT = 0.0, stoodUpT = 0.0;
-    static float standHead = 0.0f;
-    g_crouchPoseDrop = 0.0f;
+    static double lastReq = 0.0, lastCrouchT = 0.0, stoodUpT = 0.0, lastT = 0.0;
+    static float standFwd = 0.0f, fwdApplied = 0.0f;
+    static bool haveStandFwd = false;
+    g_meshHeadUp = -1000.0f;
+    g_walkerPosture = 0;
     if (!pawn || !PawnAlive(pawn)) {
         ownPawn = nullptr;
+        g_crouchPoseFwd = fwdApplied = 0.0f;
         return;
     }
     if (pawn != ownPawn) {
         ownPawn = pawn;
-        byUs = gameRecrouched = false;
-        standHead = 0.0f;
+        byUs = gameRecrouched = haveStandFwd = false;
+        fwdApplied = 0.0f;
     }
     uint32_t atm = 0, mesh = 0;
     uint8_t posture = 0;
     if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnAnimtreeManager, &atm) || !atm ||
-        !SafeCopy(&posture, reinterpret_cast<char*>(atm) + kOffAtmCurrentPosture, 1))
+        !SafeCopy(&posture, reinterpret_cast<char*>(atm) + kOffAtmCurrentPosture, 1)) {
+        g_crouchPoseFwd = fwdApplied = 0.0f;
         return;
-    const double now = ProfMs() * 0.001;
-    // Testa di Walker in piedi: la piu' alta vista in postura in piedi
-    // (camminando oscilla di 1-2 unita').
-    float head = 0.0f;
-    bool haveHead = TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnMesh, &mesh) && mesh &&
-                    MeshHeadHeight(reinterpret_cast<void*>(mesh), &head);
-    // Non durante le mosse animate (scavalcare, corda): la testa sale con l'animazione.
-    if (haveHead && posture == kPostureStand && !vr::control::g_inCover && !vr::control::g_gameLocked &&
-        head > standHead)
-        standHead = head;
-    if (posture == kPostureCrouch) lastCrouchT = now;
-    // Durante la postura accucciata e la transizione per rialzarsi (1 s).
-    if (haveHead && standHead > 0.0f && !vr::control::g_inCover && now - lastCrouchT < 1.0) {
-        float d = standHead - head;
-        g_crouchPoseDrop = d < 0.0f ? 0.0f : (d > 45.0f ? 45.0f : d);
     }
+    const double now = ProfMs() * 0.001;
+    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
+    lastT = now;
+    float head = 0.0f, headFwd = 0.0f;
+    bool haveHead = TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnMesh, &mesh) && mesh &&
+                    MeshHeadPos(reinterpret_cast<void*>(mesh), &headFwd, &head);
+    if (haveHead) g_meshHeadUp = head;
+    g_walkerPosture = posture;
+    if (posture == kPostureCrouch) lastCrouchT = now;
+    // Testa di Walker in piedi: posizione avanti media (in piedi ondeggia di
+    // 1-2 unita'). Non durante le mosse animate (scavalcare, corda) ne' nel
+    // secondo in cui si rialza.
+    if (haveHead && posture == kPostureStand && !vr::control::g_inCover && !vr::control::g_gameLocked &&
+        now - lastCrouchT >= 1.0) {
+        standFwd = haveStandFwd ? standFwd + 0.05f * (headFwd - standFwd) : headFwd;
+        haveStandFwd = true;
+    }
+    // Durante la postura accucciata e la transizione per rialzarsi (1 s).
+    float fwdTarget = 0.0f;
+    if (haveHead && haveStandFwd && !vr::control::g_inCover && now - lastCrouchT < 1.0) {
+        float f = headFwd - standFwd;
+        fwdTarget = f < 0.0f ? 0.0f : (f > 30.0f ? 30.0f : f);
+    }
+    // Al massimo 80 unita'/s: entrando in copertura da accucciati (il riparo
+    // azzera la correzione) il corpo non salta avanti in un frame.
+    float maxStep = 80.0f * (dt > 0.0f && dt < 0.1f ? dt : 0.011f);
+    fwdApplied += (std::max)(-maxStep, (std::min)(maxStep, fwdTarget - fwdApplied));
+    g_crouchPoseFwd = fwdApplied;
     bool allowed = vr::control::g_physicalCrouch && vr::control::g_sixDof && !vr::control::g_seated &&
                    !vr::control::g_cinemaActive && !vr::control::g_gameLocked && !vr::control::g_inCover &&
                    PawnOnFirmGround(pawn) && (posture == kPostureStand || posture == kPostureCrouch);
@@ -6251,12 +6276,89 @@ void SetHeadHidden(void* mesh, bool hide) {
     }
 }
 
+// Abbassamento del corpo (23/10): l'altezza della mesh la compone il sistema
+// di traslazione di YGamePawn (vedi la NOTA in UpdateFirstPersonBody), quindi
+// si toglie da m_meshTranslationOffset, che il gioco applica entro un tick
+// (misurato: -10 -> LocalToWorld -10 al tick dopo). Si tiene solo la propria
+// parte: se il gioco riscrive il campo, il nuovo valore e' la sua base.
+constexpr uintptr_t kOffPawnMeshTranslationOffset = 0x1574;  // YGamePawn.m_meshTranslationOffset
+struct MeshLowering {
+    void* pawn;
+    float applied;  // unita' tolte all'offset del gioco
+    float written;  // valore scritto nel campo
+    float ramp;     // abbassamento voluto, a velocita' limitata
+} g_meshLower = {nullptr, 0.0f, 0.0f, 0.0f};
+
+void SetMeshLowering(void* pawn, float lower) {
+    if (pawn != g_meshLower.pawn) g_meshLower = {pawn, 0.0f, 0.0f, 0.0f};
+    float cur = 0.0f;
+    if (!SafeCopy(&cur, static_cast<char*>(pawn) + kOffPawnMeshTranslationOffset, 4)) return;
+    if (g_meshLower.applied != 0.0f && std::fabs(cur - g_meshLower.written) > 0.01f) g_meshLower.applied = 0.0f;
+    if (lower == 0.0f && g_meshLower.applied == 0.0f) return;
+    float v = cur + g_meshLower.applied - lower;
+    if (SafeCopy(static_cast<char*>(pawn) + kOffPawnMeshTranslationOffset, &v, 4)) {
+        g_meshLower.written = v;
+        g_meshLower.applied = lower;
+    }
+}
+
+// Occhi fuori dal corpo (23/10): inginocchiandosi, accucciandosi piu' della
+// postura di Walker o chinandosi prima che si accucci, gli occhi arrivavano
+// al collo e oltre (testa e collo nascosti: si vedeva l'interno del corpo,
+// utente). Il corpo scende quanto serve perche' la testa di Walker resti
+// almeno 10 unita' sotto gli occhi, o quanto da dritti in piedi se e' meno
+// (giocatori bassi): dritti in piedi non cambia nulla. Non in copertura, sui
+// mezzi o nelle mosse animate.
+void UpdateMeshLowering(void* pawn, bool onMount) {
+    static double lastT = 0.0;
+    static float gapStand = 0.0f;
+    static bool haveGapStand = false;
+    static void* gapPawn = nullptr;
+    const double now = ProfMs() * 0.001;
+    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.0f;
+    lastT = now;
+    if (pawn != gapPawn) {
+        gapPawn = pawn;
+        haveGapStand = false;
+        if (g_meshLower.pawn != pawn) g_meshLower.ramp = 0.0f;
+    }
+    float target = 0.0f, headUp = g_meshHeadUp.load();
+    float l2w[16], pl[3];
+    if (!onMount && !vr::control::g_inCover && !vr::control::g_gameLocked && headUp > -999.0f && g_fpHeadMesh &&
+        SafeCopy(l2w, static_cast<char*>(g_fpHeadMesh) + kOffCompLocalToWorld, sizeof(l2w)) &&
+        SafeCopy(pl, static_cast<char*>(pawn) + kOffsetLocationX, 12)) {
+        // Testa di Walker e occhi sopra il centro del Pawn, senza il nostro abbassamento.
+        float mine = g_meshLower.pawn == pawn ? g_meshLower.applied : 0.0f;
+        float headZ = l2w[14] - pl[2] + mine + headUp;
+        float eyeZ = vr::control::g_fpEyeHeight + ViewHeightExtra() + g_headOffset[2].load();
+        float gap = eyeZ - headZ;
+        // Distanza da dritti in piedi (entro 3 cm): dipende dall'altezza del giocatore.
+        if (g_walkerPosture == kPostureStand && g_headOffset[2].load() > -1.5f) {
+            gapStand = haveGapStand ? gapStand + 0.02f * (gap - gapStand) : gap;
+            haveGapStand = true;
+        }
+        if (haveGapStand) {
+            float t = (std::min)(10.0f, gapStand) - gap;
+            target = t < 0.0f ? 0.0f : (t > 30.0f ? 30.0f : t);
+        }
+    }
+    // Al massimo 120 unita'/s (accucciandosi in fretta la testa scende a ~50).
+    float maxStep = 120.0f * (dt > 0.0f && dt < 0.1f ? dt : 0.011f);
+    g_meshLower.ramp += (std::max)(-maxStep, (std::min)(maxStep, target - g_meshLower.ramp));
+    SetMeshLowering(pawn, g_meshLower.ramp);
+}
+
 void UpdateFirstPersonBody(void* pawn) {
     bool want = pawn && vr::control::g_firstPerson && !vr::control::g_cinemaActive && PawnAlive(pawn);
     uint32_t mesh = 0;
     if (want && !TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnMesh, &mesh)) want = false;
     if (g_fpPawn && (!want || pawn != g_fpPawn)) {
         if (StillAlive(g_fpPawn, g_fpPawnCls)) SetCylinders(g_fpPawn, g_fpSavedCylinders);
+        // Corpo all'altezza del gioco (mai su Walker morto: ragdoll, crash 19/10).
+        if (g_meshLower.pawn == g_fpPawn && StillAlive(g_fpPawn, g_fpPawnCls) && PawnAlive(g_fpPawn)) {
+            SetMeshLowering(g_fpPawn, 0.0f);
+            g_meshLower.ramp = 0.0f;
+        }
         if (g_fpHeadMesh && StillAlive(g_fpHeadMesh, g_fpHeadMeshCls)) {
             SetHeadHidden(g_fpHeadMesh, false);
             float xyz[3] = {g_fpSavedMeshX, g_fpSavedMeshY, g_fpSavedMeshZ};
@@ -6348,25 +6450,34 @@ void UpdateFirstPersonBody(void* pawn) {
         if (onMount) {
             xy[0] = g_fpSavedMeshX;
             xy[1] = g_fpSavedMeshY;
+        } else {
+            // Accucciati (physicalcrouch) il corpo arretra di quanto la postura
+            // ha portato avanti la testa (X della mesh = avanti dell'attore): il
+            // collo resta dietro gli occhi come in piedi.
+            xy[0] -= g_crouchPoseFwd.load();
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX, xy, 8);
+        // NOTA (misurato il 23/10): l'altezza scritta qui non si vede. Il sistema
+        // di traslazione della mesh di YGamePawn (tracce del pavimento,
+        // smussatura, m_meshTranslationOffset +0x1574) riscrive Translation.Z a
+        // ogni tick e LocalToWorld resta alla sua quota; scrivendo invece
+        // m_meshTranslationOffset la mesh si sposta subito. X e Y restano nostre.
         // In altezza il busto segue la testa vera: con "crouchview real" e
         // Walker accucciato dal gioco sale della stessa differenza della vista
         // (altrimenti spalle e braccia restavano 20 unita' sotto e l'arma
-        // fluttuava senza mano, playtest 19/10); accucciandosi davvero scende
-        // con la testa (prima gli occhi finivano dentro il petto, audit 19/10).
+        // fluttuava senza mano, playtest 19/10). Accucciandosi davvero il corpo
+        // scende con la testa (prima gli occhi finivano dentro il petto, audit
+        // 19/10): UpdateMeshLowering, qui sotto.
         float z = g_fpSavedMeshZ;
         // Guardando in basso (oltre 30 gradi) il rialzo si toglie: sotto di se'
         // si vede il corpo accucciato a terra, non l'interno del colletto.
         if (!onMount) {
             // Seduti non ci si puo' accovacciare davvero: vista come nel gioco (20/10).
             if (vr::control::g_crouchViewReal && !vr::control::g_seated) z += GameCrouchDrop(pawn) * (1.0f - look);
-            // Con la postura accucciata (physicalcrouch) la testa di Walker e'
-            // gia' scesa: la mesh scende solo per il resto, mai sopra la posa.
-            float headDrop = g_headOffset[2].load() + g_crouchPoseDrop.load();
-            if (headDrop < 0.0f) z += headDrop;
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX + 8, &z, 4);
+        // Il corpo che scende con la testa vera passa da m_meshTranslationOffset.
+        UpdateMeshLowering(pawn, onMount);
     }
 }
 

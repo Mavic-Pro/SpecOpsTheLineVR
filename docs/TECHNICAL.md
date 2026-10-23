@@ -1086,20 +1086,29 @@ automated playtest). What changed, by area:
 - Left stick moves where you look (`movedir head`) outside cover.
 - `crouchview real`: the game's crouch (capsule 45 -> 25, pawn 20 units down)
   is removed from the view and the mesh is raised by the same amount (less
-  when looking down past 30 degrees); a physical crouch lowers the mesh.
+  when looking down past 30 degrees); a physical crouch lowers the mesh
+  (both heights do not show: see "Mesh height" below).
+  `height auto`: eye height = standing HMD height x posscale - 45 (25..55);
+  `seated on` uses `fp`.
 - `physicalcrouch on` (23/10): crouching 30 cm below the standing height
   (back up above 20 cm) calls `YAnimtreeManager.PlayPosture(YPTID_Crouch=2)`
   (`YGamePawn.m_animtreeManager` +0xB30, `m_currentPosture` +0x98, Stand = 1):
   Walker plays the game's own `Crc_*` crouch set (hips -23, head -28 units,
   feet on the ground) and keeps it through fire, reload, aim, sprint, weapon
-  swap and grenades; the game camera and capsule do not change. The mesh is
-  lowered only by the part of the real crouch beyond the pose's own head drop
-  (head bone measured in component space, up = -Y, so no feedback with the
-  mesh translation). Before, the standing mesh was pushed into the floor.
+  swap and grenades; the game camera and capsule do not change. Before, the
+  view went down while Walker's skeleton stayed standing.
   If the game re-crouches Walker within 2 s of being stood up, it is left
-  alone until the next real crouch. Engine crouch (`bCanCrouch` +
-  `bWantsToCrouch`, +0x228 bits 0x20/0x4) only shrinks the capsule 45 -> 25,
-  the skeleton stays standing: not used.
+  alone until the next real crouch.
+  The crouched pose brings the head 14 units forward (and 29 down) in mesh
+  space (X = actor forward, -Y = up, Z = right; measured on the head bone in
+  component space, so no feedback with the mesh translation): with head and
+  neck hidden, the neck stump ended up in front of the eyes ("decapitated
+  body", user 23/10). The mesh now moves back by the head's forward shift
+  measured each tick against the standing average (at most 80 units/s, so
+  entering cover does not snap): the neck stays 4 units behind the eyes as
+  when standing.
+  Engine crouch (`bCanCrouch` + `bWantsToCrouch`, +0x228 bits 0x20/0x4) only
+  shrinks the capsule 45 -> 25, the skeleton stays standing: not used.
   Hits: instant-hit traces hit Walker's mesh through its physics asset
   (`CH_MC_SK_PHYS_new`, mesh `BlockZeroExtent`); the capsule only blocks
   extents (`BlockNonZeroExtent`). `hittest`, standing: hit from -10 to +28
@@ -1108,8 +1117,28 @@ automated playtest). What changed, by area:
   real crouch behind a low wall protects like the game's cover.
   *Needs a headset check: body seen from above while crouching, low cover,
   crouch then duck-into-cover.*
-  `height auto`: eye height = standing HMD height x posscale - 45 (25..55);
-  `seated on` uses `fp`.
+- Mesh height (measured 23/10): `YGamePawn`'s mesh translation system (floor
+  traces, smoothing, `m_meshTranslationOffset` +0x1574) rewrites
+  `Translation.Z` every tick before `LocalToWorld` is built, so the heights
+  the mod writes to `Translation.Z` (`crouchview real` raise in cover, mesh
+  lowered with a real crouch) do not show; X/Y do. Writing
+  `m_meshTranslationOffset` moves the mesh at once (-10 -> `LocalToWorld`
+  -51 -> -61, within one tick, no smoothing).
+- Eyes out of the body (23/10, user: kneeling or crouching too low showed the
+  inside of the body): with head and neck hidden, the eyes reached the neck
+  and the chest when lowering the head before Walker crouches (at 30 cm the
+  head bone was 2 units above the eyes) or going below his crouch pose (90 cm:
+  3.5 above). `UpdateMeshLowering` keeps Walker's head bone at least 10 units
+  below the eyes (or as far as when standing upright, if less: short
+  players) by lowering the body through `m_meshTranslationOffset`, owning
+  only its own delta (a value rewritten by the game becomes the new base) and
+  at most 120 units/s; gap = eye height above the Pawn (`fp` +
+  `ViewHeightExtra` + head offset) minus head bone height (`LocalToWorld` + our
+  delta + head in mesh space). Measured: 10-30 cm before the crouch pose
+  lowers 2-12 units, 70/90 cm crouched 4/13, upright 0. The game's foot IK
+  keeps the feet on the floor (ankles unchanged, legs bend). Not in cover, on
+  mounts, in animated moves, never on a dead Walker; restored when leaving
+  first person.
 - Room-scale: past 15 cm the Pawn is moved with `Actor.Move` (collisions) and
   `posRef` shifts by the distance actually moved.
 - Standing-height reference: spikes over 10 cm per sample ignored, decays
