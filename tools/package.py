@@ -21,40 +21,140 @@ def version():
         return re.search(r'SPECOPSVR_VERSION "([^"]+)"', f.read()).group(1)
 
 
-# Shared by the scripts: finds the game folder from the argument or from every
-# Steam library listed in libraryfolders.vdf (Steam path from the registry).
+# Shared by the scripts: finds the folder of SpecOpsTheLine.exe (Steam or any
+# other copy) from the argument, the running game, Steam libraries, GOG/Epic/
+# uninstall entries, the usual game folders and, last, a search of every drive.
 FIND_GAME_PS1 = r"""
-function Find-Game([string]$game) {
+$ExeName = 'SpecOpsTheLine.exe'
+
+# Folder containing the exe for a path: the exe itself, its folder, or a folder
+# above it (searched down to $depth levels).
+function Resolve-GameDir([string]$p, [int]$depth = 4) {
+  if (-not $p) { return $null }
   # A trailing backslash before the closing quote ("C:\Games\Spec Ops\") reaches
-  # PowerShell as a stray quote; the folder, Binaries\Win32 or the exe all work.
-  if ($game) {
-    $game = $game.Trim().Trim('"').TrimEnd('\')
-    if ($game -like '*.exe') { $game = Split-Path $game -Parent }
-    if (Test-Path (Join-Path $game 'SpecOpsTheLine.exe')) { return $game }
+  # PowerShell as a stray quote.
+  $p = $p.Trim().Trim('"').TrimEnd('\')
+  if (-not $p) { return $null }
+  if ($p -like '*.exe') {
+    if ((Split-Path $p -Leaf) -eq $ExeName -and (Test-Path -LiteralPath $p -PathType Leaf)) { return (Split-Path $p -Parent) }
+    $p = Split-Path $p -Parent
   }
-  if (-not $game) {
-    $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
-    $libs = @()
-    if ($steam) {
-      $libs += $steam
-      $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
-      if (Test-Path $vdf) {
-        foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' -AllMatches).Matches) {
-          $libs += ($m.Groups[1].Value -replace '\\+', '\')
-        }
+  if (-not $p -or -not (Test-Path -LiteralPath $p -PathType Container)) { return $null }
+  if (Test-Path -LiteralPath (Join-Path $p $ExeName) -PathType Leaf) { return $p }
+  if ($depth -le 0) { return $null }
+  $hit = Get-ChildItem -LiteralPath $p -Filter $ExeName -File -Recurse -Depth $depth -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if ($hit) { return $hit.DirectoryName }
+  return $null
+}
+
+function Add-Candidate([System.Collections.ArrayList]$list, [string]$dir) {
+  if (-not $dir) { return }
+  $full = (Resolve-Path -LiteralPath $dir -ErrorAction SilentlyContinue).Path
+  if (-not $full) { return }
+  foreach ($c in $list) { if ($c -ieq $full) { return } }
+  [void]$list.Add($full)
+}
+
+function Find-Candidates {
+  $list = New-Object System.Collections.ArrayList
+  # The game running right now.
+  foreach ($pr in (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue)) {
+    if ($pr.Path) { Add-Candidate $list (Split-Path $pr.Path -Parent) }
+  }
+  # Steam libraries (any Spec Ops folder under steamapps\common).
+  $steam = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath
+  if ($steam) {
+    $libs = @($steam)
+    $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+    if (Test-Path $vdf) {
+      foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' -AllMatches).Matches) {
+        $libs += ($m.Groups[1].Value -replace '\\+', '\')
       }
     }
     foreach ($l in $libs) {
-      $p = Join-Path $l 'steamapps\common\SpecOps_TheLine'
-      if (Test-Path (Join-Path $p 'Binaries\Win32\SpecOpsTheLine.exe')) { $game = $p; break }
+      $common = Join-Path $l 'steamapps\common'
+      if (Test-Path -LiteralPath $common) {
+        foreach ($d in (Get-ChildItem -LiteralPath $common -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*Spec*Ops*' })) {
+          Add-Candidate $list (Resolve-GameDir $d.FullName 3)
+        }
+      }
     }
   }
-  if (-not $game -or -not (Test-Path (Join-Path $game 'Binaries\Win32\SpecOpsTheLine.exe'))) {
-    Write-Host 'Spec Ops: The Line was not found. Run:  install.bat "<game folder>"'
+  # Uninstall entries (GOG, retail, other launchers) and GOG's own keys.
+  $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+          'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  foreach ($e in (Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Spec Ops*' })) {
+    Add-Candidate $list (Resolve-GameDir $e.InstallLocation 3)
+    if ($e.DisplayIcon) { Add-Candidate $list (Resolve-GameDir (($e.DisplayIcon -split ',')[0]) 0) }
+  }
+  foreach ($e in (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\GOG.com\Games\*', 'HKLM:\SOFTWARE\GOG.com\Games\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.gameName -like '*Spec Ops*' })) {
+    Add-Candidate $list (Resolve-GameDir $e.path 3)
+  }
+  # Epic Games Launcher manifests.
+  $epic = Join-Path $env:ProgramData 'Epic\EpicGamesLauncher\Data\Manifests'
+  if (Test-Path -LiteralPath $epic) {
+    foreach ($f in (Get-ChildItem -LiteralPath $epic -Filter '*.item' -ErrorAction SilentlyContinue)) {
+      try { $j = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json } catch { continue }
+      if ($j.DisplayName -like '*Spec Ops*') { Add-Candidate $list (Resolve-GameDir $j.InstallLocation 3) }
+    }
+  }
+  if ($list.Count) { return ,$list }
+  # The usual game folders on every fixed drive.
+  $drives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object { $_.DeviceID + '\' })
+  if (-not $drives) { $drives = @('C:\') }
+  $roots = 'Games', 'Giochi', 'Program Files', 'Program Files (x86)', 'SteamLibrary', 'GOG Games', 'Epic Games', 'XboxGames'
+  foreach ($d in $drives) {
+    foreach ($r in $roots) {
+      $p = Join-Path $d $r
+      if (Test-Path -LiteralPath $p) {
+        foreach ($h in (Get-ChildItem -LiteralPath $p -Filter $ExeName -File -Recurse -Depth 5 -ErrorAction SilentlyContinue)) {
+          Add-Candidate $list $h.DirectoryName
+        }
+      }
+    }
+  }
+  if ($list.Count) { return ,$list }
+  # Last resort: every fixed drive.
+  foreach ($d in $drives) {
+    Write-Host "Searching $d for $ExeName ..."
+    foreach ($h in (cmd /c dir /s /b /a-d ($d + $ExeName) 2>$null)) {
+      if ($h -and (Test-Path -LiteralPath $h -PathType Leaf)) { Add-Candidate $list (Split-Path $h -Parent) }
+    }
+  }
+  return ,$list
+}
+
+function Find-Game([string]$game) {
+  if ($game) {
+    $dir = Resolve-GameDir $game 6
+    if ($dir) { return $dir }
+    Write-Host "$ExeName was not found in: $game"
+    Write-Host 'Pass the folder that contains the game, e.g.  install.bat "D:\Games\Spec Ops The Line"'
+    exit 1
+  }
+  Write-Host "Looking for $ExeName ..."
+  $list = Find-Candidates
+  if (-not $list -or $list.Count -eq 0) {
+    Write-Host ('Spec Ops: The Line (' + $ExeName + ') was not found. Run:  install.bat "<game folder>"')
     Write-Host 'e.g.  install.bat "D:\SteamLibrary\steamapps\common\SpecOps_TheLine"'
     exit 1
   }
-  return (Join-Path $game 'Binaries\Win32')
+  if ($list.Count -eq 1) { Write-Host "Game found: $($list[0])"; return $list[0] }
+  Write-Host 'More than one copy of the game was found:'
+  for ($i = 0; $i -lt $list.Count; $i++) {
+    $mod = if (Test-Path -LiteralPath (Join-Path $list[$i] 'specopsvr.ini')) { '  (mod installed)' } else { '' }
+    Write-Host ("  {0}) {1}{2}" -f ($i + 1), $list[$i], $mod)
+  }
+  $n = 1
+  try {
+    $a = Read-Host "Which one? [1-$($list.Count), Enter = 1]"
+    if ($a -match '^\d+$' -and [int]$a -ge 1 -and [int]$a -le $list.Count) { $n = [int]$a }
+  } catch {}
+  Write-Host "Using: $($list[$n - 1])"
+  return $list[$n - 1]
 }
 """
 
@@ -187,14 +287,17 @@ README_TXT = """SpecOpsTheLineVR {version} - unofficial VR mod for Spec Ops: The
 
 https://github.com/Mavic-Pro/SpecOpsTheLineVR
 
-Requirements: Windows 10/11, Spec Ops: The Line (Steam) and a PC VR headset
+Requirements: Windows 10/11, Spec Ops: The Line (Steam; other copies work
+but are untested) and a PC VR headset
 with two motion controllers, through Virtual Desktop (VDXR) or SteamVR:
 "runtime auto" (default) picks Virtual Desktop when its Streamer is running,
 otherwise SteamVR. Developed and tested with a Meta Quest 3.
 
 INSTALL
-  1. Run install.bat (it finds the game through Steam; otherwise
-     install.bat "D:\\SteamLibrary\\steamapps\\common\\SpecOps_TheLine").
+  1. Run install.bat. It looks for SpecOpsTheLine.exe (Steam libraries,
+     GOG/Epic/other installs, usual game folders, then every drive); if it
+     is not found, or to pick a copy, pass its folder:
+     install.bat "D:\\Games\\Spec Ops The Line"
   2. In Steam, game Properties > Launch options, add:
        -windowed ResX=2400 ResY=2500
      (the mod then uses the resolution the VR runtime recommends: change
@@ -283,7 +386,7 @@ def main():
         "install.ps1": INSTALL_PS1,
         "uninstall.ps1": UNINSTALL_PS1,
         "collect_logs.ps1": COLLECT_PS1,
-        "install.bat": bat("install.ps1", "Installs SpecOpsTheLineVR into the game folder (found through Steam)."),
+        "install.bat": bat("install.ps1", "Installs SpecOpsTheLineVR into the game folder (finds SpecOpsTheLine.exe)."),
         "uninstall.bat": bat("uninstall.ps1", "Removes SpecOpsTheLineVR (the game files are never modified)."),
         "collect_logs.bat": bat("collect_logs.ps1", "Zips logs, configuration and crash dumps for a bug report."),
         "rollback.ps1": ROLLBACK_PS1,

@@ -86,9 +86,11 @@ virtual cinema screen.
 1. Download `SpecOpsTheLineVR.zip` from the
    [latest release](https://github.com/Mavic-Pro/SpecOpsTheLineVR/releases/latest)
    and extract it anywhere.
-2. Run `install.bat`. It finds the game through your Steam libraries; if it
-   cannot, pass the folder:
-   `install.bat "D:\SteamLibrary\steamapps\common\SpecOps_TheLine"`.
+2. Run `install.bat`. It looks for `SpecOpsTheLine.exe`: Steam libraries,
+   GOG/Epic/other installs, the usual game folders, then every drive (if it
+   finds more than one copy it asks which one). If it cannot find it, or to
+   pick a copy, pass the folder:
+   `install.bat "D:\Games\Spec Ops The Line"`.
 3. In Steam, *Spec Ops: The Line > Properties > Launch options*, add
    `-windowed ResX=2400 ResY=2500`. Once the headset is on, the mod switches
    the game to the resolution SteamVR recommends for your headset: to change
