@@ -3025,6 +3025,8 @@ double ProfMs() {
 }
 
 void UpdateFirstPersonBody(void* pawn);
+void UpdatePhysicalCrouch(void* pawn);
+void RunHitTest(void* pawn);
 void UpdateSquadCommandAim(char* cam, void* pawn);
 void PublishWristData(char* cam);
 void InteractionScan(void* pawn);
@@ -3341,6 +3343,8 @@ public:
         char* cam = static_cast<char*>(g_cameraPtr.load());
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        UpdatePhysicalCrouch(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        RunHitTest(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // da seduti il corpo (in piedi) si vedeva deforme: solo braccia (21/10)
         UpdateProjectileLog();
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
@@ -6119,6 +6123,122 @@ float GameCrouchDrop(void* pawn) {
     return standingH - h;
 }
 
+// Accucciata vera (physicalcrouch, 23/10): abbassandosi nella stanza Walker
+// passa alla postura accucciata del gioco (YAnimtreeManager.PlayPosture con
+// YPTID_Crouch): gambe piegate e bacino giu' con le animazioni Crc_* del gioco,
+// invece della mesh in piedi spinta nel pavimento. La postura resta con sparo,
+// ricarica, mira, granate e camminando; la camera del gioco non cambia (Pawn+40)
+// e la capsula nemmeno. Prima la mesh scendeva di tutta la discesa della testa.
+constexpr uintptr_t kOffPawnAnimtreeManager = 0xB30;  // YGamePawn.m_animtreeManager
+constexpr uintptr_t kOffAtmCurrentPosture = 0x98;      // YAnimtreeManager.m_currentPosture (YE_PostureID)
+constexpr uint8_t kPostureStand = 1, kPostureCrouch = 2;
+// Quanto la postura del gioco ha gia' abbassato la testa di Walker (unita'):
+// la mesh scende solo per la parte di accucciata vera che resta.
+std::atomic<float> g_crouchPoseDrop{0.0f};
+
+bool PlayPosture(void* atm, uint8_t posture) {
+    struct {
+        uint8_t postureID;
+        uint8_t pad[3];
+        float blendInTime;
+        uint32_t forcePosture;
+        uint32_t disablePostureTransition;
+        uint32_t ret;
+    } parms = {posture, {0, 0, 0}, 0.0f, 0, 0, 0};
+    return vr::script::CallFunction(atm, "PlayPosture", &parms) && parms.ret;
+}
+
+// Altezza della testa di Walker nello spazio della mesh (asse su = -Y): non
+// dipende dallo spostamento della mesh fatto qui sotto, niente retroazione.
+bool MeshHeadHeight(void* mesh, float* h) {
+    struct {
+        int32_t name[2];
+        int32_t space;
+        float ret[3];
+    } hp = {{vr::script::NameIndex("head"), 0}, 1, {0, 0, 0}};
+    if (hp.name[0] < 0 || !vr::script::CallFunction(mesh, "GetBoneLocation", &hp)) return false;
+    *h = -hp.ret[1];
+    return true;
+}
+
+void UpdatePhysicalCrouch(void* pawn) {
+    static void* ownPawn = nullptr;
+    static bool byUs = false, gameRecrouched = false;
+    static double lastReq = 0.0, lastCrouchT = 0.0, stoodUpT = 0.0;
+    static float standHead = 0.0f;
+    g_crouchPoseDrop = 0.0f;
+    if (!pawn || !PawnAlive(pawn)) {
+        ownPawn = nullptr;
+        return;
+    }
+    if (pawn != ownPawn) {
+        ownPawn = pawn;
+        byUs = gameRecrouched = false;
+        standHead = 0.0f;
+    }
+    uint32_t atm = 0, mesh = 0;
+    uint8_t posture = 0;
+    if (!TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnAnimtreeManager, &atm) || !atm ||
+        !SafeCopy(&posture, reinterpret_cast<char*>(atm) + kOffAtmCurrentPosture, 1))
+        return;
+    const double now = ProfMs() * 0.001;
+    // Testa di Walker in piedi: la piu' alta vista in postura in piedi
+    // (camminando oscilla di 1-2 unita').
+    float head = 0.0f;
+    bool haveHead = TrySafeReadUint32(static_cast<char*>(pawn) + kOffPawnMesh, &mesh) && mesh &&
+                    MeshHeadHeight(reinterpret_cast<void*>(mesh), &head);
+    // Non durante le mosse animate (scavalcare, corda): la testa sale con l'animazione.
+    if (haveHead && posture == kPostureStand && !vr::control::g_inCover && !vr::control::g_gameLocked &&
+        head > standHead)
+        standHead = head;
+    if (posture == kPostureCrouch) lastCrouchT = now;
+    // Durante la postura accucciata e la transizione per rialzarsi (1 s).
+    if (haveHead && standHead > 0.0f && !vr::control::g_inCover && now - lastCrouchT < 1.0) {
+        float d = standHead - head;
+        g_crouchPoseDrop = d < 0.0f ? 0.0f : (d > 45.0f ? 45.0f : d);
+    }
+    bool allowed = vr::control::g_physicalCrouch && vr::control::g_sixDof && !vr::control::g_seated &&
+                   !vr::control::g_cinemaActive && !vr::control::g_gameLocked && !vr::control::g_inCover &&
+                   PawnOnFirmGround(pawn) && (posture == kPostureStand || posture == kPostureCrouch);
+    if (!allowed) {
+        // Spenta dal menu con Walker accucciato da noi: si rialza.
+        if (!vr::control::g_physicalCrouch && byUs && posture == kPostureCrouch && now - lastReq > 0.3) {
+            lastReq = now;
+            PlayPosture(reinterpret_cast<void*>(atm), kPostureStand);
+        }
+        byUs = false;
+        return;
+    }
+    // 30 cm sotto l'altezza in piedi per accucciarsi, sopra i 20 cm per
+    // rialzarsi (isteresi: niente su e giu' guardando a terra).
+    float drop = -g_headOffset[2].load(), scale = vr::control::g_posScale;
+    bool down = drop > (posture == kPostureCrouch ? 0.20f : 0.30f) * scale;
+    if (down) gameRecrouched = false;  // la prossima accucciata vera riprende il controllo
+    if (now - lastReq < 0.3) return;
+    if (down && posture == kPostureStand) {
+        lastReq = now;
+        if (PlayPosture(reinterpret_cast<void*>(atm), kPostureCrouch)) {
+            byUs = true;
+            vr::log::Line("CROUCH: you crouched " + std::to_string(static_cast<int>(drop / scale * 100.0f)) +
+                          " cm, Walker crouches");
+        }
+    } else if (!down && posture == kPostureCrouch && !gameRecrouched) {
+        // Accucciato dal gioco subito dopo averlo rialzato (soffitto basso,
+        // scena): non si insiste fino alla prossima accucciata vera.
+        if (!byUs && now - stoodUpT < 2.0) {
+            gameRecrouched = true;
+            vr::log::Line("CROUCH: the game keeps Walker crouched, left as it is");
+            return;
+        }
+        lastReq = now;
+        if (PlayPosture(reinterpret_cast<void*>(atm), kPostureStand)) {
+            byUs = false;
+            stoodUpT = now;
+            vr::log::Line("CROUCH: you stood up, Walker stands");
+        }
+    }
+}
+
 void SetHeadHidden(void* mesh, bool hide) {
     for (const char* bone : {"Neck", "head"}) {
         struct {
@@ -6241,7 +6361,9 @@ void UpdateFirstPersonBody(void* pawn) {
         if (!onMount) {
             // Seduti non ci si puo' accovacciare davvero: vista come nel gioco (20/10).
             if (vr::control::g_crouchViewReal && !vr::control::g_seated) z += GameCrouchDrop(pawn) * (1.0f - look);
-            float headDrop = g_headOffset[2].load();
+            // Con la postura accucciata (physicalcrouch) la testa di Walker e'
+            // gia' scesa: la mesh scende solo per il resto, mai sopra la posa.
+            float headDrop = g_headOffset[2].load() + g_crouchPoseDrop.load();
             if (headDrop < 0.0f) z += headDrop;
         }
         SafeCopy(static_cast<char*>(g_fpHeadMesh) + kOffMeshTranslationX + 8, &z, 4);
@@ -7847,6 +7969,54 @@ constexpr uintptr_t kOffActorWorldInfo = 0xEC;
 constexpr uintptr_t kOffPawnExecDetection = 0x1D48;  // YS_SpecialMoveDetectionParams (3 coppie min/max)
 constexpr uintptr_t kOffPawnDbnoFlags = 0x5FC;
 constexpr uint32_t kDbnoBits = 0x10000 | 0x40000;  // m_isKnockedDown | m_isDownButNotOut
+
+// Diagnostica "hittest <z>" (23/10): linea orizzontale a estensione zero, come
+// un colpo istantaneo, da 2 m davanti a Walker verso di lui a <z> unita' sopra
+// il centro del Pawn. I colpi istantanei prendono la mesh (physics asset,
+// BlockZeroExtent), non la capsula (solo BlockNonZeroExtent): dice se con
+// Walker accucciato (physicalcrouch) il colpo gli passa sopra.
+// FCheckResult: Actor +4, Location +8, Component +0x30, BoneName +0x34.
+bool TraceHitActor(void* source, const float* start, const float* end, void** actor, float* loc, int32_t* bone) {
+    __try {
+        void* world = *reinterpret_cast<void**>(kGWorldAddr);
+        if (!world) return false;
+        alignas(16) unsigned char hit[0x100] = {};
+        const float extent[3] = {0.0f, 0.0f, 0.0f};
+        reinterpret_cast<SingleLineCheck_t>(kSingleLineCheckAddr)(world, hit, source, end, start, kTraceFlags, extent, nullptr);
+        *actor = *reinterpret_cast<void**>(hit + 4);
+        std::memcpy(loc, hit + 8, 12);
+        std::memcpy(bone, hit + 0x34, 4);
+        return *actor != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void RunHitTest(void* pawn) {
+    float z = vr::control::g_hitTestZ.exchange(-1000.0f);
+    if (z <= -999.0f || !pawn) return;
+    float loc[3];
+    int32_t yaw = 0;
+    uint32_t worldInfo = 0;
+    if (!SafeCopy(loc, static_cast<char*>(pawn) + kOffActorLocation, 12) ||
+        !SafeCopy(&yaw, static_cast<char*>(pawn) + kOffActorRotation + 4, 4) ||
+        !TrySafeReadUint32(static_cast<char*>(pawn) + kOffActorWorldInfo, &worldInfo) || !worldInfo)
+        return;
+    float a = yaw * (6.28318530718f / 65536.0f), fx = std::cos(a), fy = std::sin(a);
+    float start[3] = {loc[0] + fx * 200.0f, loc[1] + fy * 200.0f, loc[2] + z};
+    float end[3] = {loc[0] - fx * 30.0f, loc[1] - fy * 30.0f, loc[2] + z};
+    void* actor = nullptr;
+    float at[3] = {};
+    int32_t bone = 0;
+    // Sorgente WorldInfo: col Pawn (o il Controller, suo Owner) Walker sarebbe escluso.
+    bool hit = TraceHitActor(reinterpret_cast<void*>(worldInfo), start, end, &actor, at, &bone);
+    std::string what = hit ? vr::script::ObjectName(actor) : std::string("nothing");
+    if (hit && bone > 0) what += " bone " + vr::script::NameFromIndex(bone);
+    char b[240];
+    std::snprintf(b, sizeof(b), "HITTEST: line %+.0f units above Walker's centre -> %s", z, what.c_str());
+    if (hit) std::snprintf(b + std::strlen(b), sizeof(b) - std::strlen(b), " (impact %+.1f)", at[2] - loc[2]);
+    vr::log::Line(b);
+}
 
 bool IsFriendOrCivilian(const std::string& cls) {
     return cls.find("Adams") != std::string::npos || cls.find("Lugo") != std::string::npos ||

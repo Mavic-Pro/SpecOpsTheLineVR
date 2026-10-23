@@ -358,6 +358,12 @@ extern std::atomic<bool> g_handPredictAuto;
 // Altezza della vista con Walker accucciato: "real" = testa vera sul
 // pavimento, "game" = abbassata dal gioco (crouchview real|game).
 extern std::atomic<bool> g_crouchViewReal;
+// Accucciarsi davvero (30 cm sotto l'altezza in piedi) mette Walker nella
+// postura accucciata del gioco, con le sue animazioni ("physicalcrouch on|off").
+extern std::atomic<bool> g_physicalCrouch;
+// "hittest <z>": linea come un colpo istantaneo verso Walker a <z> unita' sopra
+// il centro del Pawn, esito nel log (-1000 = nessuna richiesta).
+extern std::atomic<float> g_hitTestZ;
 extern std::atomic<bool> g_snapFade;
 extern std::atomic<bool> g_vrPauseRequest;
 extern std::atomic<bool> g_vrProjectionDirty;

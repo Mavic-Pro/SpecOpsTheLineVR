@@ -50,6 +50,7 @@ std::vector<Item> BasicItems() {
         {"marker", "Green aim marker", "A green marker where the barrel points (on by default). Off: use only the weapon's own sights.", Kind::OnOff},
         {"laser", "Laser beam", "A visible beam from the barrel to the point of impact.", Kind::OnOff},
         {"spread", "Bullet spread", "on = the game's spread scaled by stance; off = laser-straight shots.", Kind::OnOff},
+        {"physicalcrouch", "Crouch for real", "Crouch in your room and Walker crouches with you (legs bent, lower behind low walls).", Kind::OnOff},
         {"roomscale", "Room-scale", "Walker follows your real steps (collisions included).", Kind::OnOff},
         {"seated", "Seated play", "Playing sitting down: the view keeps Walker's standing eye height from where your head is when you recenter.", Kind::OnOff},
         {"hints", "Controller hints", "Short hints in the headset during the first sessions.", Kind::Choice, {"auto", "on", "off"}},
@@ -70,7 +71,7 @@ const char* const kControls[] = {
     "B + Y 1 s: gunstock calibration (aim at something far, look at it)",
     "RELOAD BY HAND: grip the magazine under the gun, pull it out, grip at your belt, push it in",
     "WEAPON SWAP: right grip over your shoulder or at your hip",
-    "COVER: duck quickly next to cover; lean out with your body to pop out and aim",
+    "CROUCH: Walker crouches with you   COVER: duck fast by cover, lean out to aim",
 };
 
 std::mutex g_mutex;

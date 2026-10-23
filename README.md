@@ -16,8 +16,9 @@ virtual cinema screen.
 - **6DOF head tracking**: look, lean, crouch and side-step; the head stops at
   walls instead of clipping through them. **Room-scale**: when you step,
   Walker walks with you. Your real height sets the eye height (seated mode
-  available). The game's recoil, camera shakes and crouching never move your
-  view; cuts, checkpoints and death fade from black.
+  available); crouch for real and Walker crouches with you. The game's
+  recoil, camera shakes and crouching never move your view; cuts,
+  checkpoints and death fade from black.
 - **Audio in the headset**: the game's sound follows the Windows default
   playback device, so it reaches the headset even when Virtual Desktop or
   Link starts streaming after the game is already running.

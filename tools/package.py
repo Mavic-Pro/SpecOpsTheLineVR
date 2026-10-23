@@ -344,6 +344,7 @@ GESTURES
   Reload: grip the magazine under the gun with your left hand and pull it out,
     grip at your belt to take a new one, push it into the gun.
     ("reload simple" in specopsvr.ini: left hand on the magazine, pull down.)
+  Crouch: crouch for real and Walker crouches with you (stand up to stand).
   Cover: duck quickly next to cover (not while already in cover).
   Weapon: right hand over your right shoulder (or at your hip) + right grip
     = next weapon.

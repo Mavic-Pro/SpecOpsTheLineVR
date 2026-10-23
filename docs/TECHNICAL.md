@@ -465,7 +465,11 @@ line, wrong on a stock where the hand sits ~25 cm below the eye (-67 degrees).
 - `VISCHECK`: enemies within 2500 units and 35 degrees of the view that are
   not drawn for more than 0.3 s (investigation of enemies disappearing when
   leaning out of cover).
-- `camlog N`, `bodysize`, `SHOT ... on <actor>`, `GRENADE`, `COVER`, `ADS`.
+- `camlog N`, `bodysize`, `SHOT ... on <actor>`, `GRENADE`, `COVER`, `ADS`,
+  `CROUCH`.
+- `hittest <z>`: a zero-extent line (like an instant-hit bullet) from 2 m in
+  front of Walker towards him, `<z>` units above the Pawn centre; `HITTEST`
+  logs what it hits.
 - `tools/regress.py`: release gate (eye pairing, view stability while the gun
   sweeps, checkpoint/cutscene transition, shot accuracy, stalls).
 
@@ -1083,6 +1087,27 @@ automated playtest). What changed, by area:
 - `crouchview real`: the game's crouch (capsule 45 -> 25, pawn 20 units down)
   is removed from the view and the mesh is raised by the same amount (less
   when looking down past 30 degrees); a physical crouch lowers the mesh.
+- `physicalcrouch on` (23/10): crouching 30 cm below the standing height
+  (back up above 20 cm) calls `YAnimtreeManager.PlayPosture(YPTID_Crouch=2)`
+  (`YGamePawn.m_animtreeManager` +0xB30, `m_currentPosture` +0x98, Stand = 1):
+  Walker plays the game's own `Crc_*` crouch set (hips -23, head -28 units,
+  feet on the ground) and keeps it through fire, reload, aim, sprint, weapon
+  swap and grenades; the game camera and capsule do not change. The mesh is
+  lowered only by the part of the real crouch beyond the pose's own head drop
+  (head bone measured in component space, up = -Y, so no feedback with the
+  mesh translation). Before, the standing mesh was pushed into the floor.
+  If the game re-crouches Walker within 2 s of being stood up, it is left
+  alone until the next real crouch. Engine crouch (`bCanCrouch` +
+  `bWantsToCrouch`, +0x228 bits 0x20/0x4) only shrinks the capsule 45 -> 25,
+  the skeleton stays standing: not used.
+  Hits: instant-hit traces hit Walker's mesh through its physics asset
+  (`CH_MC_SK_PHYS_new`, mesh `BlockZeroExtent`); the capsule only blocks
+  extents (`BlockNonZeroExtent`). `hittest`, standing: hit from -10 to +28
+  units above the centre; crouched 45 cm with the hands down: only at 0 and
+  below, +5..+28 passes over him (hands held up: the forearms are hit). So a
+  real crouch behind a low wall protects like the game's cover.
+  *Needs a headset check: body seen from above while crouching, low cover,
+  crouch then duck-into-cover.*
   `height auto`: eye height = standing HMD height x posscale - 45 (25..55);
   `seated on` uses `fp`.
 - Room-scale: past 15 cm the Pawn is moved with `Actor.Move` (collisions) and

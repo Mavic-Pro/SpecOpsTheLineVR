@@ -128,6 +128,8 @@ std::atomic<int> g_hintsShown{0};
 std::atomic<bool> g_weaponNeedsAim{false};
 std::atomic<bool> g_handPredictAuto{false};
 std::atomic<bool> g_crouchViewReal{true};
+std::atomic<bool> g_physicalCrouch{true};
+std::atomic<float> g_hitTestZ{-1000.0f};
 std::atomic<bool> g_snapFade{true};
 std::atomic<bool> g_vrPauseRequest{false};
 std::atomic<bool> g_vrProjectionDirty{false};
@@ -346,6 +348,18 @@ bool OnOff(const std::string& cmd, const std::string& v, bool def) {
 }
 
 bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
+    if (cmd == "physicalcrouch") {
+        std::string v;
+        in >> v;
+        g_physicalCrouch = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "hittest") {
+        float z = 15.0f;
+        in >> z;
+        g_hitTestZ = z;
+        return true;
+    }
     if (cmd == "runtime") {
         // runtime steamvr|openxr|auto: backend VR, letto all'avvio (vr_runtime.cpp);
         // qui si registra solo la preferenza per il prossimo avvio.
