@@ -1,4 +1,4 @@
-"""Builds the release package in dist/SpecOpsTheLineVR.zip.
+"""Builds the release package in dist/0-SpecOpsTheLineVR.zip.
 
 Contents: d3d9.dll (proxy), openvr_api.dll, specopsvr.ini, install/uninstall/
 collect_logs (.bat launching the .ps1 next to it) and README.txt. No Windows files are shipped
@@ -14,6 +14,7 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAME = "SpecOpsTheLineVR"
 DIST = os.path.join(ROOT, "dist", NAME)
+ZIP_NAME = "0-" + NAME + ".zip"
 
 
 def version():
@@ -411,7 +412,11 @@ def main():
     import json
     with open(os.path.join(DIST, "companions.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"version": version(), "files": entries}, f, indent=1)
-    zip_path = os.path.join(ROOT, "dist", NAME + ".zip")
+    # GitHub lists release assets by name: the "0-" prefix puts the zip first,
+    # above the updater's loose files (before, players had to expand the list).
+    zip_path = os.path.join(ROOT, "dist", ZIP_NAME)
+    if os.path.exists(os.path.join(ROOT, "dist", NAME + ".zip")):
+        os.remove(os.path.join(ROOT, "dist", NAME + ".zip"))
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for name in sorted(os.listdir(DIST)):
             z.write(os.path.join(DIST, name), os.path.join(NAME, name))

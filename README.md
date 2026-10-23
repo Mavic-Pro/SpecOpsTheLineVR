@@ -83,7 +83,7 @@ virtual cinema screen.
 
 ## Install
 
-1. Download `SpecOpsTheLineVR.zip` from the
+1. Download `0-SpecOpsTheLineVR.zip` (the first file) from the
    [latest release](https://github.com/Mavic-Pro/SpecOpsTheLineVR/releases/latest)
    and extract it anywhere.
 2. Run `install.bat`. It looks for `SpecOpsTheLine.exe`: Steam libraries,
@@ -231,7 +231,7 @@ Requirements: Visual Studio 2022 (C++ desktop workload, 32-bit toolset), CMake
 ```
 cmake -S . -B build -A Win32
 cmake --build build --config Release
-python tools/package.py        # dist/SpecOpsTheLineVR.zip
+python tools/package.py        # dist/0-SpecOpsTheLineVR.zip
 python tools/regress.py        # release gate (runs the game, no headset needed)
 ```
 
