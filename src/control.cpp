@@ -59,6 +59,7 @@ std::atomic<bool> g_stickTurning{false};
 std::atomic<bool> g_coverSnapCompensate{true};
 std::atomic<bool> g_coverPeekEnabled{true};
 std::atomic<bool> g_coverPeek{false};
+std::atomic<bool> g_coverLeanEnabled{true};
 std::atomic<bool> g_turretAimHand{true};
 std::atomic<bool> g_adsEnabled{true};
 std::atomic<bool> g_adsActive{false};
@@ -348,6 +349,12 @@ bool OnOff(const std::string& cmd, const std::string& v, bool def) {
 }
 
 bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
+    if (cmd == "coverlean") {
+        std::string v;
+        in >> v;
+        g_coverLeanEnabled = OnOff(cmd, v, true);
+        return true;
+    }
     if (cmd == "physicalcrouch") {
         std::string v;
         in >> v;

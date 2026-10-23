@@ -362,6 +362,15 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
         ret = (v & Field(retProp, kOffBoolMask)) ? "true" : "false";
     } else if (type == "ByteProperty") {
         ret = std::to_string(v & 0xFF);
+    } else if (type == "StructProperty") {
+        // Vettori e rotatori (GetBoneLocation, GetPawnViewLocation...): i primi 3 campi.
+        float f[3];
+        std::memcpy(f, parms + off, 12);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "(%.1f, %.1f, %.1f) / ints (%d, %d, %d)", f[0], f[1], f[2],
+                 *reinterpret_cast<int32_t*>(parms + off), *reinterpret_cast<int32_t*>(parms + off + 4),
+                 *reinterpret_cast<int32_t*>(parms + off + 8));
+        ret = buf;
     } else {
         ret = std::to_string(static_cast<int32_t>(v));
     }

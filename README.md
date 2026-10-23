@@ -212,7 +212,7 @@ documented in the file (aiming, arms, cover, comfort, cinema screen, haptics,
 performance, updates). The same commands can be sent while the game runs by
 writing them to `specopsvr_cmd.txt` in the same folder. If something looks
 wrong, most features can be switched off one by one (`ads off`,
-`coverpeek off`, `turretaim stick`, `cinemawalker screen`, `gesture melee off`,
+`coverpeek off`, `coverlean off`, `turretaim stick`, `cinemawalker screen`, `gesture melee off`,
 `vrinput legacy`).
 
 ## Reporting bugs

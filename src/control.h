@@ -220,6 +220,9 @@ extern std::atomic<bool> g_coverSnapCompensate;
 // esce dal riparo per mirare ("coverpeek on|off"). g_coverPeek: stato attuale.
 extern std::atomic<bool> g_coverPeekEnabled;
 extern std::atomic<bool> g_coverPeek;
+// Mirando in copertura la vista segue Walker che si sporge oltre lo spigolo
+// ("coverlean on|off").
+extern std::atomic<bool> g_coverLeanEnabled;
 // Torrette e mitragliatrici fisse mirate col controller ("turretaim hand|stick").
 extern std::atomic<bool> g_turretAimHand;
 // Mira con le tacche: occhio sulla linea della canna -> niente mirino verde e

@@ -380,6 +380,20 @@ Useful offsets (`ue3.py props`):
   body turned away from the view (stick forward walked into walls).
   In cover, raising the head 12 cm or leaning 18 cm from where it was when
   entering cover holds LT: Walker pops out to aim (`coverpeek`).
+  While aiming in cover (`m_aimingReplicated`, +0x5F0 bit 0x800) the view,
+  and with it hands and gun, follows the sideways part (relative to the Pawn,
+  6-unit dead zone, at most 45) of the Head bone offset from the mesh origin:
+  around a corner Walker's head moves ~30 units, while the view stayed on the
+  player's head behind the wall (hostage scene, ch. 1, 23/10: the player had
+  to walk out of cover in the room). The offset is added in ApplyFirstPerson
+  with an 80 ms time constant (`coverlean`).
+- `YGamePawn::RaiseWeapon` (0x0052F2B0): with the body a step from a wall in
+  front the script calls it with YRWS_Raised (2) and m_weaponRaised (+0x499)
+  makes MayAim (0x0065B7C0) and UpdateMayFireWeaponInternal (0x0068A820)
+  refuse aim and fire (zoomWithoutFire): the trigger reached the game and no
+  shot left. With the barrel aim the mod turns YRWS_Raised into None for the
+  player (YRWS_NoAim, scripted no-aim zones, is kept); MuzzleStart already
+  handles a barrel inside the wall.
 - Turrets (`YWeapon_Stationary`): the PlayerController is steered towards the
   right controller (35% of the error per frame, yaw and pitch); the part of
   the yaw actually performed is moved into the yaw reference and body pitch

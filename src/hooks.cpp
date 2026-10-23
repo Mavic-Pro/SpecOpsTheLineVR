@@ -2818,6 +2818,9 @@ bool PawnOnFirmGround(void* pawn);
 // Avanzamento degli occhi rispetto al centro di Walker applicato nell'ultima
 // copia della camera (fp a terra, 0 sui mezzi, 0 se la vista non e' su Walker).
 std::atomic<float> g_fwdApplied{0.0f};
+// Sporgenza di Walker fuori dal riparo (UpdateCoverLean), in unita' del mondo:
+// la vista (e con lei mani e arma) la segue.
+std::atomic<float> g_coverLean[2] = {{0.0f}, {0.0f}};
 
 void ApplyFirstPerson(char* cam) {
     g_fwdApplied = 0.0f;
@@ -2848,8 +2851,8 @@ void ApplyFirstPerson(char* cam) {
     // dell'elicottero (19/10, nel visore, anche nella 0.9.6).
     float fwd = PawnOnFirmGround(pawn) ? vr::control::g_fpForward.load() : 0.0f;
     g_fwdApplied = fwd;  // per le correzioni del perno (girando, gli occhi non devono scivolare)
-    loc[0] = p[0] + fwd * std::cos(yaw);
-    loc[1] = p[1] + fwd * std::sin(yaw);
+    loc[0] = p[0] + fwd * std::cos(yaw) + g_coverLean[0].load(std::memory_order_relaxed);
+    loc[1] = p[1] + fwd * std::sin(yaw) + g_coverLean[1].load(std::memory_order_relaxed);
     // "height auto": occhi all'altezza della testa vera (in piedi, misurata da
     // SteamVR sul pavimento) sopra i piedi di Walker; prima sempre 40 unita'
     // sopra il centro del Pawn, ~20 cm sopra gli occhi di Walker e uguale per
@@ -3006,6 +3009,72 @@ void UpdatePawnFacing(char* cam, void* pawn) {
         logged = true;
         vr::log::Line("BODY: Walker turned with the view while standing still (" + std::to_string(d * 360 / 65536) +
                       " degrees; the game only turns him when walking).");
+    }
+}
+
+// Sporgersi dal riparo: mirando in copertura (m_aimingReplicated, +0x5F0 bit
+// 0x800, con LT o sporgendosi col corpo: coverpeek) l'animazione porta la
+// testa di Walker oltre lo spigolo, ma la vista restava sulla testa vera,
+// dietro il riparo: si vedeva il muro e bisognava uscire camminando nella
+// stanza (scena degli ostaggi, cap. 1, 23/10: "il corpo rimane attaccato al
+// muro, bisogna muoversi fisicamente fuori copertura"; misurato: testa 30
+// unita' a destra, 60 cm, colpi dallo spigolo). La vista segue la parte
+// laterale (rispetto al Pawn) dello spostamento dell'osso Head dall'origine
+// della mesh: la traslazione della mesh decisa dalla mod si annulla, l'altezza
+// resta della testa vera (alzarsi da un riparo basso lo fa gia' il giocatore).
+void UpdateCoverLean(char* cam, void* pawn) {
+    constexpr uintptr_t kMeshOff = 0x3A8, kL2wOff = 0x70;  // Pawn.Mesh, PrimitiveComponent.LocalToWorld
+    static double lastT = 0.0;
+    double now = ProfMs() * 0.001;
+    float dt = lastT > 0.0 ? static_cast<float>(now - lastT) : 0.011f;
+    lastT = now;
+    if (dt <= 0.0f || dt > 0.1f) dt = 0.011f;
+    float target[2] = {0.0f, 0.0f};
+    uint32_t cover = 0, flags = 0, mesh = 0;
+    int32_t pawnYaw = 0;
+    float l2w[16];
+    if (pawn && HasCameraSignature(cam) && vr::control::g_coverLeanEnabled && vr::control::g_mode != vr::control::kModeOff &&
+        vr::control::g_firstPerson && !vr::control::g_cinemaActive && PawnAlive(pawn) &&
+        TrySafeReadUint32(static_cast<char*>(pawn) + 0x498, &cover) && (cover & 0xFF) != 0 &&
+        TrySafeReadUint32(static_cast<char*>(pawn) + 0x5F0, &flags) && (flags & 0x800) &&
+        TrySafeReadUint32(static_cast<char*>(pawn) + kMeshOff, &mesh) && mesh &&
+        SafeCopy(&pawnYaw, static_cast<char*>(pawn) + 0x64, 4) &&
+        SafeCopy(l2w, reinterpret_cast<char*>(mesh) + kL2wOff, sizeof(l2w))) {
+        static int32_t headName = -1;
+        if (headName < 0) headName = vr::script::NameIndex("Head");
+        struct {
+            int32_t name[2];
+            int32_t space;
+            float ret[3];
+        } hp = {{headName, 0}, 0, {0, 0, 0}};
+        if (headName >= 0 && vr::script::CallFunction(reinterpret_cast<void*>(mesh), "GetBoneLocation", &hp) &&
+            std::isfinite(hp.ret[0]) && std::isfinite(hp.ret[1])) {
+            float a = pawnYaw * (6.28318530718f / 65536.0f);
+            float rx = -std::sin(a), ry = std::cos(a);  // destra del Pawn
+            float lat = (hp.ret[0] - l2w[12]) * rx + (hp.ret[1] - l2w[13]) * ry;
+            // Fermi in copertura la testa sta entro ~5 unita' dall'asse.
+            constexpr float kDead = 6.0f, kMax = 45.0f;
+            lat = std::fabs(lat) < kDead ? 0.0f : lat - std::copysign(kDead, lat);
+            lat = (std::max)(-kMax, (std::min)(kMax, lat));
+            target[0] = rx * lat;
+            target[1] = ry * lat;
+        }
+    }
+    // Segue l'animazione con una costante di tempo di 80 ms (niente scatti
+    // dall'osso da un frame all'altro), anche rientrando.
+    float k = 1.0f - std::exp(-dt / 0.08f);
+    float cur[2] = {g_coverLean[0].load(), g_coverLean[1].load()};
+    for (int i = 0; i < 2; ++i) {
+        cur[i] += (target[i] - cur[i]) * k;
+        if (std::fabs(cur[i]) < 0.05f && target[i] == 0.0f) cur[i] = 0.0f;
+        g_coverLean[i] = cur[i];
+    }
+    static bool logged = false;
+    float len = std::sqrt(cur[0] * cur[0] + cur[1] * cur[1]);
+    if (!logged && len > 15.0f) {
+        logged = true;
+        vr::log::Line("COVER: Walker leans out of cover " + std::to_string(static_cast<int>(len)) +
+                      " units, the view goes with him (coverlean).");
     }
 }
 
@@ -3417,6 +3486,7 @@ public:
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdatePhysicalCrouch(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdatePawnFacing(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        UpdateCoverLean(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RunHitTest(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // da seduti il corpo (in piedi) si vedeva deforme: solo braccia (21/10)
         UpdateProjectileLog();
@@ -9402,6 +9472,41 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
     }
 }
 
+// YGamePawn::RaiseWeapon(YE_RaiseWeaponState) (FUN_0052f2b0, __thiscall(this,
+// BYTE state), chiamata dallo script tramite execRaiseWeapon 0x00A27380):
+// con il corpo di Walker a un passo da un muro davanti lo script la chiama con
+// YRWS_Raised (2) e m_weaponRaised (+0x499) diventa 2. Da li' MayAim
+// (FUN_0065b7c0) e UpdateMayFireWeaponInternal (FUN_0068a820) rispondono "ne'
+// mira ne' fuoco": il grilletto arriva al gioco (m_primaryFireInput) e non
+// parte nessun colpo, anche con l'arma vera (nelle mani) gia' fuori dal muro
+// (23/10, scena degli ostaggi del cap. 1, Walker col viso contro il container
+// fuori copertura: nessun colpo; girato di 180 gradi colpi subito). In
+// copertura invece non succede: li' decide la posa di mira del gioco
+// (UpdateCoverLean). In VR l'arma e' quella nelle mani
+// e il muro lo considera gia' MuzzleStart (il colpo parte prima dell'ostacolo
+// se la canna e' dentro): Raised diventa None. YRWS_NoAim (1, zone in cui lo
+// script vieta la mira) resta del gioco.
+constexpr uintptr_t kRaiseWeaponAddr = 0x0052F2B0;
+constexpr uint8_t kRaiseWeaponRaised = 2;  // YE_RaiseWeaponState.YRWS_Raised
+typedef void(__thiscall* RaiseWeapon_t)(void* self, uint8_t state);
+RaiseWeapon_t g_RaiseWeapon_Original = nullptr;
+void __fastcall Hooked_RaiseWeapon(void* self, void* /*edx*/, uint8_t state) {
+    if (state == kRaiseWeaponRaised && vr::control::g_mode != vr::control::kModeOff && vr::control::g_firstPerson &&
+        !vr::control::g_cinemaActive && vr::control::g_muzzleAim && g_armsActive) {
+        char* cam = static_cast<char*>(g_cameraPtr.load());
+        if (HasCameraSignature(cam) && PlayerPawnIfViewTarget(cam) == self) {
+            state = 0;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                vr::log::Line("FIRE: Walker's body faces a wall up close: the game would raise the weapon and block "
+                              "aim and fire; kept ready (the shot leaves from the barrel in your hands).");
+            }
+        }
+    }
+    g_RaiseWeapon_Original(self, state);
+}
+
 void* GetPlayerViewPointThunkAddress() {
     union {
         void (GetPlayerViewPointThunk::*mfp)(float*, int32_t*);
@@ -9884,6 +9989,13 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     } else {
         vr::log::Line("ERROR: hook on CalcWeaponFire failed.");
     }
+    void* rwTarget = reinterpret_cast<void*>(kRaiseWeaponAddr);
+    if (MH_CreateHook(rwTarget, reinterpret_cast<void*>(&Hooked_RaiseWeapon),
+                      reinterpret_cast<void**>(&g_RaiseWeapon_Original)) == MH_OK &&
+        MH_EnableHook(rwTarget) == MH_OK)
+        vr::log::Line("Hook on YGamePawn::RaiseWeapon installed (aim and fire with the body against a wall).");
+    else
+        vr::log::Line("ERROR: hook on RaiseWeapon failed.");
 
     void* csvTarget = reinterpret_cast<void*>(kCalcSceneViewAddr);
     if (MH_CreateHook(csvTarget, GetCalcSceneViewThunkAddress(),
