@@ -2002,8 +2002,44 @@ bool HasCameraSignature(void* p) {
 
 // Chiamata dallo stub naked qui sotto. Solo aritmetica intera: ST0 contiene
 // ancora il float che l'fstp originale deve scrivere, non va toccato.
+// Indici FName di PlayerController/LocalPlayer, risolti fuori dall'hook
+// (ResolveCameraClassNames, tick di gioco). Il valore-firma 0.05 a +0x64 non
+// basta da solo: il 23/10 all'inizio della scena degli ostaggi (cambio di
+// controller) un altro oggetto con 0.05 a +0x64 e' passato da qui ed e'
+// diventato "la camera"; il suo finto LocalPlayer puntava nel codice dell'exe
+// e la scrittura del ViewState dell'occhio destro ha fatto crashare il gioco.
+std::atomic<int32_t> g_pcNameIndex{-1}, g_lpNameIndex{-1};
+
+// Solo letture intere protette (niente stringhe/allocazioni: usata anche
+// dall'hook del setter con ST0 carico). UObject: Name +0x2C, Class +0x34,
+// UStruct::SuperField +0x3C.
+bool ObjIsANameIndex(const void* obj, int32_t nameIndex) {
+    uint32_t c = 0;
+    if (!obj || nameIndex < 0 || !TrySafeReadUint32(const_cast<char*>(static_cast<const char*>(obj)) + 0x34, &c)) return false;
+    for (int i = 0; c && i < 32; ++i) {
+        uint32_t name = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<char*>(c) + 0x2C, &name)) return false;
+        if (static_cast<int32_t>(name) == nameIndex) return true;
+        if (!TrySafeReadUint32(reinterpret_cast<char*>(c) + 0x3C, &c)) return false;
+    }
+    return false;
+}
+
+void ResolveCameraClassNames() {
+    if (g_pcNameIndex.load() < 0) g_pcNameIndex = vr::script::NameIndex("PlayerController");
+    if (g_lpNameIndex.load() < 0) g_lpNameIndex = vr::script::NameIndex("LocalPlayer");
+}
+
+// Camera vera: firma + l'oggetto 0x77C prima e' una PlayerController. Finche'
+// l'indice del nome non e' noto (primi istanti) basta la firma, come prima.
+bool IsPlayerCameraCandidate(void* p) {
+    if (!HasCameraSignature(p)) return false;
+    int32_t pcIdx = g_pcNameIndex.load(std::memory_order_relaxed);
+    return pcIdx < 0 || ObjIsANameIndex(static_cast<char*>(p) - 0x77C, pcIdx);
+}
+
 extern "C" void __cdecl CameraHookCheck(void* dest) {
-    if (HasCameraSignature(dest)) {
+    if (IsPlayerCameraCandidate(dest)) {
         g_cameraPtr = dest;
         vr::control::g_playerController = static_cast<char*>(dest) - 0x77C;
         g_cameraSeenSeq.fetch_add(1, std::memory_order_relaxed);
@@ -2940,6 +2976,39 @@ bool PawnAlive(void* pawn) {
     return pawn && TrySafeReadUint32(static_cast<char*>(pawn) + 0x304, &hp) && static_cast<int32_t>(hp) > 0;
 }
 
+// Corpo girato con la testa anche da fermi (23/10, utente: "il collo si gira
+// a 360 gradi senza muovere il corpo"). Il gioco gira il Pawn verso la
+// PlayerController solo camminando (misurato: PC +90 gradi da fermo, Pawn
+// immobile; al primo passo si allinea in ~1 s). "turnwithhead" gira la PC,
+// quindi da fermi Walker restava com'era: girandosi si vedevano le sue spalle
+// e il collo nascosto. Qui Pawn.Rotation.Yaw (+0x64) segue lo yaw della PC
+// (la mesh lo segue al tick dopo; la capsula e' un cilindro). Non in
+// copertura, nelle mosse animate, sulle torrette, sui mezzi, nelle scene e da
+// morti: li' l'orientamento lo decide il gioco.
+void UpdatePawnFacing(char* cam, void* pawn) {
+    if (!pawn || !HasCameraSignature(cam) || vr::control::g_mode == vr::control::kModeOff ||
+        !vr::control::g_firstPerson || vr::control::g_cinemaActive || vr::control::g_inCover ||
+        vr::control::g_gameLocked || g_pawnSpecialAnim || TurretAimActive() || !PawnAlive(pawn) ||
+        !PawnOnFirmGround(pawn))
+        return;
+    // Copertura letta anche qui (m_coverFaceState +0x498): g_inCover lo
+    // aggiorna solo il percorso del visore.
+    uint32_t cover = 0;
+    if (!TrySafeReadUint32(static_cast<char*>(pawn) + 0x498, &cover) || (cover & 0xFF) != 0) return;
+    int32_t pcYaw = 0, pawnYaw = 0;
+    if (!SafeCopy(&pcYaw, cam - 0x77C + 0x64, 4) || !SafeCopy(&pawnYaw, static_cast<char*>(pawn) + 0x64, 4)) return;
+    int32_t d = static_cast<int16_t>(static_cast<uint16_t>(pcYaw - pawnYaw));
+    if (std::abs(d) < 32) return;  // sotto 0,2 gradi
+    int32_t v = pawnYaw + d;
+    if (!SafeCopy(static_cast<char*>(pawn) + 0x64, &v, 4)) return;
+    static bool logged = false;
+    if (!logged && std::abs(d) > 1820) {  // 10 gradi
+        logged = true;
+        vr::log::Line("BODY: Walker turned with the view while standing still (" + std::to_string(d * 360 / 65536) +
+                      " degrees; the game only turns him when walking).");
+    }
+}
+
 // Ultimo spostamento d'occhio applicato (mondo), per togliere/rimettere
 // l'occhio intorno allo smorzamento dell'altezza e alla collisione della testa.
 float g_eyeOffsetApplied[2][3] = {};
@@ -3150,7 +3219,10 @@ bool CallDestroyViewState(uint32_t state) {
 // Indirizzo di LocalPlayer.ViewState del giocatore (nullptr se non valido).
 uint32_t* ViewStateSlot(char* cam) {
     uint32_t lp = 0, vs = 0;
-    if (!HasCameraSignature(cam) || !TrySafeReadUint32(cam - 0x77C + kOffPcPlayer, &lp) || !lp) return nullptr;
+    if (!IsPlayerCameraCandidate(cam) || !TrySafeReadUint32(cam - 0x77C + kOffPcPlayer, &lp) || !lp) return nullptr;
+    // Il valore viene SCRITTO (ViewState dell'occhio destro): solo su un vero
+    // LocalPlayer (crash del 23/10 con un puntatore nel codice dell'exe).
+    if (!ObjIsANameIndex(reinterpret_cast<void*>(lp), g_lpNameIndex.load())) return nullptr;
     if (!TrySafeReadUint32(reinterpret_cast<char*>(lp) + kOffLpViewState, &vs) || !vs) return nullptr;
     return reinterpret_cast<uint32_t*>(lp + kOffLpViewState);
 }
@@ -3344,6 +3416,7 @@ public:
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdatePhysicalCrouch(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        UpdatePawnFacing(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RunHitTest(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateFirstPersonBody(vr::control::g_fpBody && HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // da seduti il corpo (in piedi) si vedeva deforme: solo braccia (21/10)
         UpdateProjectileLog();
@@ -4185,6 +4258,7 @@ void UpdateHeadTracking() {
         }
     }
 
+    ResolveCameraClassNames();
     void* camera = g_cameraPtr.load();
     if (camera != g_lastLoggedCameraPtr) {
         g_lastLoggedCameraPtr = camera;
