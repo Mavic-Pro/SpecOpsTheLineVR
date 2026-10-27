@@ -65,8 +65,12 @@ add_library(d3d9proxy SHARED
     src/vr_runtime.h
     src/vr_openxr.cpp
     src/vr_openxr.h
+    src/vr_fake.cpp
+    src/vr_fake.h
     src/xr_shim_ifaces.h
     src/script_call.cpp
+    src/props.cpp
+    src/props.h
     src/updater.cpp
     src/pure_utils.h
     src/vr_toast.cpp

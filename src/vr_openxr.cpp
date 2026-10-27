@@ -22,6 +22,7 @@
 #include "xr_shim_ifaces.h"
 #include "control.h"
 #include "logger.h"
+#include "pure_utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -340,6 +341,30 @@ struct State {
     // Viste del frame in corso (spazio stage) e occhio->testa (spazio view).
     XrView frameViews[2] = {};
     bool frameViewsValid = false;
+    // Campo visivo dato al mod per disegnare (ultimo GetProjection*): con
+    // l'invio con la posa (submitpose on) e' quello dichiarato nel layer, piu'
+    // 1,5 gradi per lato (overscan), WI-1.
+    XrFovf renderFov[2] = {};
+    bool renderFovValid = false, overscan = false;
+    float overscanDeg = 1.5f;  // "xroverscan" (gradi per lato), letto alla fine del frame
+    // Attesa del mutex dai thread diversi da quello di uscita (ogni chiamata
+    // dell'interfaccia), WI-1. Review 2 WI-1: per thread. Il thread di gioco
+    // somma le sue attese per tick (t_waitTickUs, chiuso da EndGameTickLockWait
+    // al confine del tick; gameTickHist lo tocca solo il thread di gioco, senza
+    // mutex): con ~30 chiamate per tick un'attesa di 2-4 ms nel 20% dei tick
+    // era lo 0,7% delle chiamate e il p99 per chiamata non la vedeva. Present,
+    // sessione e altri thread per chiamata (callHist, sotto g.mutex).
+    vr::pure::WaitHistogram gameTickHist;
+    double gameTickLogMs = 0.0;
+    vr::pure::WaitHistogram callHist[3];  // 0 altri thread, 1 Present, 2 sessione
+    double callLogMs[3] = {};
+    // Ultimo cambio dello spazio di riferimento con la posa (WI-2): origine del
+    // nuovo spazio nel vecchio, letta da TakeSpaceChange (spaceChangePending:
+    // controllo senza mutex a ogni tick).
+    bool spaceChangeValid = false;
+    std::atomic<bool> spaceChangePending{false};
+    Mat34 spaceChange = {};
+    DWORD outputThread = 0;  // thread che inizia i frame (vr_output): escluso dal conto
     XrView eyeInHead[2] = {};
     bool eyeInHeadValid = false;
     std::atomic<float> hz{0.0f};
@@ -423,16 +448,49 @@ XrTime Now() {
     return g.lastPredicted + static_cast<XrTime>((QpcMs() - g.frameBeginMs) * 1e6);
 }
 
-// Trasformazione grip -> raw dei Touch (componente openxr_grip del modello di SteamVR).
+// Trasformazione grip -> raw dei Touch (componente openxr_grip del modello di
+// SteamVR): costanti in vr::pure::GripInRaw, condivise con PalmOf (25/10).
 Mat34 GripToRaw(int hand) {
-    Mat34 c = RotX(g.gripPitch);
-    c.m[0][3] = hand == 0 ? 0.007f : -0.007f;
-    c.m[1][3] = -0.00182941f;
-    c.m[2][3] = 0.1019482f;
+    Mat34 c;
+    vr::pure::GripInRaw(hand == 0, g.gripPitch, c.m);
     return Inverse(c);
 }
 
+// Raggio di puntamento nello spazio della mano (WI-4a, telaio dell'arma): la
+// posa aim del runtime localizzata nello spazio della mano (grip * inverse di
+// GripInRaw), media di 10 campioni a 100 ms entro 0,2 gradi l'uno dall'altro,
+// solo con un profilo di controller attivo e una misura plausibile
+// (vr::pure::AimInRawPlausible). Con VDXR e i Touch vale (-39,4, 0, 0); le
+// correzioni personali di VDXR (OffsetsTool, registro) e gli altri controller
+// la cambiano, e l'arma segue la posa aim vera invece della costante.
+// Review WI-4a (round 1): la logica sta in vr::pure::AimRayMeasure (misura
+// ricordata per profilo, rimisura ogni 30 s); qui i valori pubblicati per il
+// thread di gioco (MeasuredAimInRaw), atomici.
+struct AimMeasure {
+    vr::pure::AimRayMeasure logic;  // solo sotto il lock del backend
+    std::atomic<bool> valid{false};
+    std::atomic<float> pitch{0.0f}, yaw{0.0f}, roll{0.0f};
+    void Publish() {
+        if (logic.valid) {
+            pitch = logic.cur.pitch;
+            yaw = logic.cur.yaw;
+            roll = logic.cur.roll;
+        }
+        valid = logic.valid;
+    }
+    void Reset() {  // sessione chiusa
+        logic.Reset();
+        Publish();
+    }
+    void ResetSpace() {  // spazio della mano nuovo (openxrgrip): si rimisura
+        logic.ResetSpace();
+        Publish();
+    }
+};
+AimMeasure g_aimMeasure[2];
+
 bool CreateHandSpaces() {
+    for (int h = 0; h < 2; ++h) g_aimMeasure[h].ResetSpace();  // spazio della mano nuovo (openxrgrip): si rimisura
     for (int h = 0; h < 2; ++h) {
         if (g.handSpace[h]) fn.xrDestroySpace(g.handSpace[h]);
         g.handSpace[h] = XR_NULL_HANDLE;
@@ -891,6 +949,63 @@ void PushEvent(uint32_t type, vr::TrackedDeviceIndex_t dev = kHmd) {
     g.events.push_back(ev);
 }
 
+// Misura del raggio di puntamento nello spazio della mano (vedi AimMeasure).
+// Sotto il lock del backend, da SyncActions; due xrLocateSpace ogni 100 ms per
+// mano finche' la misura non e' fatta, poi 10 campioni ogni 30 s (review
+// WI-4a, round 1: rimisura; la riga nel log solo se la misura cambia).
+void MeasureAimInRaw(double now) {
+    for (int h = 0; h < 2; ++h) {
+        AimMeasure& m = g_aimMeasure[h];
+        vr::pure::AimRayMeasure& L = m.logic;
+        const HandState& hs = g.hand[h];
+        // Profili delle mani tracciate: la loro posa aim e' quella del pinch.
+        const bool usable = !hs.profile.empty() && hs.profile.find("hand_interaction") == std::string::npos;
+        char b[420];
+        if (L.SetProfile(usable ? hs.profile : std::string(), now) == vr::pure::AimRayMeasure::kReused) {
+            std::snprintf(b, sizeof(b),
+                          "OPENXR: %s pointing ray (aim pose): profile %s again, its last measurement re-used at once: pitch %.2f "
+                          "yaw %.2f roll %.2f deg (re-measured within 30 s).",
+                          h ? "right" : "left", hs.profile.c_str(), L.cur.pitch, L.cur.yaw, L.cur.roll);
+            vr::log::Line(b);
+        }
+        m.Publish();
+        if (!hs.poseActive || !g.handSpace[h] || !g.aimSpace[h] || !L.Due(now)) continue;
+        XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+        if (XR_FAILED(fn.xrLocateSpace(g.aimSpace[h], g.handSpace[h], Now(), &loc)) ||
+            !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+            L.Drop(now);
+            continue;
+        }
+        const Mat34 rel = FromPose(loc.pose);
+        const vr::pure::Euler e = vr::pure::ExactEuler(rel.m);
+        const float a[3] = {e.pitch * 57.2957795f, e.yaw * 57.2957795f, e.roll * 57.2957795f};
+        const vr::pure::AimInRaw before = L.cur;
+        vr::pure::AimInRaw r;
+        const vr::pure::AimRayMeasure::Event ev = L.Sample(now, a, &r);
+        if (ev == vr::pure::AimRayMeasure::kImplausible && !L.warned) {
+            std::snprintf(b, sizeof(b),
+                          "OPENXR: %s pointing ray (aim pose) in the hand pose: pitch %.2f yaw %.2f roll %.2f deg, not plausible for "
+                          "a controller (profile %s): the gun keeps the Touch model (%.1f deg).",
+                          h ? "right" : "left", r.pitch, r.yaw, r.roll, hs.profile.c_str(),
+                          (g.gripFix ? g.gripPitch : 0.0f) - vr::pure::kGripInAimPitchDeg);
+            vr::log::Line(b);
+            L.warned = true;
+        } else if (ev == vr::pure::AimRayMeasure::kMeasured || ev == vr::pure::AimRayMeasure::kChanged) {
+            const bool changed = ev == vr::pure::AimRayMeasure::kChanged;
+            std::snprintf(b, sizeof(b),
+                          "OPENXR: %s pointing ray (aim pose) %s in the hand pose: pitch %.2f yaw %.2f roll %.2f deg%s "
+                          "(SteamVR Touch model: -39.40 0 0; openxrgrip %s), profile %s.",
+                          h ? "right" : "left", changed ? "re-measured, CHANGED" : "measured", r.pitch, r.yaw, r.roll,
+                          changed ? (" (was " + std::to_string(before.pitch) + " " + std::to_string(before.yaw) + " " +
+                                     std::to_string(before.roll) + ")").c_str()
+                                  : "",
+                          g.gripFix ? std::to_string(g.gripPitch).c_str() : "off", hs.profile.c_str());
+            vr::log::Line(b);
+        }
+        m.Publish();
+    }
+}
+
 // Sincronizzazione delle azioni (al massimo una ogni 2 ms) e lettura degli stati.
 void SyncActions(bool force) {
     if (!g.running) return;
@@ -949,6 +1064,7 @@ void SyncActions(bool force) {
         g.lastProfileMs = now;
         RefreshProfiles();
     }
+    MeasureAimInRaw(now);
 }
 
 bool LocateHand(int h, XrTime t, Mat34* out) {
@@ -1236,7 +1352,19 @@ void UploadOverlays() {
             if (!fmt) fmt = g.eyeFormat;
             if (EnsureSwap(o.swap, d.Width, d.Height, fmt)) WriteSwap(o.swap, o.tex, nullptr, 0);
         } else if (o.pixW && o.pixH && !o.pixels.empty()) {
-            if (EnsureSwap(o.swap, o.pixW, o.pixH, g.overlayFormat)) WriteSwap(o.swap, nullptr, o.pixels.data(), o.pixW * 4);
+            // Trasparenza dell'overlay (SetOverlayAlpha) moltiplicata nell'alfa
+            // dei pixel: il quad usa l'alfa della texture non premoltiplicata.
+            // Prima l'alfa serviva solo a nascondere l'overlay sotto 0,01, e
+            // l'HUD al polso (voce 5) restava opaco fino a sparire di colpo.
+            const uint8_t* src = o.pixels.data();
+            std::vector<uint8_t> faded;
+            if (o.alpha < 0.999f) {
+                faded = o.pixels;
+                const float k = (std::max)(0.0f, o.alpha);
+                for (size_t i = 3; i < faded.size(); i += 4) faded[i] = static_cast<uint8_t>(faded[i] * k + 0.5f);
+                src = faded.data();
+            }
+            if (EnsureSwap(o.swap, o.pixW, o.pixH, g.overlayFormat)) WriteSwap(o.swap, nullptr, src, o.pixW * 4);
         }
         o.dirty = false;
     }
@@ -1317,6 +1445,22 @@ void EndFrameLocked(bool newEyes) {
     {
         std::lock_guard<std::recursive_mutex> lock(g.mutex);
         display = g.frameState.predictedDisplayTime;
+        // Overscan acceso/spento con "submitpose": il mod ricalcola la proiezione.
+        if (g.overscan != vr::control::g_submitWithPose.load()) {
+            g.overscan = vr::control::g_submitWithPose.load();
+            g.overscanDeg = vr::control::g_xrOverscanDeg.load();
+            vr::control::g_vrProjectionDirty = true;
+            char ob[160];
+            std::snprintf(ob, sizeof(ob), "OPENXR: render field of view %s",
+                          g.overscan ? "wider per side by \"xroverscan\" (submit with render pose)" : "as the runtime's views");
+            vr::log::Line(ob);
+        }
+        // "xroverscan" cambiato con submitpose acceso: proiezione da ricalcolare.
+        if (g.overscan && std::fabs(g.overscanDeg - vr::control::g_xrOverscanDeg.load()) > 1e-4f) {
+            g.overscanDeg = vr::control::g_xrOverscanDeg.load();
+            vr::control::g_vrProjectionDirty = true;
+            vr::log::Line("OPENXR: overscan " + std::to_string(g.overscanDeg) + " deg per side.");
+        }
         SyncActions(false);
         if (newEyes && g.submit[0].set && g.submit[1].set && g.eyeFormat) {
             bool ok = true;
@@ -1338,6 +1482,13 @@ void EndFrameLocked(bool newEyes) {
                 if (s.hasPose && g.eyeInHeadValid) pv.pose = ToPose(Mul(s.pose, FromPose(g.eyeInHead[e].pose)));
                 else pv.pose = g.frameViews[e].pose;
                 pv.fov = g.frameViewsValid ? g.frameViews[e].fov : XrFovf{-0.785f, 0.785f, 0.785f, -0.785f};
+                // Il campo visivo con cui il mod ha davvero disegnato (overscan
+                // compreso), con o senza posa: la posa e' indipendente dal campo
+                // visivo. Review WI-1: prima solo con la posa, e con "submitpose
+                // on" i frame senza posa (cannocchiale, coppie senza tag) erano
+                // disegnati larghi ma dichiarati stretti: immagine ~3% piu'
+                // piccola, salto di scala entrando e uscendo dal cannocchiale.
+                if (g.renderFovValid) pv.fov = g.renderFov[e];
             }
             if (ok) {
                 g.projValid = true;
@@ -1458,6 +1609,7 @@ bool BeginFrameForCaller() {
     {
         std::lock_guard<std::recursive_mutex> lock(g.mutex);
         own = g.frameBegun && g.frameOwner == GetCurrentThreadId();
+        g.outputThread = GetCurrentThreadId();
     }
     if (own) EndFrameLocked(false);  // frame lasciato aperto (coppia scartata dal mod)
     g.frameMutex.lock();
@@ -1530,7 +1682,20 @@ void PumpEvents() {
             break;
         case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
             auto* e = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&ev);
-            if (e->referenceSpaceType == g.stageType) PushEvent(vr::VREvent_StandingZeroPoseReset);
+            if (e->referenceSpaceType == g.stageType) {
+                // WI-2: la mod non ricentra piu' sull'evento; con la posa del nuovo
+                // spazio nel vecchio sposta i suoi riferimenti esattamente di
+                // quanto si e' spostato lo spazio (vista ferma).
+                g.spaceChangeValid = e->poseValid == XR_TRUE;
+                if (g.spaceChangeValid) g.spaceChange = FromPose(e->poseInPreviousSpace);
+                g.spaceChangePending = g.spaceChangeValid;
+                char b[200];
+                std::snprintf(b, sizeof(b), "OPENXR: reference space change pending (pose %s, position %.3f %.3f %.3f m).",
+                              e->poseValid ? "valid" : "not valid", e->poseInPreviousSpace.position.x,
+                              e->poseInPreviousSpace.position.y, e->poseInPreviousSpace.position.z);
+                vr::log::Line(b);
+                PushEvent(vr::VREvent_StandingZeroPoseReset);
+            }
             break;
         }
         case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
@@ -1584,6 +1749,7 @@ void DestroyAll() {
         if (g.aimSpace[h]) fn.xrDestroySpace(g.aimSpace[h]);
         g.handSpace[h] = g.aimSpace[h] = XR_NULL_HANDLE;
         g.hand[h] = HandState();
+        g_aimMeasure[h].Reset();
     }
     if (g.stage) fn.xrDestroySpace(g.stage);
     if (g.view) fn.xrDestroySpace(g.view);
@@ -1619,16 +1785,83 @@ RenderModelsShim g_rm;
 SettingsShim g_set;
 ApplicationsShim g_app;
 
+// Attesa del mutex per thread (review 2 WI-1). Ruolo (LockWaitThread): il
+// thread di gioco lo prende alla prima EndGameTickLockWait, Present e sessione
+// con NameLockWaitThread (solo se il thread non ha gia' un ruolo: se il
+// Present girasse sul thread di gioco le sue attese restano del tick).
+// t_waitTickUs: attesa del tick in corso (solo il thread di gioco la usa);
+// t_waitTotalUs: tutto il thread, per la parte nel tracciamento della testa.
+static thread_local int t_waitRole = static_cast<int>(LockWaitThread::Other);
+static thread_local long long t_waitTickUs = 0;
+static thread_local long long t_waitTotalUs = 0;
+
+// Con g.mutex preso: attesa del mutex di una chiamata dell'interfaccia mentre
+// il thread di uscita lo tiene durante l'attesa della swapchain e xrEndFrame
+// (WI-1, sospetto del bug 2 su VDXR, non misurabile senza visore). Thread di
+// gioco: nel totale del tick (EndGameTickLockWait, riga per tick e riga
+// HITCH). Altri thread: istogramma per chiamata col loro nome, riga ogni 10 s.
+static void NoteLockWait(double ms) {
+    if (GetCurrentThreadId() == g.outputThread) return;  // il thread di uscita non aspetta se stesso
+    const long long us = std::llround(ms * 1000.0);
+    t_waitTotalUs += us;
+    if (t_waitRole == static_cast<int>(LockWaitThread::Game)) {
+        t_waitTickUs += us;
+        return;
+    }
+    const int k = t_waitRole == static_cast<int>(LockWaitThread::Present)   ? 1
+                  : t_waitRole == static_cast<int>(LockWaitThread::Session) ? 2
+                                                                             : 0;
+    vr::pure::WaitHistogram& h = g.callHist[k];
+    h.Add(ms);
+    const double now = QpcMs();
+    if (g.callLogMs[k] <= 0.0) g.callLogMs[k] = now;
+    if (now - g.callLogMs[k] < 10000.0) return;
+    static const char* const kName[3] = {"other threads", "Present thread", "session thread"};
+    char b[260];
+    std::snprintf(b, sizeof(b), "OPENXR: lock wait, %s, per call over %.0f s: %u calls, p50 %.3f p99 %.3f max %.2f ms, %u over 1 ms",
+                  kName[k], (now - g.callLogMs[k]) * 0.001, h.n, h.Quantile(0.5), h.Quantile(0.99), h.maxMs, h.overOne);
+    vr::log::Line(b);
+    h.Reset();
+    g.callLogMs[k] = now;
+}
+
+// g.mutex preso da una chiamata dell'interfaccia con l'attesa misurata
+// (NoteLockWait, che salta il thread di uscita). Review WI-1: prima si
+// misuravano solo la posa e i ruoli dei controller, mentre vr_input prende il
+// mutex a ogni tick anche per lo stato dei controller e le azioni.
+struct TimedLock {
+    std::unique_lock<std::recursive_mutex> lock;
+    TimedLock() : lock(g.mutex, std::defer_lock) {
+        const double t0 = QpcMs();
+        lock.lock();
+        NoteLockWait(QpcMs() - t0);
+    }
+};
+
 // IVRSystem
 void SystemShim::GetRecommendedRenderTargetSize(uint32_t* w, uint32_t* h) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;  // review 2 WI-1: prima un lock_guard non misurato (ogni 5 s dal thread di gioco)
     if (w) *w = g.viewCfg[0].recommendedImageRectWidth;
     if (h) *h = g.viewCfg[0].recommendedImageRectHeight;
 }
 
 static void Tangents(int eye, float* l, float* r, float* u, float* d) {
     if (g.frameViewsValid) {
-        const XrFovf& f = g.frameViews[eye].fov;
+        XrFovf f = g.frameViews[eye].fov;
+        if (g.overscan) {
+            // Invio con la posa: il compositor riproietta dalla posa di disegno a
+            // quella dei fotoni (fino a ~2 gradi a testa veloce, modello b2):
+            // "xroverscan" gradi in piu' per lato (1,5) invece di bordi neri.
+            const float k = g.overscanDeg * 0.01745329252f;
+            f.angleLeft -= k;
+            f.angleRight += k;
+            f.angleUp += k;
+            f.angleDown -= k;
+        }
+        if (eye == 0 || eye == 1) {
+            g.renderFov[eye] = f;
+            g.renderFovValid = true;
+        }
         *l = std::tan(f.angleLeft);
         *r = std::tan(f.angleRight);
         *u = std::tan(f.angleUp);
@@ -1639,7 +1872,7 @@ static void Tangents(int eye, float* l, float* r, float* u, float* d) {
 }
 
 vr::HmdMatrix44_t SystemShim::GetProjectionMatrix(vr::EVREye eye, float zNear, float zFar) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     float l, r, u, d;
     Tangents(eye, &l, &r, &u, &d);
     vr::HmdMatrix44_t m = {};
@@ -1654,7 +1887,7 @@ vr::HmdMatrix44_t SystemShim::GetProjectionMatrix(vr::EVREye eye, float zNear, f
 }
 
 void SystemShim::GetProjectionRaw(vr::EVREye eye, float* pl, float* pr, float* pt, float* pb) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     float l, r, u, d;
     Tangents(eye, &l, &r, &u, &d);
     if (pl) *pl = l;
@@ -1664,7 +1897,7 @@ void SystemShim::GetProjectionRaw(vr::EVREye eye, float* pl, float* pr, float* p
 }
 
 vr::HmdMatrix34_t SystemShim::GetEyeToHeadTransform(vr::EVREye eye) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (!g.eyeInHeadValid) {
         Mat34 m = Identity();
         m.m[0][3] = eye == vr::Eye_Left ? -0.032f : 0.032f;
@@ -1692,7 +1925,7 @@ void SystemShim::GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin, fl
     if (!poses || !count) return;
     std::memset(poses, 0, sizeof(vr::TrackedDevicePose_t) * count);
     for (uint32_t i = 0; i < count; ++i) poses[i].eTrackingResult = vr::TrackingResult_Uninitialized;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (!g.running) return;
     XrTime t = Now() + static_cast<XrTime>(predictSec * 1e9f);
     auto fill = [&](XrSpace space, vr::TrackedDevicePose_t* p) {
@@ -1726,7 +1959,7 @@ void SystemShim::GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin, fl
 }
 
 vr::TrackedDeviceIndex_t SystemShim::GetTrackedDeviceIndexForControllerRole(vr::ETrackedControllerRole role) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     int h = role == vr::TrackedControllerRole_LeftHand ? 0 : (role == vr::TrackedControllerRole_RightHand ? 1 : -1);
     if (h < 0 || !(g.hand[h].connected || g.hand[h].poseActive)) return vr::k_unTrackedDeviceIndexInvalid;
     return h == 0 ? kLeft : kRight;
@@ -1744,7 +1977,7 @@ vr::ETrackedDeviceClass SystemShim::GetTrackedDeviceClass(vr::TrackedDeviceIndex
 }
 
 bool SystemShim::IsTrackedDeviceConnected(vr::TrackedDeviceIndex_t i) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (i == kHmd) return g.session != XR_NULL_HANDLE;
     if (i == kLeft || i == kRight) {
         const HandState& h = g.hand[i == kLeft ? 0 : 1];
@@ -1765,7 +1998,7 @@ float SystemShim::GetFloatTrackedDeviceProperty(vr::TrackedDeviceIndex_t i, vr::
         if (prop == vr::Prop_DisplayFrequency_Float) return g.hz.load();
         if (prop == vr::Prop_SecondsFromVsyncToPhotons_Float) return 0.0f;
         if (prop == vr::Prop_UserIpdMeters_Float) {
-            std::lock_guard<std::recursive_mutex> lock(g.mutex);
+            TimedLock lock;
             if (g.eyeInHeadValid) return std::fabs(g.eyeInHead[1].pose.position.x - g.eyeInHead[0].pose.position.x);
         }
     }
@@ -1788,7 +2021,7 @@ static uint32_t CopyString(const std::string& s, char* out, uint32_t size, vr::E
 
 uint32_t SystemShim::GetStringTrackedDeviceProperty(vr::TrackedDeviceIndex_t i, vr::ETrackedDeviceProperty prop, char* out,
                                                     uint32_t size, vr::ETrackedPropertyError* e) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     std::string rn = g.runtimeName;
     for (auto& c : rn) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
     if (i == kHmd) {
@@ -1825,7 +2058,7 @@ uint32_t SystemShim::GetStringTrackedDeviceProperty(vr::TrackedDeviceIndex_t i, 
 }
 
 bool SystemShim::PollNextEvent(vr::VREvent_t* ev, uint32_t size) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     PumpEvents();
     if (g.events.empty() || !ev) return false;
     std::memcpy(ev, &g.events.front(), (std::min)(size, static_cast<uint32_t>(sizeof(vr::VREvent_t))));
@@ -1836,7 +2069,7 @@ bool SystemShim::PollNextEvent(vr::VREvent_t* ev, uint32_t size) {
 vr::HiddenAreaMesh_t SystemShim::GetHiddenAreaMesh(vr::EVREye eye, vr::EHiddenAreaMeshType type) {
     vr::HiddenAreaMesh_t m = {};
     if (type != vr::k_eHiddenAreaMesh_Standard) return m;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     int e = eye == vr::Eye_Left ? 0 : 1;
     if (!g.hamTried[e] && g.extVisMask && g.session && g.frameViewsValid) {
         g.hamTried[e] = true;
@@ -1893,7 +2126,7 @@ static void FillControllerState(int h, vr::VRControllerState_t* s) {
 
 bool SystemShim::GetControllerState(vr::TrackedDeviceIndex_t i, vr::VRControllerState_t* s, uint32_t) {
     if (!s || (i != kLeft && i != kRight)) return false;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (QpcMs() - g.lastSyncMs > 4.0) SyncActions(false);
     int h = i == kLeft ? 0 : 1;
     FillControllerState(h, s);
@@ -1925,7 +2158,7 @@ static void Haptic(int h, float seconds, float freq, float amp) {
 
 void SystemShim::TriggerHapticPulse(vr::TrackedDeviceIndex_t i, uint32_t, unsigned short us) {
     if (i != kLeft && i != kRight) return;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     // Impulsi legacy ripetuti a ogni frame dal mod: 20 ms con ampiezza = durata/3900.
     Haptic(i == kLeft ? 0 : 1, 0.02f, 0.0f, us / 3900.0f);
 }
@@ -1936,7 +2169,7 @@ bool SystemShim::ShouldApplicationPause() { return false; }
 bool SystemShim::ShouldApplicationReduceRenderingWork() { return false; }
 
 vr::EDeviceActivityLevel SystemShim::GetTrackedDeviceActivityLevel(vr::TrackedDeviceIndex_t i) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (i != kHmd) return vr::k_EDeviceActivityLevel_Unknown;
     if (g.presenceKnown) return g.present ? vr::k_EDeviceActivityLevel_UserInteraction : vr::k_EDeviceActivityLevel_Standby;
     if (g.state == XR_SESSION_STATE_FOCUSED || g.state == XR_SESSION_STATE_VISIBLE) return vr::k_EDeviceActivityLevel_UserInteraction;
@@ -1961,7 +2194,14 @@ vr::EVRCompositorError CompositorShim::WaitGetPoses(vr::TrackedDevicePose_t* ren
         Sleep(10);
         return vr::VRCompositorError_RequestFailed;
     }
-    if (render && nr) g_sys.GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, render, nr);
+    // Pose del frame come in OpenVR: predette ai fotoni del frame appena
+    // iniziato (predictedDisplayTime). Prima quelle di adesso; le usa solo la
+    // riga POSEAGE di vr_output (WI-1), quindi solo la testa (review WI-1:
+    // ogni xrLocateSpace in piu' allunga il mutex tenuto dal thread di uscita).
+    if (render && nr) {
+        std::memset(render, 0, sizeof(vr::TrackedDevicePose_t) * nr);
+        g_sys.GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, SecondsToPhotons(), render, 1);
+    }
     if (game && ng) g_sys.GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0.0f, game, ng);
     return vr::VRCompositorError_None;
 }
@@ -1979,7 +2219,7 @@ vr::EVRCompositorError CompositorShim::Submit(vr::EVREye eye, const vr::Texture_
     if (!g.running || g.dead) return vr::VRCompositorError_DoNotHaveFocus;
     if (!FrameOwnedByCaller() && !BeginFrameForCaller()) return vr::VRCompositorError_RequestFailed;
     {
-        std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        TimedLock lock;
         int e = eye == vr::Eye_Left ? 0 : 1;
         State::EyeSubmit& s = g.submit[e];
         s.tex = static_cast<ID3D11Texture2D*>(tex->handle);
@@ -1994,14 +2234,14 @@ vr::EVRCompositorError CompositorShim::Submit(vr::EVREye eye, const vr::Texture_
 }
 
 void CompositorShim::ClearLastSubmittedFrame() {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     g.projValid = false;
 }
 void CompositorShim::PostPresentHandoff() {}
 float CompositorShim::GetFrameTimeRemaining() { return 0.0f; }
 
 void CompositorShim::FadeToColor(float seconds, float, float, float, float alpha, bool) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     g.fadeFrom = FadeAlphaNow();
     g.fadeTo = alpha;
     g.fadeStartMs = QpcMs();
@@ -2009,7 +2249,7 @@ void CompositorShim::FadeToColor(float seconds, float, float, float, float alpha
 }
 
 vr::HmdColor_t CompositorShim::GetCurrentFadeColor(bool) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     return {0.0f, 0.0f, 0.0f, FadeAlphaNow()};
 }
 
@@ -2031,12 +2271,12 @@ static OverlayItem* Find(vr::VROverlayHandle_t h) {
     return it == g.overlays.end() ? nullptr : &it->second;
 }
 #define OV_LOCK_FIND(h)                                        \
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);      \
+    TimedLock lock;      \
     OverlayItem* o = Find(h);                                      \
     if (!o) return vr::VROverlayError_UnknownOverlay;
 
 vr::EVROverlayError OverlayShim::FindOverlay(const char* key, vr::VROverlayHandle_t* out) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     for (auto& kv : g.overlays)
         if (key && kv.second.key == key) {
             if (out) *out = kv.first;
@@ -2046,7 +2286,7 @@ vr::EVROverlayError OverlayShim::FindOverlay(const char* key, vr::VROverlayHandl
 }
 
 vr::EVROverlayError OverlayShim::CreateOverlay(const char* key, const char* name, vr::VROverlayHandle_t* out) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (!g.session) return vr::VROverlayError_RequestFailed;
     for (auto& kv : g.overlays)
         if (key && kv.second.key == key) return vr::VROverlayError_KeyInUse;
@@ -2068,7 +2308,7 @@ vr::EVROverlayError OverlayShim::DestroyOverlay(vr::VROverlayHandle_t h) {
 }
 
 uint32_t OverlayShim::GetOverlayKey(vr::VROverlayHandle_t h, char* out, uint32_t size, vr::EVROverlayError* e) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     OverlayItem* o = Find(h);
     if (e) *e = o ? vr::VROverlayError_None : vr::VROverlayError_UnknownOverlay;
     if (!o) return 0;
@@ -2076,7 +2316,7 @@ uint32_t OverlayShim::GetOverlayKey(vr::VROverlayHandle_t h, char* out, uint32_t
     return static_cast<uint32_t>(o->key.size() + 1);
 }
 uint32_t OverlayShim::GetOverlayName(vr::VROverlayHandle_t h, char* out, uint32_t size, vr::EVROverlayError* e) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     OverlayItem* o = Find(h);
     if (e) *e = o ? vr::VROverlayError_None : vr::VROverlayError_UnknownOverlay;
     if (!o) return 0;
@@ -2110,6 +2350,8 @@ vr::EVROverlayError OverlayShim::SetOverlayColor(vr::VROverlayHandle_t h, float,
 }
 vr::EVROverlayError OverlayShim::SetOverlayAlpha(vr::VROverlayHandle_t h, float a) {
     OV_LOCK_FIND(h);
+    // Overlay coi pixel dalla CPU: l'alfa va nei pixel, da ricaricare (UploadOverlays).
+    if (a != o->alpha && !o->tex && !o->pixels.empty()) o->dirty = true;
     o->alpha = a;
     return vr::VROverlayError_None;
 }
@@ -2194,7 +2436,7 @@ vr::EVROverlayError OverlayShim::HideOverlay(vr::VROverlayHandle_t h) {
     return vr::VROverlayError_None;
 }
 bool OverlayShim::IsOverlayVisible(vr::VROverlayHandle_t h) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     OverlayItem* o = Find(h);
     return o && o->visible;
 }
@@ -2210,7 +2452,7 @@ vr::EVROverlayError OverlayShim::GetTransformForOverlayCoordinates(vr::VROverlay
     return vr::VROverlayError_None;
 }
 bool OverlayShim::PollNextOverlayEvent(vr::VROverlayHandle_t h, vr::VREvent_t* ev, uint32_t size) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     OverlayItem* o = Find(h);
     if (!o || o->events.empty() || !ev) return false;
     std::memcpy(ev, &o->events.front(), (std::min)(size, static_cast<uint32_t>(sizeof(vr::VREvent_t))));
@@ -2240,7 +2482,7 @@ vr::EVROverlayError OverlayShim::SetOverlayMouseScale(vr::VROverlayHandle_t h, c
 }
 bool OverlayShim::ComputeOverlayIntersection(vr::VROverlayHandle_t h, const vr::VROverlayIntersectionParams_t* p,
                                              vr::VROverlayIntersectionResults_t* r) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     OverlayItem* o = Find(h);
     if (!o || !p || !r) return false;
     Mat34 m;
@@ -2254,7 +2496,7 @@ bool OverlayShim::ComputeOverlayIntersection(vr::VROverlayHandle_t h, const vr::
     return true;
 }
 bool OverlayShim::IsHoverTargetOverlay(vr::VROverlayHandle_t h) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     OverlayItem* o = Find(h);
     return o && o->hovered;
 }
@@ -2299,7 +2541,7 @@ vr::EVROverlayError OverlayShim::GetOverlayTextureSize(vr::VROverlayHandle_t h, 
     return vr::VROverlayError_None;
 }
 bool OverlayShim::IsDashboardVisible() {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     // VISIBLE senza focus = menu di sistema / dashboard sopra il gioco. SYNCHRONIZED
     // (non visibile) capita anche col visore appoggiato: non e' una dashboard.
     return g.running && g.state == XR_SESSION_STATE_VISIBLE;
@@ -2349,7 +2591,7 @@ vr::EVRInputError InputShim::GetInputSourceHandle(const char*, vr::VRInputValueH
     return vr::VRInputError_None;
 }
 vr::EVRInputError InputShim::UpdateActionState(vr::VRActiveActionSet_t*, uint32_t, uint32_t) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     SyncActions(false);
     return g.running ? vr::VRInputError_None : vr::VRInputError_NoActiveActionSet;
 }
@@ -2357,7 +2599,7 @@ vr::EVRInputError InputShim::GetDigitalActionData(vr::VRActionHandle_t a, vr::In
                                                   vr::VRInputValueHandle_t) {
     int hand, act;
     if (!d || !DecodeAction(a, &hand, &act)) return vr::VRInputError_InvalidHandle;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     *d = {};
     const HandState& hs = g.hand[hand];
     bool v = false;
@@ -2380,7 +2622,7 @@ vr::EVRInputError InputShim::GetAnalogActionData(vr::VRActionHandle_t a, vr::Inp
                                                  vr::VRInputValueHandle_t) {
     int hand, act;
     if (!d || !DecodeAction(a, &hand, &act)) return vr::VRInputError_InvalidHandle;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     *d = {};
     const HandState& hs = g.hand[hand];
     d->bActive = hs.active;
@@ -2407,7 +2649,7 @@ vr::EVRInputError InputShim::TriggerHapticVibrationAction(vr::VRActionHandle_t a
                                                           vr::VRInputValueHandle_t) {
     int hand, act;
     if (!DecodeAction(a, &hand, &act) || act != kActHaptic) return vr::VRInputError_InvalidHandle;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     Haptic(hand, dur, freq, amp);
     return vr::VRInputError_None;
 }
@@ -2519,7 +2761,7 @@ bool Init(const std::string& overrideJson, std::string* error) {
     // Primo giro di eventi: READY arriva subito dopo la creazione.
     for (int i = 0; i < 20 && !g.running; ++i) {
         {
-            std::lock_guard<std::recursive_mutex> lock(g.mutex);
+            TimedLock lock;
             PumpEvents();
         }
         if (!g.running) Sleep(50);
@@ -2546,8 +2788,52 @@ vr::IVRApplications* Applications() { return g.session ? &g_app : nullptr; }
 
 ID3D11Device* D3D11Device() { return g.device; }
 
+bool TakeSpaceChange(float m[3][4]) {
+    if (!g.spaceChangePending.load()) return false;  // a ogni tick: senza mutex
+    TimedLock lock;
+    g.spaceChangePending = false;
+    if (!g.spaceChangeValid) return false;
+    g.spaceChangeValid = false;
+    std::memcpy(m, g.spaceChange.m, sizeof(float) * 12);
+    return true;
+}
+
+// Confine del tick sul thread di gioco (review 2 WI-1): senza mutex (prima un
+// lock_guard a ogni tick, cioe' proprio l'attesa da misurare, e non contata).
+// gameTickHist e gameTickLogMs li tocca solo questo thread.
+float EndGameTickLockWait(bool record) {
+    t_waitRole = static_cast<int>(LockWaitThread::Game);
+    const double ms = static_cast<double>(t_waitTickUs) * 0.001;
+    t_waitTickUs = 0;
+    if (!record) return static_cast<float>(ms);
+    vr::pure::WaitHistogram& h = g.gameTickHist;
+    h.Add(ms);
+    const double now = QpcMs();
+    if (g.gameTickLogMs <= 0.0) g.gameTickLogMs = now;
+    if (now - g.gameTickLogMs >= 10000.0 && h.n >= 50) {
+        // Criterio (TECHNICAL.md, voce 6 del WI-1): mutex da rilasciare se oltre
+        // l'1% dei tick aspetta piu' di 1 ms.
+        char b[320];
+        std::snprintf(b, sizeof(b),
+                      "OPENXR: lock wait, game thread, per tick over %.0f s: %u ticks, p50 %.3f p99 %.3f max %.2f ms, "
+                      "%u ticks over 1 ms (%.2f%%), %u over 0.5 ms, mean %.3f ms",
+                      (now - g.gameTickLogMs) * 0.001, h.n, h.Quantile(0.5), h.Quantile(0.99), h.maxMs, h.overOne,
+                      100.0 * h.overOne / h.n, h.overHalf, h.sumMs / h.n);
+        vr::log::Line(b);
+        h.Reset();
+        g.gameTickLogMs = now;
+    }
+    return static_cast<float>(ms);
+}
+
+double ThreadLockWaitMs() { return static_cast<double>(t_waitTotalUs) * 0.001; }
+
+void NameLockWaitThread(LockWaitThread role) {
+    if (t_waitRole == static_cast<int>(LockWaitThread::Other)) t_waitRole = static_cast<int>(role);
+}
+
 float SecondsToPhotons() {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (!g.running || !g.lastPredicted) return 0.0f;
     XrTime now = Now();
     XrTime t = g.frameBegun ? g.frameState.predictedDisplayTime : g.lastPredicted;
@@ -2559,12 +2845,20 @@ float SecondsToPhotons() {
 }
 
 void SetGripFix(bool on, float pitchDeg) {
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    TimedLock lock;
     if (g.gripFix == on && std::fabs(g.gripPitch - pitchDeg) < 0.01f) return;
     g.gripFix = on;
     g.gripPitch = pitchDeg;
     if (g.session && g.action[0][kActPose]) CreateHandSpaces();
     vr::log::Line(std::string("OPENXR: grip pose correction ") + (on ? "on, pitch " + std::to_string(pitchDeg) : "off") + ".");
+}
+
+bool MeasuredAimInRaw(int hand, float* pitchDeg, float* yawDeg, float* rollDeg) {
+    if (hand < 0 || hand > 1 || !g_aimMeasure[hand].valid) return false;
+    *pitchDeg = g_aimMeasure[hand].pitch;
+    *yawDeg = g_aimMeasure[hand].yaw;
+    *rollDeg = g_aimMeasure[hand].roll;
+    return true;
 }
 
 }  // namespace vr::xr

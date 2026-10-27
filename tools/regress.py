@@ -194,6 +194,10 @@ def main():
         # block the magazine grab: move it away first, as m14test does.
         g.send_cmds(['synthleft 10 -45 -25', 'reload physical'])
         time.sleep(1.5)
+        # The gesture simulation advances on the game's pad polls, and an
+        # unfocused window stops polling the pad (25/10, copy B next to copy A:
+        # "pad polls per tick" 1.00 -> 0.00 and the reload never finished).
+        g.focus()
         pos = ls.log_size()
         g.send_cmds(['gesturesim reload'])
         time.sleep(4)

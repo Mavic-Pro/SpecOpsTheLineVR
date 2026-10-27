@@ -9,6 +9,7 @@ usate per trovare offset di classi e proprieta' senza indovinare.
     python tools/ue3.py objects WeaponName     # oggetti con quel nome
 """
 import ctypes
+import os
 import re
 import struct
 import subprocess
@@ -30,7 +31,7 @@ k32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_voi
 
 
 class Proc:
-    def __init__(self, image="SpecOpsTheLine.exe"):
+    def __init__(self, image=os.environ.get("SPECOPS_EXE", "SpecOpsTheLine.exe")):
         out = subprocess.check_output(["tasklist", "/FI", f"IMAGENAME eq {image}", "/FO", "CSV", "/NH"]).decode(
             "mbcs", "replace")
         m = re.search(r'"[^"]+","(\d+)"', out)

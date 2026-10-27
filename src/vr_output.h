@@ -21,7 +21,11 @@ void OnBeforeReset();
 // Thread di rendering: posa del visore con cui e' stato disegnato l'occhio del
 // frame in corso (nullptr = sconosciuta). Viaggia col frame fino al Submit.
 // tick: tick stereo del frame; si inviano solo coppie con lo stesso tick.
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter, double sampleMs = 0.0);
+// scope: disegnato nel cannocchiale (mai inviato con la posa); cropUnknown:
+// ScreenPercentage incerto (Present senza tag subito dopo un cambio): la
+// coppia non viene inviata (WI-1).
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter, double sampleMs = 0.0,
+                   bool scope = false, bool cropUnknown = false);
 // Ritardo misurato dal campionamento della testa ai fotoni (ms, 0 = non ancora).
 float PhotonLatencyMs();
 

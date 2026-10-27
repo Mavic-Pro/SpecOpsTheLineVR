@@ -24,6 +24,11 @@ void CorrectControllerPoses(vr::IVRSystem* sys, vr::TrackedDevicePose_t* poses);
 // tramite le azioni di SteamVR Input (l'impulso legacy viene ignorato quando
 // c'e' un manifesto di azioni).
 void PulseHand(int hand, unsigned ms);
+// Impulso d'urto (voce 3 del piano Boneworks): ampiezza 0..1, frequenza in Hz
+// (0 = 150 Hz come gli altri), durata esatta in ms. Tra due impulsi d'urto in
+// corso vince il piu' forte; contro la vibrazione del gioco (mano dell'arma) e
+// gli impulsi fissi qui sopra vince il piu' forte frame per frame (UpdateHaptics).
+void PulseHand(int hand, unsigned ms, float amp, float freqHz = 0.0f);
 
 void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, unsigned buttons, unsigned durationMs);
 
@@ -34,5 +39,7 @@ unsigned PadPolls();
 std::string WriteActionFiles();
 // Ricarica fisica: caricatore estratto o in mano (l'osso "Magazine" dell'arma va nascosto, R-W7).
 bool MagazineRemoved();
+// Ricarica fisica con la mano sinistra (sul caricatore, caricatore nuovo in mano, castello): vibrazione degli urti.
+bool LeftHandOnReload();
 
 }  // namespace vr::input

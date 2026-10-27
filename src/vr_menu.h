@@ -18,5 +18,11 @@ void Tick(bool cinema);
 void Show(bool show);
 // Vero mentre il menu e' aperto: il pad del gioco resta neutro.
 bool IsOpen();
+// Collaudo ("vrmenu cycle <chiave> [dir]"): come un clic sulla voce, al
+// prossimo Tick (review 2 WI-1).
+void TestCycle(const std::string& key, int dir);
+// Collaudo ("vrmenu dump <file.bmp> [basic|advanced|controls] [vd|novd]",
+// review WI-4c round 1): la scheda disegnata in BMP al prossimo Tick.
+void TestDump(const std::string& path, const std::string& tab, const std::string& vd);
 
 }  // namespace vr::menu

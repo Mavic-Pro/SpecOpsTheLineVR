@@ -28,9 +28,15 @@ LOG = os.path.join(g.GAME_DIR, 'specopsvr.log')
 OUT = os.path.join(ROOT, 'shots', 'sweep')
 def _find_save_dir():
     """Cartella dei salvataggi di Spec Ops (Steam Cloud, app 50300) del primo
-    account Steam che ne ha una; SPECOPS_SAVE_DIR la sostituisce."""
+    account Steam che ne ha una; SPECOPS_SAVE_DIR la sostituisce.
+    Seconda copia del gioco (SPECOPS_EXE impostato, es. SpecOpsTheLineB.exe)
+    senza SPECOPS_SAVE_DIR: nessuna cartella. I salvataggi di Steam sono
+    condivisi tra le due copie e il ripristino a fine collaudo sovrascriveva
+    quelli scritti nel frattempo dall'altra copia (review 25/10)."""
     if os.environ.get('SPECOPS_SAVE_DIR'):
         return os.environ['SPECOPS_SAVE_DIR']
+    if os.environ.get('SPECOPS_EXE', 'SpecOpsTheLine.exe').lower() != 'specopstheline.exe':
+        return ''
     import glob
     hits = glob.glob(os.path.join('C:' + os.sep, 'Program Files (x86)', 'Steam', 'userdata', '*', '50300', 'remote'))
     return hits[0] if hits else ''
@@ -49,6 +55,9 @@ STATE_RE = re.compile(r'STATE (gameplay=\d cinema=\d cinematic=\d pawn=\S* viewt
 
 
 def backup_saves():
+    if not SAVE_DIR:
+        print('salvataggi non toccati (seconda copia del gioco senza SPECOPS_SAVE_DIR)')
+        return
     if not os.path.isdir(SAVE_BACKUP):
         os.makedirs(SAVE_BACKUP)
         for f in os.listdir(SAVE_DIR):
@@ -57,7 +66,11 @@ def backup_saves():
 
 
 def restore_saves(folder=None):
+    if not SAVE_DIR:
+        return
     folder = folder or SAVE_BACKUP
+    if not os.path.isdir(folder):
+        return
     for f in os.listdir(folder):
         dst = os.path.join(SAVE_DIR, f)
         shutil.copyfile(os.path.join(folder, f), dst)
@@ -71,9 +84,11 @@ def gamectl(*args, timeout=900):
 
 
 def running():
-    out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq SpecOpsTheLine.exe'], capture_output=True,
+    # L'eseguibile di gamectl (SPECOPS_EXE): con la seconda copia del gioco
+    # si guardava il processo dell'altra copia (review 25/10).
+    out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq ' + g.EXE_NAME], capture_output=True,
                          text=True).stdout
-    return 'SpecOpsTheLine.exe' in out
+    return g.EXE_NAME.lower() in out.lower()
 
 
 def log_size():

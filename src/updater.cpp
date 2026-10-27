@@ -21,27 +21,22 @@
 // controlla che sia una dll a 32 bit e la mette al posto di quella in uso:
 // Windows permette di rinominare una dll caricata, quindi la vecchia diventa
 // d3d9.dll.old (cancellata all'avvio seguente) e la nuova vale dal prossimo
-// avvio del gioco. "autoupdate off" nell'ini lo disattiva.
+// avvio del gioco. Sempre attivo (24/10, richiesta dell'utente: "sono proprio
+// gli utenti che hanno bisogno degli update"): niente "autoupdate off", niente
+// rollback automatico ne' versioni saltate dopo avvii falliti. Una release
+// difettosa si ritira per tutti da updates.json (lista "revoked" +
+// "recommended"), che l'updater legge a ogni avvio.
 //
-// Sicurezza (R-R4):
-//  - sentinella di avvio: la versione appena installata lascia
-//    specopsvr_update.pending; ogni avvio incrementa specopsvr_boot.count, che
-//    viene azzerato quando il gioco esce normalmente o resta vivo 90 s dopo la
-//    lettura dell'ini. Due avvii morti prima -> al terzo la d3d9.dll.prev
-//    torna al suo posto e la versione finisce in specopsvr_skip.txt (non viene
-//    reinstallata finche' il file esiste);
-//  - file compagni: la release puo' avere un allegato companions.json (nome,
-//    dimensione, SHA-256 di openvr_api.dll, script .bat/.ps1, README.txt):
-//    quelli diversi o mancanti vengono scaricati, mai specopsvr.ini.
+// File compagni: la release puo' avere un allegato companions.json (nome,
+// dimensione, SHA-256 di openvr_api.dll, script .bat/.ps1, README.txt):
+// quelli diversi o mancanti vengono scaricati, mai specopsvr.ini.
 namespace vr::updater {
 
 namespace {
 
-const char* kPendingFile = "\\specopsvr_update.pending";
-const char* kBootCountFile = "\\specopsvr_boot.count";
-const char* kSkipFile = "\\specopsvr_skip.txt";
-constexpr int kFailedBootsBeforeRollback = 2;
-constexpr DWORD kHealthyAfterConfigMs = 90000;
+// Avanzi della vecchia sentinella di avvio (fino alla 0.9.18): cancellati
+// all'avvio, cosi' una versione "saltata" non blocca piu' nulla.
+const char* kObsoleteFiles[] = {"\\specopsvr_update.pending", "\\specopsvr_boot.count", "\\specopsvr_skip.txt"};
 
 std::string ReadTextFile(const std::string& path) {
     HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -78,52 +73,6 @@ std::string ReadWholeFile(const std::string& path, size_t maxBytes) {
     }
     CloseHandle(f);
     return out;
-}
-
-// Avvio sano: ini letto e gioco vivo per 90 s. Spegne sentinella e contatore.
-void ConfirmBoot() {
-    vr::control::WaitForConfig(120000, 0);
-    if (!vr::control::g_configLoaded) return;
-    Sleep(kHealthyAfterConfigMs);
-    std::string dir = vr::log::Directory();
-    std::string tag = ReadTextFile(dir + kPendingFile);
-    DeleteFileA((dir + kBootCountFile).c_str());
-    if (DeleteFileA((dir + kPendingFile).c_str()))
-        vr::log::Line("UPDATE: version " + tag + " confirmed (healthy start).");
-}
-
-// Avvio con un aggiornamento ancora da confermare: conta gli avvii falliti e
-// al limite rimette la versione precedente.
-void CheckPendingUpdate(const std::string& dir) {
-    std::string pending = dir + kPendingFile;
-    if (!FileExists(pending)) return;
-    std::string tag = ReadTextFile(pending);
-    int failed = atoi(ReadTextFile(dir + kBootCountFile).c_str());
-    if (failed >= kFailedBootsBeforeRollback) {
-        std::string cur = dir + "\\d3d9.dll", prev = dir + "\\d3d9.dll.prev", bad = dir + "\\d3d9.dll.bad";
-        DeleteFileA((dir + kBootCountFile).c_str());
-        DeleteFileA(pending.c_str());
-        if (!FileExists(prev)) {
-            vr::log::Line("UPDATE: version " + tag + " died " + std::to_string(failed) +
-                          " times right after starting, but there is no d3d9.dll.prev to go back to.");
-            return;
-        }
-        DeleteFileA(bad.c_str());
-        if (MoveFileA(cur.c_str(), bad.c_str()) && MoveFileA(prev.c_str(), cur.c_str())) {
-            WriteTextFile(dir + kSkipFile, tag);
-            vr::log::Line("UPDATE: version " + tag + " died " + std::to_string(failed) +
-                          " times right after starting: the previous version is back from the next launch "
-                          "(this one kept as d3d9.dll.bad). It will not be reinstalled while specopsvr_skip.txt exists.");
-        } else {
-            MoveFileA(bad.c_str(), cur.c_str());
-            vr::log::Line("UPDATE: version " + tag + " died " + std::to_string(failed) +
-                          " times right after starting; automatic rollback failed, run rollback.bat.");
-        }
-        return;
-    }
-    WriteTextFile(dir + kBootCountFile, std::to_string(failed + 1));
-    vr::log::Line("UPDATE: first starts of version " + tag + " (failed so far: " + std::to_string(failed) + ").");
-    std::thread(ConfirmBoot).detach();
 }
 
 using vr::pure::IsDll32;
@@ -289,12 +238,8 @@ void RefreshCompanions(const std::string& json, const std::string& dir) {
 void Run() {
     vr::control::WaitForConfig(120000, 5000);  // dopo la lettura dell'ini e l'avvio del gioco
     // Ini mai caricato dai hook (eseguibile non supportato, primo EndScene
-    // oltre 120 s): "autoupdate off", canale e repository valevano zero (M5).
+    // oltre 120 s): canale e repository valevano zero (M5).
     if (!vr::control::g_configLoaded) vr::control::ReadUpdateSettingsFromIni();
-    if (!vr::control::g_autoUpdate) {
-        vr::log::Line("UPDATE: disabled (autoupdate off).");
-        return;
-    }
     std::string repo = vr::control::UpdateRepo();
     if (repo.empty()) repo = SPECOPSVR_REPO;
     if (repo.empty() || repo.find('/') == std::string::npos) {
@@ -350,13 +295,6 @@ void Run() {
     } else if (ParseVersion(tag) < ParseVersion(SPECOPSVR_VERSION)) {
         vr::log::Line("UPDATE: version " SPECOPSVR_VERSION " is newer than the latest " +
                       std::string(beta ? "beta" : "stable") + " release " + tag + " (test build?).");
-        return;
-    }
-    // Versione rimessa indietro dalla sentinella di avvio: non la si reinstalla.
-    std::string skip = ReadTextFile(dir + kSkipFile);
-    if (!skip.empty() && ParseVersion(skip) == ParseVersion(tag)) {
-        vr::log::Line("UPDATE: version " + tag + " was rolled back after failed starts; not reinstalling it "
-                      "(delete specopsvr_skip.txt to try again).");
         return;
     }
     // Allegato "d3d9.dll" della release.
@@ -428,9 +366,6 @@ void Run() {
         vr::log::Line("UPDATE: cannot install the new dll.");
         return;
     }
-    // Sentinella per i primi avvii della nuova versione (vedi CheckPendingUpdate).
-    WriteTextFile(dir + kPendingFile, tag);
-    DeleteFileA((dir + kBootCountFile).c_str());
     vr::log::Line("UPDATE: version " + tag + " installed, active from the next game start.");
     vr::toast::Notify("SpecOpsVR " + tag + " installed: active from the next start");
     RefreshCompanions(json, dir);
@@ -447,10 +382,9 @@ void Start() {
     DeleteFileA((dir + "\\d3d9.dll.new").c_str());
     old = dir + "\\openvr_api.dll.old";
     if (FileExists(old)) DeleteFileA(old.c_str());
-    CheckPendingUpdate(dir);
+    for (const char* f : kObsoleteFiles)
+        if (DeleteFileA((dir + f).c_str())) vr::log::Line(std::string("UPDATE: removed ") + (f + 1) + " (old update block).");
     std::thread(Run).detach();
 }
-
-void OnCleanExit() { DeleteFileA((vr::log::Directory() + kBootCountFile).c_str()); }
 
 }  // namespace vr::updater

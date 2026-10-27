@@ -22,6 +22,9 @@ void QueueGiveWeapon(const std::string& weaponClass);
 void QueueConsole(const std::string& command);
 // Thread di gioco: esegue subito un comando da console (PlayerController).
 void ExecConsole(void* pc, const std::string& command);
+// Oggetto ancora vivo: il suo posto in GObjects punta ancora a lui (un
+// puntatore del livello precedente non passa).
+bool LiveObject(void* obj);
 // Indice FName di un testo (senza distinzione maiuscole), -1 se non esiste.
 // Il risultato e' messo in cache.
 int32_t NameIndex(const std::string& text);
@@ -30,6 +33,9 @@ std::string NameFromIndex(int32_t idx);
 // Chiama per nome una funzione UnrealScript (anche nativa) dell'oggetto, con
 // i parametri gia' preparati nel layout della funzione. Solo thread di gioco.
 bool CallFunction(void* obj, const char* name, void* parms);
+// Azzera le esclusioni per oggetto delle interrogazioni delle ossa (WI-3 fix 1:
+// al cambio di Pawn, cosi' un oggetto nuovo allo stesso indirizzo non le eredita).
+void ClearObjectFaults();
 
 // "ucall <oggetto> <Funzione> [argomenti]": chiamata generica a una funzione
 // UnrealScript (oggetto = pc|pawn|cheat|world|0x...|Classe[#k]).

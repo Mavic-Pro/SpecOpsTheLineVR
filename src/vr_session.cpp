@@ -9,6 +9,7 @@
 #include <delayimp.h>
 #include <openvr.h>
 #include "vr_runtime.h"
+#include "vr_fake.h"
 
 #include <atomic>
 #include <string>
@@ -243,6 +244,30 @@ void Switch(vr::EVRApplicationType type) {
 // visore solo dopo 2 minuti senza movimento; lo standby vero (3, 4) dopo 3 s.
 std::atomic<bool> g_present{false};
 
+// Ricentramento del runtime (Quest: tasto Meta tenuto) o area di gioco cambiata.
+// Virtual Desktop li manda a raffica (anche 4 per secondo, 21/10). WI-2 (bug 3
+// del tester): l'evento non ricentra piu' la mod (prima: yaw e posizione di
+// riferimento sulla testa di adesso, al piu' uno ogni 10 s, quindi la vista
+// scattava di lato e l'altezza cambiava senza che il giocatore facesse nulla).
+// Lo si conta e basta: UpdateHeadTracking guarda se la posa del visore e'
+// saltata (il runtime ha spostato il suo spazio) e in quel caso sposta i
+// riferimenti della stessa quantita', con la vista ferma.
+void OnZeroPoseChanged(const char* how) {
+    ++vr::control::g_runtimeRecenterEvents;
+    static ULONGLONG lastLog = 0;
+    static unsigned skipped = 0;
+    ULONGLONG nowA = GetTickCount64();
+    if (nowA - lastLog > 2000) {
+        lastLog = nowA;
+        vr::log::Line(std::string("OpenVR: play area / zero pose changed") + how +
+                      (skipped ? " (" + std::to_string(skipped) + " more since the last line)" : std::string()) +
+                      ": the view follows only a real jump of the headset pose.");
+        skipped = 0;
+    } else {
+        ++skipped;
+    }
+}
+
 // Eventi di SteamVR (audit 19/10: nessuno era gestito).
 // - Dashboard aperta / focus dell'input a un'altra app: il gioco va in pausa
 //   (Start una volta, vr_input) e i gesti si spengono.
@@ -286,21 +311,9 @@ bool PollEvents() {
             break;
         case vr::VREvent_ChaperoneUniverseHasChanged:
         case vr::VREvent_StandingZeroPoseReset:
-        case vr::VREvent_SeatedZeroPoseReset: {
-            // Virtual Desktop li manda a raffica (anche 4 per secondo, 21/10):
-            // uno ogni 10 s al massimo, e senza avviso nel visore (il toast
-            // "Recentered" a 1 m davanti allo schermo virtuale era un riquadro
-            // che spuntava di continuo: nausea sulla bandiera iniziale).
-            static ULONGLONG lastAuto = 0;
-            ULONGLONG nowA = GetTickCount64();
-            if (nowA - lastAuto > 10000) {
-                lastAuto = nowA;
-                vr::control::g_recenterSilent = true;
-                vr::control::g_recenterRequested = true;
-                vr::log::Line("OpenVR: play area / zero pose changed, recentering.");
-            }
+        case vr::VREvent_SeatedZeroPoseReset:
+            OnZeroPoseChanged("");
             break;
-        }
         case vr::VREvent_IpdChanged:
             vr::control::g_vrProjectionDirty = true;
             break;
@@ -328,10 +341,18 @@ bool PollEvents() {
             break;
         }
     }
+    // "simevent zeropose" (collaudi, 25/10): col runtime finto il ricentramento
+    // lo fa lui (origine spostata) e l'evento arriva al giro dopo, come da un
+    // runtime vero; con SteamVR o OpenXR si simula solo l'evento.
+    if (vr::control::g_simEvent.exchange(0) == 1) {
+        if (vr::rt::Active() == vr::rt::Backend::Fake) vr::fake::SimulateZeroPose();
+        else OnZeroPoseChanged(" (simulated event)");
+    }
     return keep;
 }
 
 void MonitorLoop() {
+    vr::rt::NameThread(vr::rt::ThreadRole::Session);  // riga dell'attesa del mutex OpenXR (review 2 WI-1)
     ULONGLONG inactiveSince = 0, lastActive = 0, standbySince = 0, lastRetry = 0;
     for (;;) {
         Sleep(500);

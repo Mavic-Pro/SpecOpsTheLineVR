@@ -1,12 +1,15 @@
 #include "vr_menu.h"
 #include "control.h"
 #include "logger.h"
+#include "pure_utils.h"
+#include "ui_text.h"
 #include "vr_session.h"
 
 #include <windows.h>
 #include <openvr.h>
 #include "vr_runtime.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -36,44 +39,80 @@ struct Item {
     std::string value;    // valore attuale (testo dopo la chiave)
 };
 
+// Voce "Gun angle" (review WI-4a, round 1): mostra e cambia l'angolo della
+// presa ATTIVA. Prima cambiava sempre gunangle, che con "holdmode gunstock"
+// (anche dopo la migrazione di un vecchio aimpitch calibrato) non conta: il
+// clic non faceva niente e nessuno lo diceva. B + Y nella presa normale non
+// e' piu' nell'aiuto: allineando l'arma DISEGNATA (gia' inclinata di gunangle)
+// la misura restituisce gunangle stesso (circolare); col calcio vale, la
+// guancia fissa il controller rispetto all'occhio. Verifica nel visore.
+const char* const kGunAngleHelp =
+    "Normal hold: tilt of the gun above where the controller points (0 = like the menu laser). Raise it if the gun points too "
+    "low, lower it if it points too high.";
+const char* const kStockAngleHelp =
+    "Gunstock hold: tilt of the gun above where the controller points. B + Y held 1 s measures it (stock at your cheek, look "
+    "through the sights at something far). No stock: Controller hold > normal.";
+
 // Scheda Basic: le scelte che un giocatore tocca davvero.
 std::vector<Item> BasicItems() {
     return {
         {"hand", "Dominant hand", "Which controller holds the gun. Left-handed: the gun buttons move to the left controller and Walker holds the gun in his left hand.", Kind::Choice, {"right", "left"}},
+        // WI-4b: la presa a due mani segue la presa: normal = la sinistra sulla canna gira l'arma; gunstock = la mira resta del calcio.
+        {"holdmode", "Controller hold", "normal = bare controllers: the gun points like the menu laser (Gun angle); left hand on the barrel = two-handed, both hands aim. gunstock = controllers on a stock: the gun follows the stock (B + Y measures it).", Kind::Choice, {"normal", "gunstock"}},
+        // Con "holdmode gunstock" questa voce diventa stockangle (SyncHoldAngleRow).
+        {"gunangle", "Gun angle", kGunAngleHelp, Kind::Choice, {"-15", "-10", "-5", "0", "5", "10", "15"}},
+        // WI-4c (bug 1 del tester): torrette a due mani, i due sistemi di mira.
+        // L'aiuto si vede su una riga di 610 px: l'essenziale per primo (review WI-4c round 1).
+        {"turretgrip", "Turret grip", "normal = both hands on the handles: move them to aim like a real machine gun (helicopter minigun: grips, handlebars); gunstock = aim along the stock; auto = as Controller hold. One hand alone also aims.", Kind::Choice, {"auto", "normal", "gunstock"}},
         {"wristhud", "Wrist HUD", "Ammo, weapon and health on the support-hand wrist, like a watch.", Kind::OnOff},
-        {"height", "Standing height", "auto = your real height measured while playing; hold both sticks 3 s to set it.", Kind::Choice, {"auto", "fixed"}},
+        {"height", "Standing height", "auto = your real height measured while playing (hold both sticks 3 s to save it); fixed = Walker's eye height whatever your height.", Kind::Choice, {"auto", "fixed"}},
         {"snapturn", "Turning", "0 = smooth turning with the right stick, 30/45 = snap turns in degrees.", Kind::Choice, {"0", "30", "45"}},
         {"vignette", "Comfort vignette", "Darkens the edges while moving: 0 off, 0.5 light, 1 strong.", Kind::Choice, {"0", "0.5", "1"}},
         {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.35 100", "0.4 100", "0.5 100", "0.6 100"}},
-        {"fpbody", "Walker's body", "Show Walker's body and arms (off = floating hands and gun).", Kind::OnOff},
-        {"reload", "Reload", "physical = grip the magazine, belt, push it in; simple = press X.", Kind::Choice, {"physical", "simple"}},
+        {"fpbody", "Walker's body", "full = Walker's body under you, his eyes on yours and his neck under your neck; arms = only his arms, hands and gun (torso and legs hidden).", Kind::Choice, {"full", "arms"}},
+        // Review 2 del follow-up (27/10): il corpo che torna sotto la testa cambia cio' che il corpo fa dopo ogni sguardo: Basic.
+        {"bodyalign", "Body under the head", "Seconds your head must stay still before Walker's body turns back under it, so looking down shows your chest, not his shoulder (0 = off: it can stay up to 45 deg off). Only with tracked controllers; it waits while you aim or near a wall.", Kind::Choice, {"0", "0.4", "1"}},
+        {"reload", "Reload", "physical = grip the magazine, belt, push it in; simple = left hand on the magazine, then pull down. X always reloads.", Kind::Choice, {"physical", "simple"}},
         {"marker", "Green aim marker", "A green marker where the barrel points (on by default). Off: use only the weapon's own sights.", Kind::OnOff},
         {"laser", "Laser beam", "A visible beam from the barrel to the point of impact.", Kind::OnOff},
         {"spread", "Bullet spread", "on = the game's spread scaled by stance; off = laser-straight shots.", Kind::OnOff},
-        {"physicalcrouch", "Crouch for real", "Crouch in your room and Walker crouches with you (legs bent, lower behind low walls).", Kind::OnOff},
+        {"physicalcrouch", "Crouch for real", "Crouch 30 cm in your room and Walker crouches with you (fits through low passages); stand up and he stands. Off = only the crouch button.", Kind::OnOff},
+        {"crouchview", "Crouch view", "auto = the crouch button lowers your view smoothly to Walker's crouch (crouching for real moves only your own head, never twice); real = only your real head; game = the view drops with the game.", Kind::Choice, {"auto", "real", "game"}},
+        {"grabprops", "Grab objects", "Close the grip next to a physics object to pick it up; open it to drop or throw it.", Kind::OnOff},
+        {"gravitygloves", "Gravity gloves", "Point your left hand at an object or a dropped gun, close the grip and flick your wrist: it flies to your hand (like Half-Life: Alyx).", Kind::OnOff},
+        {"grabhighlight", "Highlight objects", "Glowing corners around the object you point at or can reach (gold when locked).", Kind::OnOff},
+        {"throwboost", "Throw strength", "Thrown objects leave at your hand's speed times this (1.1 = SteamVR's default).", Kind::Choice, {"1", "1.1", "1.3", "1.6", "2"}},
+        {"throwmode", "Throw style", "peak = objects leave at the fastest speed of your throw and spin with your wrist; heavy ones lob; a slow release just puts them down. classic = your hand's average speed at release (older).", Kind::Choice, {"peak", "classic"}},
+        {"objectweight", "Object weight", "Heavy objects in your free hand lag, sag and turn slowly (full) or a little (light); off = no weight. Everything can still be lifted.", Kind::Choice, {"light", "full", "off"}},
+        {"analoggrip", "Analog grip", "With Object weight: squeeze harder for more control. A loose grip gives your hand less pull and twist (objects trail further and turn back slowly); a full squeeze holds them tight. Everything can still be lifted.", Kind::OnOff},
+        {"solidhands", "Solid hands", "Free hand drawn where physics puts it: on what you hold (with Object weight: lags, sags, stays on an object pressed into a crate) and on door handles; full = empty hand also stops on objects with physics. Gun unchanged.", Kind::Choice, {"held", "full", "off"}},
+        {"impacthaptics", "Impact haptics", "Pulses when what you hold hits something or your empty hand slaps it, scaled by how hard (full) or at half strength (low); off = fixed pulses only.", Kind::Choice, {"full", "low", "off"}},
+        {"propcombat", "Objects as weapons", "Objects you throw or swing count as hits on enemies, glass and crates.", Kind::OnOff},
+        {"propthrowdamage", "Thrown objects hurt", "An object you throw at an enemy hurts him: light ones a little (never a kill), heavy ones or a hit on the head make him stagger or fall like your melee. Needs Objects as weapons.", Kind::OnOff},
+        {"propmelee", "Swing objects at enemies", "An object you hold and swing hard at an enemy hits him like your melee: from a fast swing (or on the head) he staggers or falls, then B finishes him; a bottle or glass breaks on him. Damage never kills; head hits count double. Needs Objects as weapons.", Kind::OnOff},
+        {"propglass", "Objects break glass", "Objects you throw or swing crack or smash glass panes, crates and the windows holding back sand (a thrown radio can bury enemies under the avalanche; a bottle only cracks it). Needs Objects as weapons.", Kind::OnOff},
+        {"propexplosive", "Explosive bottles", "Propane and diving bottles can be picked up and thrown (also with the gravity gloves); shoot one (a rifle needs two hits) or drop it from a roof and it explodes where it is, with the game's own blast and damage. Off = they stay in place, as before.", Kind::OnOff},
+        {"fakegrenade", "Fake grenades", "A small object you throw (a can, a bottle, a rock) that lands within 3 m of enemies makes them think it is a grenade: the nearest one shouts \"grenade!\" and their AI gets the same warning as for a real one. Once every 10 s per group; not when it hits an enemy, or lands as close to Adams or Lugo. Off = thrown objects are just objects.", Kind::OnOff},
+        {"propnoise", "Objects make noise", "Experimental, not verified. An object you throw, drop or knock over that lands hard (or a bottle you smash) sends the enemies' AI the game's fist-fight noise at the spot where it lands: within 3-15 m depending on how heavy it is and how hard it lands (breaking glass is louder). Tests in a firefight showed no clear effect (the enemies already knew where you were), and it was not tested on enemies that are not fighting yet: the noise may draw them to you rather than to the object. Off by default.", Kind::OnOff},
+        {"grenadeback", "Throw back grenades", "An enemy grenade that has come to rest on the ground within 8 m gets red corners (thicker when your left hand can reach it). Close your left hand on it to pick it up and throw it back. Its fuse keeps burning (enemy frag grenades: 4 s from the throw), so if you hold it too long it explodes in your hand and kills you. Once thrown back it counts as your grenade: the enemies it kills are your kills. Grenades still flying cannot be caught, and a grenade with under 1 s of fuse left gets no corners and cannot be picked up. Your squad's grenades are left alone. Off = enemy grenades cannot be picked up.", Kind::OnOff},
+        {"corpsedrag", "Drag bodies", "Close your left hand on a dead enemy's arm, leg or body to grab it and drag it (to clear a doorway, or to move it out of sight); a fast swing of your free hand also shoves a body. A body is heavy: it lags when you pull hard and the pull grows while it does not come, so it always moves; yank it away fast and it slips out of your hand. Only dead enemies: never squad mates, story characters or civilians, never the living or enemies still dying. Off = bodies stay where they fall.", Kind::OnOff},
+        {"weaponpickup", "Pick up enemy weapons", "Close your left (support) hand on a gun an enemy dropped to pick it up, then bring it to your gun hand to take it (the gun you held falls to the ground if you already carry two). Touching a gun like one you carry takes its ammo instead. Off = press A next to it, as in the game.", Kind::OnOff},
+        {"disarm", "Disarm enemies", "Hit an enemy's gun hard (a fast slap with your free hand, a swung object, or a thrown one) and he staggers; harder and the gun falls out of his hands, where you can pick it up. A disarmed enemy stops shooting; once back on his feet (5-10 s) he grabs his gun again if it is still next to him and you did not take it. Needs Objects as weapons.", Kind::OnOff},
+        {"propshield", "Objects stop bullets", "An object you hold (a suitcase, a box, a radio) stops enemy bullets: each hit pushes it and you feel it; after a few hits it flies out of your hand (plates and books 2, suitcases and radios about 6, metal boxes and sandbags 15). Off = bullets go through what you hold.", Kind::OnOff},
         {"coverlean", "Lean out of cover", "When Walker leans out of cover to aim, your view and gun go with him around the edge (off = only your real head moves).", Kind::OnOff},
         {"roomscale", "Room-scale", "Walker follows your real steps (collisions included).", Kind::OnOff},
-        {"seated", "Seated play", "Playing sitting down: the view keeps Walker's standing eye height from where your head is when you recenter.", Kind::OnOff},
-        {"hints", "Controller hints", "Short hints in the headset during the first sessions.", Kind::Choice, {"auto", "on", "off"}},
+        {"headcollision", "Head in walls", "push = leaning into a wall, crate or squadmate stops your view at the surface (sliding along it stays 1:1); off = the view goes through.", Kind::Choice, {"push", "off"}},
+        {"seated", "Seated play", "auto = detected when you put the headset on or recenter (sitting: your eyes go to Walker's eye height, no real crouch); on / off force it.", Kind::Choice, {"auto", "on", "off"}},
+        {"hints", "Controller hints", "Short hints in the headset during the first sessions, and one per object situation (auto: once per profile; on: every session).", Kind::Choice, {"auto", "on", "off"}},
         {"vrmenu", "This menu at start", "Open this menu on the game's main menu at every start.", Kind::Choice, {"on", "off"}},
         {"runtime", "VR runtime", "steamvr = through SteamVR; openxr = Quest Link or Virtual Desktop (VDXR) directly, no SteamVR; auto (default) = Virtual Desktop (VDXR) when its Streamer runs, otherwise SteamVR. Restart the game.", Kind::Choice, {"steamvr", "openxr", "auto"}},
     };
 }
 
-const char* const kControls[] = {
-    "LEFT STICK: move          RIGHT STICK: turn          STICK CLICKS: LS / RS",
-    "RIGHT TRIGGER: fire        LEFT TRIGGER: aim (or bring the gun to your eye)",
-    "A: action / cover          B: melee (punch or hit with the gun)",
-    "X: reload                  Y: next weapon",
-    "LEFT GRIP: grenade (quick throw with the left hand) / hold the gun by the barrel",
-    "RIGHT GRIP: squad orders (look at the target) / grab ropes, ziplines, turrets",
-    "LEFT MENU BUTTON: pause     RIGHT STICK HELD + direction: D-pad",
-    "BOTH STICKS 1 s: recenter   BOTH STICKS 3 s: also save your standing height",
-    "B + Y 1 s: gunstock calibration (aim at something far, look at it)",
-    "RELOAD BY HAND: grip the magazine under the gun, pull it out, grip at your belt, push it in",
-    "WEAPON SWAP: right grip over your shoulder or at your hip",
-    "CROUCH: Walker crouches with you   COVER: duck fast by cover, lean out to aim",
-};
+// Righe della pagina Controls: ui_text.h (misurate nei test offline: ognuna
+// entro i 1040 px della pagina; review WI-4c round 1).
+using vr::ui::kControls;
+
 
 std::mutex g_mutex;
 std::vector<Item> g_basic = BasicItems();
@@ -96,21 +135,68 @@ struct Hit {
     int action;  // 1 tab basic, 2 advanced, 3 controls, 4 play, 5 scroll up, 6 scroll down, 10+i riga i (toggle/cycle), 1000+i meno, 2000+i piu'
 };
 std::vector<Hit> g_hits;
+// Ultima pagina Controls disegnata (collaudo "vrmenu dump"): riga piu' larga, fondo dell'ultima, passo.
+struct ControlsMetrics {
+    int widest = 0, bottom = 0, pitch = 0;
+};
+ControlsMetrics g_lastControls;
+int g_forceVd = -1;  // collaudo: -1 come e', 0 / 1 avviso di Virtual Desktop forzato
+struct DumpReq {
+    std::string path;
+    int tab;
+    int vd;
+};
+std::vector<DumpReq> g_dumpReq;
+
+// Voce "Gun angle" sulla presa attiva (kGunAngleHelp): chiave, aiuto e
+// scelte; con withValue anche il valore, dai globali (dopo un clic su
+// "Controller hold", che cambia la presa senza ricaricare l'ini).
+void SyncHoldAngleRow(bool withValue) {
+    const bool stock = vr::control::g_holdMode.load() == 1;
+    for (Item& it : g_basic) {
+        if (it.key != "gunangle" && it.key != "stockangle") continue;
+        it.key = stock ? "stockangle" : "gunangle";
+        it.help = stock ? kStockAngleHelp : kGunAngleHelp;
+        it.choices = stock ? std::vector<std::string>{"0", "5", "10", "15", "20", "25", "30", "35", "40"}
+                           : std::vector<std::string>{"-15", "-10", "-5", "0", "5", "10", "15"};
+        if (withValue)
+            it.value = vr::pure::FormatConfigNumber(stock ? vr::control::g_stockAngleDeg.load() : vr::control::g_gunAngleDeg.load(), 1);
+    }
+}
 
 std::string Trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
 
+std::string FirstWord(const std::string& s) {
+    std::istringstream in(s);
+    std::string w;
+    in >> w;
+    return w;
+}
+
 // Righe dell'ini accanto alla dll: valori attuali e, per Advanced, i commenti
-// che precedono ogni chiave come spiegazione.
+// che precedono ogni chiave come spiegazione. Dopo, le voci dei predefiniti
+// distribuiti che l'ini dell'utente non ha (vr::pure::DefaultLinesMissingFrom):
+// col valore predefinito, che vale gia' (ApplyDefaultsMissingFrom); cambiarle
+// le scrive nell'ini (SaveIniValue aggiunge la riga).
 void LoadIni() {
-    std::ifstream f(vr::control::GameDirectory() + "\\specopsvr.ini");
+    std::vector<std::string> lines;
+    {
+        std::ifstream f(vr::control::GameDirectory() + "\\specopsvr.ini");
+        std::string l;
+        while (std::getline(f, l)) {
+            if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (lines.empty() && l.rfind("\xEF\xBB\xBF", 0) == 0) l.erase(0, 3);  // BOM UTF-8 (come LoadConfigFile)
+            lines.push_back(l);
+        }
+    }
+    for (std::string& l : vr::pure::DefaultLinesMissingFrom(lines, vr::control::DefaultIniText())) lines.push_back(l);
     std::vector<std::pair<std::string, std::string>> kv;  // chiave, resto
     std::vector<Item> adv;
-    std::string line, help;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string help;
+    for (const std::string& line : lines) {
         std::string t = Trim(line);
         if (t.empty()) {
             help.clear();
@@ -128,7 +214,7 @@ void LoadIni() {
         std::getline(in, rest);
         rest = Trim(rest);
         // Mai nel menu (richiesta 21/10): gli aggiornamenti non vanno spenti per sbaglio.
-        if (key == "configversion" || key == "hintsshown" || key == "autoupdate" || key == "updatechannel" || key == "updaterepo") {
+        if (key == "configversion" || key == "hintsshown" || key == "objecthints" || key == "autoupdate" || key == "updatechannel" || key == "updaterepo") {
             help.clear();
             continue;
         }
@@ -140,17 +226,29 @@ void LoadIni() {
         it.value = rest;
         std::string low;
         for (char ch : rest) low += static_cast<char>(tolower(static_cast<unsigned char>(ch)));
-        if (low == "on" || low == "off") it.kind = Kind::OnOff;
-        else {
+        // Valori a parole noti (vr::pure::AdvancedWordChoices, review 2 WI-1):
+        // si scorrono come le voci Choice di Basic (prima il testo restava
+        // fisso, es. "predictframe auto" per l'A/B nel visore). Prima della
+        // regola on/off: "predictframe on" deve tornare a auto, non diventare
+        // un interruttore on/off (e "predict" non ha "on": scriveva un valore
+        // non valido; collaudo 26/10).
+        const std::vector<std::string>* words = vr::pure::AdvancedWordChoices(key);
+        if (words && std::find(words->begin(), words->end(), FirstWord(low)) != words->end()) {
+            it.kind = Kind::Choice;
+            it.choices = *words;
+            it.value = FirstWord(low);
+        } else if (low == "on" || low == "off") {
+            it.kind = Kind::OnOff;
+        } else {
             char* e = nullptr;
             std::strtof(rest.c_str(), &e);
             it.kind = e != rest.c_str() ? Kind::Number : Kind::Text;
-            float v = static_cast<float>(std::atof(rest.c_str()));
-            it.step = std::fabs(v) >= 10.0f ? 1.0f : (std::fabs(v) >= 1.0f ? 0.1f : 0.05f);
+            it.step = vr::pure::MenuStepFor(key, static_cast<float>(std::atof(rest.c_str()))).step;
         }
         adv.push_back(it);
         help.clear();
     }
+    SyncHoldAngleRow(false);  // "Gun angle" = gunangle o stockangle secondo la presa
     for (Item& b : g_basic) {
         b.value.clear();
         for (auto& p : kv)
@@ -169,38 +267,33 @@ void Apply(const Item& it, const std::string& value) {
     vr::log::Line("VRMENU: " + it.key + " " + value);
 }
 
-std::string FirstWord(const std::string& s) {
-    std::istringstream in(s);
-    std::string w;
-    in >> w;
-    return w;
-}
-
 void Change(Item& it, int dir) {
     std::string low;
     for (char ch : it.value) low += static_cast<char>(tolower(static_cast<unsigned char>(ch)));
     if (it.kind == Kind::OnOff) {
         it.value = FirstWord(low) == "on" ? "off" : "on";
     } else if (it.kind == Kind::Choice) {
-        int idx = 0;
+        int idx = -1;
         for (size_t i = 0; i < it.choices.size(); ++i)
             if (it.choices[i] == low || FirstWord(it.choices[i]) == FirstWord(low)) idx = static_cast<int>(i);
-        idx = (idx + dir + static_cast<int>(it.choices.size())) % static_cast<int>(it.choices.size());
+        const int n = static_cast<int>(it.choices.size());
+        if (idx < 0) {
+            // Valore numerico fuori dalle scelte (es. "gunangle 2.5" da B+Y,
+            // WI-4a): la scelta successiva nel verso del clic, non la prima.
+            idx = vr::pure::NextNumericChoice(it.choices, low, dir);
+        } else {
+            idx = (idx + dir + n) % n;
+        }
         it.value = it.choices[idx];
     } else if (it.kind == Kind::Number) {
-        std::istringstream in(it.value);
-        float v = 0.0f;
-        in >> v;
-        std::string rest;
-        std::getline(in, rest);
-        v += dir * it.step;
-        char b[32];
-        std::snprintf(b, sizeof(b), it.step >= 1.0f ? "%.0f" : "%.2f", v);
-        it.value = std::string(b) + rest;
+        // Passo per chiave (vr::pure::MenuStepFor): gli angoli a 1 grado per
+        // clic, non 0,05 come veniva dal valore (aimpitch 0, 25/10).
+        it.value = vr::pure::StepConfigNumber(it.key, it.value, dir, it.step);
     } else {
         return;
     }
     Apply(it, it.value);
+    if (it.key == "holdmode") SyncHoldAngleRow(true);  // la voce "Gun angle" segue la presa
 }
 
 // --- Disegno (GDI) -------------------------------------------------------------
@@ -265,7 +358,7 @@ bool Render(std::vector<uint32_t>* rgba) {
     // Avviso per Virtual Desktop (richiesta 21/10): cosa spegnere per non
     // giocare a meta' frequenza.
     LONG topY = kTop;
-    if (vr::control::g_vdDetected) {
+    if (g_forceVd == 1 || (g_forceVd < 0 && vr::control::g_vdDetected)) {
         // Testo corto e a capo automatico (prima due righe lunghe tagliate).
         RECT ra = {20, kTop - 14, kW - 20, kTop + 92};
         HBRUSH ab = CreateSolidBrush(RGB(110, 70, 20));
@@ -291,10 +384,20 @@ bool Render(std::vector<uint32_t>* rgba) {
     if (g_tab == 2) {
         SelectObject(dc, mono);
         SetTextColor(dc, RGB(230, 230, 230));
-        for (size_t i = 0; i < sizeof(kControls) / sizeof(kControls[0]); ++i) {
-            RECT r = {30, topY + static_cast<LONG>(i) * 52, kW - 30, topY + static_cast<LONG>(i) * 52 + 48};
-            DrawTextA(dc, kControls[i], -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        // Passo delle righe che le fa entrare tutte anche sotto l'avviso di
+        // Virtual Desktop (review WI-4c: con l'avviso la 13a riga, TURRET,
+        // finiva a y 816-864 in un pannello alto 820).
+        const int pitch = vr::ui::ControlsRowPitch(static_cast<int>(topY), kH, vr::ui::kControlsCount);
+        LONG widest = 0, bottom = 0;
+        for (size_t i = 0; i < vr::ui::kControlsCount; ++i) {
+            RECT r = {30, topY + static_cast<LONG>(i) * pitch, kW - 30, topY + static_cast<LONG>(i) * pitch + pitch - 4};
+            DrawTextA(dc, kControls[i], -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            SIZE sz = {};
+            GetTextExtentPoint32A(dc, kControls[i], static_cast<int>(std::strlen(kControls[i])), &sz);
+            widest = (std::max)(widest, sz.cx);
+            bottom = r.bottom;
         }
+        g_lastControls = {static_cast<int>(widest), static_cast<int>(bottom), pitch};
     } else {
         std::vector<Item>& items = g_tab == 0 ? g_basic : g_advanced;
         int n = static_cast<int>(items.size());
@@ -442,6 +545,93 @@ void Click(int x, int y) {
     }
 }
 
+// Collaudo senza visore (review 2 WI-1): "vrmenu cycle <chiave> [+1|-1]" fa
+// quello che fa un clic sulla voce (LoadIni + Change: esegue e salva
+// nell'ini), dal thread del menu (Tick), con una riga sul tipo della voce.
+std::mutex g_cycleMutex;
+std::vector<std::pair<std::string, int>> g_cycleReq;
+
+void CycleNow(const std::string& keyArg, int dir) {
+    LoadIni();
+    // "basic:<chiave>" (WI-4a): solo la scheda Basic (gunangle e holdmode sono
+    // anche in Advanced, che si prova per prima).
+    const bool basicOnly = keyArg.rfind("basic:", 0) == 0;
+    const std::string key = basicOnly ? keyArg.substr(6) : keyArg;
+    for (int tab = basicOnly ? 0 : 1; tab >= 0; --tab) {
+        std::vector<Item>& items = tab == 0 ? g_basic : g_advanced;
+        for (Item& it : items) {
+            // "basic:gunangle" trova la voce "Gun angle" anche con la presa a calcio (chiave stockangle).
+            if (it.key != key && !(basicOnly && key == "gunangle" && it.key == "stockangle")) continue;
+            static const char* const kKind[] = {"on/off", "choice", "number", "text"};
+            std::string choices;
+            for (const std::string& c : it.choices) choices += (choices.empty() ? "" : "|") + c;
+            const std::string before = it.value;
+            Change(it, dir);
+            vr::log::Line(std::string("VRMENU: test cycle ") + it.key + " (" + (tab ? "Advanced" : "Basic") + ", " +
+                          kKind[static_cast<int>(it.kind)] + (choices.empty() ? "" : " " + choices) + "): \"" + before +
+                          "\" -> \"" + it.value + "\"" + (it.kind == Kind::Text ? " (text: not changeable)" : ""));
+            g_dirty = true;
+            return;
+        }
+    }
+    vr::log::Line("VRMENU: test cycle " + key + ": not in the menu.");
+}
+
+// Collaudo senza visore (review WI-4c round 1): "vrmenu dump <file.bmp> [basic|advanced|controls] [vd|novd]"
+// disegna la scheda col renderer vero (Render), con l'avviso di Virtual Desktop
+// forzato o tolto, e la salva in BMP; per Controls la riga VRMENU dice la riga
+// piu' larga, il fondo dell'ultima e il passo.
+void DumpNow(const DumpReq& d) {
+    LoadIni();
+    const int tab = g_tab, scroll = g_scroll, vd = g_forceVd;
+    g_tab = d.tab;
+    g_scroll = 0;
+    g_forceVd = d.vd;
+    g_lastControls = ControlsMetrics();
+    std::vector<uint32_t> px;
+    const bool ok = Render(&px);
+    g_tab = tab;
+    g_scroll = scroll;
+    g_forceVd = vd;
+    g_dirty = true;
+    if (!ok) {
+        vr::log::Line("VRMENU: dump failed (render).");
+        return;
+    }
+    BITMAPFILEHEADER fh = {};
+    BITMAPINFOHEADER ih = {};
+    ih.biSize = sizeof(ih);
+    ih.biWidth = kW;
+    ih.biHeight = -kH;
+    ih.biPlanes = 1;
+    ih.biBitCount = 32;
+    ih.biCompression = BI_RGB;
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof(fh) + sizeof(ih);
+    fh.bfSize = fh.bfOffBits + static_cast<DWORD>(px.size() * 4);
+    // Render da' RGBA (overlay): BMP vuole BGRA.
+    for (uint32_t& p : px) p = (p & 0xFF00FF00u) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF);
+    FILE* f = nullptr;
+    if (fopen_s(&f, d.path.c_str(), "wb") != 0 || !f) {
+        vr::log::Line("VRMENU: dump failed (cannot write " + d.path + ").");
+        return;
+    }
+    fwrite(&fh, sizeof(fh), 1, f);
+    fwrite(&ih, sizeof(ih), 1, f);
+    fwrite(px.data(), 4, px.size(), f);
+    fclose(f);
+    char b[300];
+    std::snprintf(b, sizeof(b), "VRMENU: dump tab %d, Virtual Desktop notice %s -> %s", d.tab, d.vd == 1 ? "on" : (d.vd == 0 ? "off" : "as is"),
+                  d.path.c_str());
+    std::string line(b);
+    if (d.tab == 2) {
+        std::snprintf(b, sizeof(b), " | Controls: %u lines, row pitch %d px, widest %d of %d px, last row bottom %d of %d px", static_cast<unsigned>(vr::ui::kControlsCount),
+                      g_lastControls.pitch, g_lastControls.widest, kW - 60, g_lastControls.bottom, kH);
+        line += b;
+    }
+    vr::log::Line(line);
+}
+
 void DoShow(bool show) {
     if (show == g_open) return;
     if (show) {
@@ -476,6 +666,14 @@ void DoShow(bool show) {
 }  // namespace
 
 void Show(bool show) { g_request = show ? 1 : -1; }
+void TestCycle(const std::string& key, int dir) {
+    std::lock_guard<std::mutex> lock(g_cycleMutex);
+    g_cycleReq.push_back({key, dir < 0 ? -1 : 1});
+}
+void TestDump(const std::string& path, const std::string& tab, const std::string& vd) {
+    std::lock_guard<std::mutex> lock(g_cycleMutex);
+    g_dumpReq.push_back({path, tab == "controls" ? 2 : (tab == "advanced" ? 1 : 0), vd == "vd" ? 1 : (vd == "novd" ? 0 : -1)});
+}
 bool IsOpen() { return g_open; }
 
 void Tick(bool cinema) {
@@ -488,9 +686,26 @@ void Tick(bool cinema) {
     if (!session.ok()) return;
     int req = g_request.exchange(0);
     if (req) DoShow(req > 0);
+    {
+        std::vector<std::pair<std::string, int>> cyc;
+        {
+            std::lock_guard<std::mutex> cl(g_cycleMutex);
+            cyc.swap(g_cycleReq);
+        }
+        for (const auto& c : cyc) CycleNow(c.first, c.second);
+        std::vector<DumpReq> dumps;
+        {
+            std::lock_guard<std::mutex> cl(g_cycleMutex);
+            dumps.swap(g_dumpReq);
+        }
+        for (const DumpReq& d : dumps) DumpNow(d);
+    }
     // Apertura automatica: sul primo schermo virtuale (menu del gioco), dopo 2 s.
     int mode = vr::control::g_vrMenu.load();
-    if (!g_open && !g_shownAtStart && mode == 1 && vr::session::Ready() && vr::session::HmdPresent()) {  // mai senza visore (test headless)
+    // Mai senza visore, ne' col runtime finto (collaudi senza visore, 25/10): il menu
+    // aperto rende neutro il pad, anche quello finto ("pad fake") dei collaudi.
+    if (!g_open && !g_shownAtStart && mode == 1 && vr::session::Ready() && vr::session::HmdPresent() &&
+        vr::rt::Active() != vr::rt::Backend::Fake) {
         // Prima del gioco: 1,5 s dopo l'inizio della sessione nel visore,
         // qualunque cosa stia facendo il gioco (lo schermo virtuale resta
         // nascosto finche' il menu e' aperto, vedi vr_output).

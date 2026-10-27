@@ -18,6 +18,10 @@ constexpr uintptr_t kIatSystemParametersInfoW = 0x01109664;
 constexpr uintptr_t kIatSetWindowPos = 0x011096C4;
 constexpr uintptr_t kIatMoveWindow = 0x01109570;
 constexpr uintptr_t kIatGetClientRect = 0x01109614;
+// Solo collaudi (specopsvr_keepfocus): chi e' in primo piano (import dell'exe, 25/10).
+constexpr uintptr_t kIatGetForegroundWindow = 0x011095C4;
+constexpr uintptr_t kIatGetActiveWindow = 0x011096A4;
+constexpr uintptr_t kIatGetFocus = 0x011096D0;
 constexpr uintptr_t kIatShowWindow = 0x0110963C;
 constexpr uintptr_t kIatSetWindowPlacement = 0x0110968C;
 
@@ -151,6 +155,24 @@ int g_wantedHeight = 0;
 // non si poteva piu' minimizzare (audit 20/10).
 bool HeadsetInUse() { return vr::session::IsScene() && vr::session::HmdPresent(); }
 
+// Solo collaudi: con il file "specopsvr_keepfocus" accanto alla dll la finestra
+// tiene il focus anche senza visore. Con due copie del gioco aperte insieme il
+// focus preso da una metteva in pausa l'altra e i collaudi andavano persi (25/10).
+bool TestKeepFocus() {
+    static int cached = -1;
+    if (cached < 0) {
+        char path[MAX_PATH] = {};
+        HMODULE self = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCSTR>(&TestKeepFocus), &self);
+        GetModuleFileNameA(self, path, MAX_PATH);
+        std::string flag(path);
+        flag = flag.substr(0, flag.find_last_of("\\/")) + "\\specopsvr_keepfocus";
+        cached = GetFileAttributesA(flag.c_str()) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
+        if (cached) vr::log::Line("DISPLAY: specopsvr_keepfocus present: the window keeps the focus without a headset (tests).");
+    }
+    return cached == 1;
+}
+
 BOOL WINAPI Hooked_GetClientRect(HWND h, LPRECT r) {
     BOOL ok = g_GetClientRect_Real(h, r);
     // Anche ridotta a icona e senza visore: il rettangolo vero 0x0 faceva
@@ -215,7 +237,7 @@ LRESULT CALLBACK UnclampedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // desktop di Virtual Desktop, una notifica) non deve mettere in pausa il
     // gioco ne' fermare l'input: i messaggi di disattivazione non arrivano
     // al gioco ("keepfocus off" per il comportamento normale; audit 19/10).
-    if (vr::control::g_keepFocus && HeadsetInUse()) {
+    if (vr::control::g_keepFocus && (HeadsetInUse() || TestKeepFocus())) {
         bool deactivate = (msg == WM_ACTIVATEAPP && wp == FALSE) || (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) ||
                           msg == WM_KILLFOCUS;
         if (deactivate) {
@@ -440,7 +462,32 @@ void UnclampWindow(HWND window, int clientWidth, int clientHeight) {
                   std::to_string(client.bottom - client.top) + ").");
 }
 
+typedef HWND(WINAPI* HwndQuery_t)();
+HwndQuery_t g_GetForegroundWindow_Real = nullptr, g_GetActiveWindow_Real = nullptr, g_GetFocus_Real = nullptr;
+// Solo collaudi: con due copie del gioco aperte, quella senza focus smetteva di leggere il pad (il gioco
+// chiede a Windows chi e' in primo piano) anche con specopsvr_keepfocus; il gioco vede sempre se stesso.
+HWND WINAPI Hooked_GetForegroundWindow() {
+    HWND r = g_GetForegroundWindow_Real();
+    return g_gameWindow && !vr::control::g_exiting ? g_gameWindow : r;
+}
+HWND WINAPI Hooked_GetActiveWindow() {
+    HWND r = g_GetActiveWindow_Real();
+    return g_gameWindow && !vr::control::g_exiting ? g_gameWindow : r;
+}
+HWND WINAPI Hooked_GetFocus() {
+    HWND r = g_GetFocus_Real();
+    return g_gameWindow && !vr::control::g_exiting ? g_gameWindow : r;
+}
+
 void InstallDesktopSizeSpoof() {
+    if (TestKeepFocus()) {
+        Patch(kIatGetForegroundWindow, "GetForegroundWindow", reinterpret_cast<void*>(&Hooked_GetForegroundWindow),
+              reinterpret_cast<void**>(&g_GetForegroundWindow_Real));
+        Patch(kIatGetActiveWindow, "GetActiveWindow", reinterpret_cast<void*>(&Hooked_GetActiveWindow),
+              reinterpret_cast<void**>(&g_GetActiveWindow_Real));
+        Patch(kIatGetFocus, "GetFocus", reinterpret_cast<void*>(&Hooked_GetFocus), reinterpret_cast<void**>(&g_GetFocus_Real));
+        vr::log::Line("DISPLAY: test mode: the game always sees its own window in the foreground (specopsvr_keepfocus).");
+    }
     bool a = Patch(kIatGetSystemMetrics, "GetSystemMetrics",
                    reinterpret_cast<void*>(&Hooked_GetSystemMetrics),
                    reinterpret_cast<void**>(&g_GetSystemMetrics_Real));

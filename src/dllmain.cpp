@@ -70,8 +70,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         vr::display::InstallDesktopSizeSpoof();
         vr::input::InstallXInputHooks();
         vr::haptics::Start();
-    } else if (reason == DLL_PROCESS_DETACH) {
-        vr::updater::OnCleanExit();  // uscita normale: non conta come avvio fallito
     }
     return TRUE;
 }

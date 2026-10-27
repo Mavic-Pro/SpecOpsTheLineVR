@@ -13,6 +13,8 @@
 #include <dxgi.h>
 #include <openvr.h>
 #include "vr_runtime.h"
+#include "vr_fake.h"
+#include "pure_utils.h"
 
 #include <algorithm>
 #include <atomic>
@@ -68,6 +70,11 @@ vr::HmdMatrix34_t g_slotPose[2][kSlots] = {};
 // Momento (ProfMs/QpcMs) in cui e' stata campionata la posa della testa del frame.
 double g_slotSampleMs[2][kSlots] = {};
 double g_renderSampleMs[2] = {};
+// Cannocchiale (niente invio con la posa: l'immagine segue la canna, non la
+// testa) e ritaglio incerto (Present senza tag subito dopo un cambio di
+// ScreenPercentage: la coppia non si invia), WI-1.
+bool g_slotScope[2][kSlots] = {}, g_slotCropUnknown[2][kSlots] = {};
+bool g_renderScope[2] = {}, g_renderCropUnknown[2] = {};
 // Ritardo misurato dal campionamento della testa ai fotoni (ms, media mobile;
 // 0 = ancora nessuna misura): serve a "predict auto".
 std::atomic<float> g_photonLatencyMs{0.0f};
@@ -109,6 +116,8 @@ struct EyePacket {
     vr::HmdMatrix34_t pose = {};
     double sampleMs = 0.0;              // campionamento della testa usata per disegnarlo
     vr::VRTextureBounds_t bounds = {0, 0, 1, 1};  // parte della texture con l'immagine
+    bool scope = false;                 // disegnato nel cannocchiale (lungo la canna)
+    bool cropUnknown = false;           // ScreenPercentage del frame incerto (WI-1)
 };
 std::mutex g_mutex;
 std::condition_variable g_cv;
@@ -850,7 +859,21 @@ void ApplyFades(vr::IVRCompositor* compositor) {
 void WorkerLoop() {
     vr::log::Line("VR-OUTPUT: output thread started.");
     int submits = 0, posedSubmits = 0, mismatchedPairs = 0;
+    // WI-2: coppie inviate con occhi di tick diversi (sinistro del tick n,
+    // destro del n-1: ruotando la testa vergenza sbagliata, la scala del mondo
+    // sembra cambiare; bug 3 del tester, mai misurato nel visore) e salto massimo.
+    int skewPairs = 0;
+    uint32_t skewMax = 0;
     double windowStart = QpcMs();
+    // Riga POSEAGE (WI-1): posa di disegno contro la posa del frame data dal
+    // runtime con WaitGetPoses (angolo, e di quanti ms la prima e' predetta
+    // piu' avanti lungo il moto della testa). Se su SteamVR il ritardo misurato
+    // e' un frame corto (ipotesi del "running start", provata solo col runtime
+    // finto) qui si vede circa -1 frame: "predictframe auto" decide da questo.
+    std::vector<float> paAng, paOff;
+    // "predictframe auto" (review WI-1): il frame in piu' di OpenVR solo dopo
+    // la conferma di due finestre POSEAGE (vr::pure::PredictFrameAuto).
+    vr::pure::PredictFrameAuto pfAuto;
     double copyMs = 0.0, waitMs = 0.0, submitMs = 0.0;
     while (!g_workerStop) {
         {
@@ -884,9 +907,23 @@ void WorkerLoop() {
         // tardi e il compositor saltava un frame su due (45 su 90, 36 su 72)
         // con la GPU libera.
         bool waitLate = vr::control::g_waitBeforeSubmit;
+        // Fotoni del frame aperto dall'attesa (ms, QPC) e posa della testa che il
+        // runtime gli da' (WI-1).
+        double framePhotonsAbs = 0.0;
+        vr::TrackedDevicePose_t waitHmd = {};
+        // Solo con l'attesa riuscita (review WI-1): senza frame (sessione che
+        // cambia stato, visore a riposo) lo shim OpenXR torna senza scrivere le
+        // pose, e SteamVR in errore puo' non riempirle.
+        auto afterWait = [&](vr::EVRCompositorError err, const vr::TrackedDevicePose_t* poses) {
+            if (err != vr::VRCompositorError_None) return;
+            const float fp = vr::rt::FramePhotonsSeconds();
+            framePhotonsAbs = fp > 0.0f ? QpcMs() + 1000.0 * fp : 0.0;
+            waitHmd = poses[vr::k_unTrackedDeviceIndex_Hmd];
+        };
         if (vr::control::g_outputTest < 2 && !waitLate) {
-            vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
-            compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+            vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount] = {};
+            const vr::EVRCompositorError we = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+            afterWait(we, poses);
         }
         waitMs += QpcMs() - tw;
         EyePacket pk[2];
@@ -920,6 +957,11 @@ void WorkerLoop() {
             }
         } held = {{tex[0], tex[1], pk[0].gpuSrc, pk[1].gpuSrc}};
         g_cv.notify_all();  // il thread di rendering puo' preparare il frame seguente
+        if (pk[0].slot >= 0 && pk[1].slot >= 0 && pk[0].tick && pk[1].tick && pk[0].tick != pk[1].tick) {
+            ++skewPairs;
+            const uint32_t d = pk[0].tick > pk[1].tick ? pk[0].tick - pk[1].tick : pk[1].tick - pk[0].tick;
+            if (d > skewMax) skewMax = d;
+        }
         double tc = QpcMs();
         bool cinema = pk[0].cinema;
         UINT cinemaTop = 0, cinemaBottom = pk[0].h;
@@ -1114,18 +1156,36 @@ void WorkerLoop() {
             endBusy();
             continue;
         }
+        // Present senza tag subito dopo un cambio di ScreenPercentage (WI-1): il
+        // ritaglio poteva essere quello della percentuale vecchia (immagine
+        // ingrandita o rimpicciolita di k_vecchio/k_nuovo per un frame).
+        // Niente invio: il compositor ripete il frame precedente.
+        if (!cinema && (pk[0].cropUnknown || pk[1].cropUnknown)) {
+            static int uncertain = 0;
+            if (++uncertain <= 5 || uncertain % 100 == 0)
+                vr::log::Line("VR-OUTPUT: pair without frame tag right after a ScreenPercentage change not sent (" +
+                              std::to_string(uncertain) + " so far).");
+            endBusy();
+            continue;
+        }
         if (waitLate && vr::control::g_outputTest < 2) {
             double tw2 = QpcMs();
-            vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
-            compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+            vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount] = {};
+            const vr::EVRCompositorError we = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
             waitMs += QpcMs() - tw2;
+            afterWait(we, poses);
         }
+        // Runtime finto (collaudi): tick e posa del frame per la riga JITTER.
+        if (vr::rt::Active() == vr::rt::Backend::Fake)
+            vr::fake::NoteSubmit(pk[0].tick, pk[0].poseValid ? &pk[0].pose : nullptr, pk[0].sampleMs, cinema);
         double ts = QpcMs();
         vr::Texture_t texL = {cinema && g_blackTex ? g_blackTex : tex[0], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
         vr::Texture_t texR = {cinema && g_blackTex ? g_blackTex : tex[1], vr::TextureType_DirectX, vr::ColorSpace_Gamma};
         vr::VRTextureBounds_t full = {0.0f, 0.0f, 1.0f, 1.0f};
         vr::EVRCompositorError errL, errR;
-        if (!cinema && vr::control::g_submitWithPose && pk[0].poseValid && pk[1].poseValid) {
+        // Cannocchiale escluso (WI-1): l'immagine guarda lungo la canna, la posa
+        // della testa farebbe muovere l'ingrandimento con la testa.
+        if (!cinema && vr::control::g_submitWithPose && pk[0].poseValid && pk[1].poseValid && !pk[0].scope && !pk[1].scope) {
             // Con la posa usata per disegnare: il compositor riproietta da
             // quella alla posa reale al momento della visualizzazione.
             vr::VRTextureWithPose_t pl = {}, pr = {};
@@ -1172,26 +1232,90 @@ void WorkerLoop() {
         // trasmissione). Media mobile per "predict auto": ogni PC e visore ha
         // il suo valore.
         if (!cinema && pk[0].sampleMs > 0.0) {
-            float photons = vr::rt::SecondsToPhotons();
-            if (photons > 0.0f) {
-                double total = (QpcMs() - pk[0].sampleMs) + 1000.0 * photons;
-                if (total > 0.0 && total < 200.0) {
-                    float old = g_photonLatencyMs.load();
-                    g_photonLatencyMs = old <= 0.0f ? static_cast<float>(total) : old + (static_cast<float>(total) - old) * 0.02f;
+            // WI-1: fotoni del frame aperto dall'attesa (FramePhotonsSeconds).
+            // Prima "fino al prossimo vsync" dopo il Submit: col runtime finto
+            // openvr un frame corto (13,9 ms a 72 Hz); su SteamVR da confermare
+            // (predictframe auto, riga POSEAGE).
+            double total = 0.0;
+            if (framePhotonsAbs > 0.0) {
+                total = framePhotonsAbs - pk[0].sampleMs;
+            } else {
+                float photons = vr::rt::SecondsToPhotons();
+                if (photons > 0.0f) total = (QpcMs() - pk[0].sampleMs) + 1000.0 * photons;
+            }
+            if (total > 0.0 && total < 250.0) {
+                float old = g_photonLatencyMs.load();
+                g_photonLatencyMs = old <= 0.0f ? static_cast<float>(total) : old + (static_cast<float>(total) - old) * 0.02f;
+            }
+        }
+        if (!cinema && pk[0].poseValid && waitHmd.bPoseIsValid) {
+            // Valori non finiti esclusi (std::sort con NaN non e' definito).
+            const float ang = static_cast<float>(vr::pure::PoseAngleDeg(pk[0].pose.m, waitHmd.mDeviceToAbsoluteTracking.m));
+            if (std::isfinite(ang)) paAng.push_back(ang);
+            const float* w = waitHmd.vAngularVelocity.v;
+            const float w2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+            if (std::isfinite(w2) && w2 > 0.0305f) {  // oltre 10 gradi/s
+                float v[3];
+                vr::pure::RelativeRotationVector(pk[0].pose.m, waitHmd.mDeviceToAbsoluteTracking.m, v);
+                const float off = 1000.0f * (v[0] * w[0] + v[1] * w[1] + v[2] * w[2]) / w2;
+                if (std::isfinite(off)) paOff.push_back(off);
+            }
+            if (paAng.size() >= 300) {
+                std::vector<float> a = paAng, o = paOff;
+                std::sort(a.begin(), a.end());
+                std::sort(o.begin(), o.end());
+                double sq = 0.0;
+                for (float x : a) sq += static_cast<double>(x) * x;
+                // Frame in piu' di OpenVR (predictframe): solo SteamVR e il
+                // runtime finto con la semantica openvr; OpenXR ha il tempo di
+                // visualizzazione dal runtime.
+                const bool openVrSem = vr::rt::Active() == vr::rt::Backend::OpenVR ||
+                                       (vr::rt::Active() == vr::rt::Backend::Fake && !vr::fake::OpenXrSemantics());
+                const int pfMode = vr::control::g_predictFrameMode.load();
+                const float medOff = o.empty() ? 0.0f : o[o.size() / 2];
+                const float hzNow = g_hmdHz;
+                const float frameMs = hzNow > 30.0f ? 1000.0f / hzNow : 0.0f;
+                if (pfMode != 2) {
+                    pfAuto = vr::pure::PredictFrameAuto{};
+                } else if (openVrSem) {
+                    pfAuto.on = vr::control::g_predictFrameAutoOn.load();
+                    if (pfAuto.Window(medOff, static_cast<int>(o.size()), frameMs)) {
+                        vr::control::g_predictFrameAutoOn = pfAuto.on;
+                        char sb[220];
+                        std::snprintf(sb, sizeof(sb),
+                                      "POSEAGE: predictframe auto -> %s (render pose %+.1f ms vs the runtime's in two windows in a row, "
+                                      "frame %.1f ms)",
+                                      pfAuto.on ? "on, one more frame to photons" : "off", medOff, frameMs);
+                        vr::log::Line(sb);
+                    }
                 }
+                const char* pfState = !openVrSem ? "n/a (display time from the runtime)"
+                                      : pfMode == 1 ? "on"
+                                      : pfMode == 0 ? "off"
+                                      : (vr::control::g_predictFrameAutoOn.load() ? "auto (on)" : "auto (off)");
+                char pb[400];
+                std::snprintf(pb, sizeof(pb),
+                              "POSEAGE: render pose vs the runtime's frame pose over %u frames: angle rms %.3f p99 %.3f deg; render "
+                              "pose predicted %+.1f ms vs the runtime's (median of %u frames turning > 10 deg/s, + = later); "
+                              "measured head-to-photons %.1f ms; predictframe %s",
+                              static_cast<unsigned>(a.size()), std::sqrt(sq / a.size()), a[static_cast<size_t>(0.99 * (a.size() - 1))],
+                              medOff, static_cast<unsigned>(o.size()), g_photonLatencyMs.load(), pfState);
+                vr::log::Line(pb);
+                paAng.clear();
+                paOff.clear();
             }
         }
         if (submits == 1 || submits % 300 == 0 || (errL != vr::VRCompositorError_None && submits % 120 == 0)) {
             double now = QpcMs();
             double n = submits == 1 ? 1.0 : 300.0;
-            char b[300];
+            char b[400];
             std::snprintf(b, sizeof(b),
                           "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
                           "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d; mismatched pairs skipped %d; stale pairs "
-                          "dropped %d; fence timeouts d3d9=%u d3d11=%u",
+                          "dropped %d; fence timeouts d3d9=%u d3d11=%u; L/R from different ticks %d (largest %u ticks)",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
                           copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs, g_pairsDropped,
-                          g_fenceTimeout9.load(), g_fenceTimeout11.load());
+                          g_fenceTimeout9.load(), g_fenceTimeout11.load(), skewPairs, skewMax);
             vr::log::Line(b);
             // Visore a meta' frequenza (SSW di Virtual Desktop, ASW di Link):
             // 36 invii/s su 72 Hz con la GPU libera = riproiezione continua,
@@ -1281,9 +1405,12 @@ bool EyeCant(int eye, float* fwd, float* right, float* up) {
     return true;
 }
 
-void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter, double sampleMs) {
+void SetRenderPose(int eye, const vr::HmdMatrix34_t* pose, uint32_t tick, bool offCenter, double sampleMs, bool scope,
+                   bool cropUnknown) {
     if (eye < 0 || eye > 1) return;
     g_renderSampleMs[eye] = sampleMs;
+    g_renderScope[eye] = scope;
+    g_renderCropUnknown[eye] = cropUnknown;
     g_renderOffCenter[eye] = offCenter;
     g_renderTick[eye] = tick;
     g_renderPoseValid[eye] = pose != nullptr;
@@ -1341,6 +1468,8 @@ void DeliverGpuSlot(int e, int g) {
     pk.pose = g_slotPose[e][g];
     pk.sampleMs = g_slotSampleMs[e][g];
     pk.bounds = g_slotBounds[e][g];
+    pk.scope = g_slotScope[e][g];
+    pk.cropUnknown = g_slotCropUnknown[e][g];
     g_ready[e] = pk;
     g_gpuSlot[e] = -1;
 }
@@ -1348,6 +1477,7 @@ void DeliverGpuSlot(int e, int g) {
 int g_sameTickOk = 0, g_sameTickMissed = 0;
 
 void OnPresent(IDirect3DDevice9* device, int eye) {
+    vr::rt::NameThread(vr::rt::ThreadRole::Present);  // riga dell'attesa del mutex OpenXR (review 2 WI-1)
     if (vr::control::g_exiting) return;
     if (OutputDisabled() || !vr::control::g_vrOutput) return;
     ++g_presentSeq;
@@ -1517,6 +1647,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
                 g_ready[e].pose = g_slotPose[e][g];
                 g_ready[e].sampleMs = g_slotSampleMs[e][g];
                 g_ready[e].bounds = g_slotBounds[e][g];
+                g_ready[e].scope = g_slotScope[e][g];
+                g_ready[e].cropUnknown = g_slotCropUnknown[e][g];
             } else {
                 g_slotState[e][g] = kFree;
             }
@@ -1575,6 +1707,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
             g_slotBounds[e][s] = texBounds;
             g_slotPose[e][s] = g_renderPose[e];
             g_slotSampleMs[e][s] = g_renderSampleMs[e];
+            g_slotScope[e][s] = g_renderScope[e];
+            g_slotCropUnknown[e][s] = g_renderCropUnknown[e];
             g_slotTick[e][s] = g_renderTick[e];
             g_slotSeq[e][s] = g_presentSeq;
             g_gpuSlot[e] = s;
@@ -1601,6 +1735,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         g_slotBounds[e][s] = texBounds;
         g_slotPose[e][s] = g_renderPose[e];
         g_slotSampleMs[e][s] = g_renderSampleMs[e];
+        g_slotScope[e][s] = g_renderScope[e];
+        g_slotCropUnknown[e][s] = g_renderCropUnknown[e];
         g_slotTick[e][s] = g_renderTick[e];
         g_slotSeq[e][s] = g_presentSeq;
         g_slotGpu[e][s] = false;

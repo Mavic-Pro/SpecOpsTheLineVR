@@ -1,12 +1,14 @@
 #include "vr_toast.h"
 #include "control.h"
 #include "logger.h"
+#include "ui_text.h"
 #include "vr_session.h"
 
 #include <windows.h>
 #include <openvr.h>
 #include "vr_runtime.h"
 
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -15,8 +17,9 @@ namespace vr::toast {
 
 namespace {
 
-constexpr int kW = 768, kH = 112;
-constexpr ULONGLONG kShowMs = 3500;
+// Impaginazione e testi in ui_text.h (anche per i test offline): a capo
+// automatico, 40 px su una o due righe, se no 36 / 32 (review WI-4c round 1).
+constexpr int kW = vr::ui::kToastW, kH = vr::ui::kToastH;
 constexpr size_t kMaxQueued = 4;
 
 std::mutex g_mutex;
@@ -30,49 +33,18 @@ ULONGLONG g_shownUntil = 0;
 bool g_visible = false;
 
 // Testo bianco su fondo scuro semitrasparente, in RGBA per SetOverlayRaw.
-bool RenderText(const std::string& text, std::vector<uint32_t>* rgba) {
-    HDC screen = GetDC(nullptr);
-    HDC dc = CreateCompatibleDC(screen);
-    ReleaseDC(nullptr, screen);
-    if (!dc) return false;
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = kW;
-    bi.bmiHeader.biHeight = -kH;  // dall'alto in basso
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!bmp || !bits) {
-        DeleteDC(dc);
-        return false;
-    }
-    HGDIOBJ oldBmp = SelectObject(dc, bmp);
-    HFONT font = CreateFontA(-40, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-    HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
-    RECT r = {0, 0, kW, kH};
-    HBRUSH bg = CreateSolidBrush(RGB(16, 16, 20));
-    FillRect(dc, &r, bg);
-    DeleteObject(bg);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(240, 240, 240));
-    RECT tr = {24, 0, kW - 24, kH};
-    DrawTextA(dc, text.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
-    GdiFlush();
-    rgba->resize(static_cast<size_t>(kW) * kH);
-    const uint32_t* src = static_cast<const uint32_t*>(bits);
-    for (size_t i = 0; i < rgba->size(); ++i) {
-        uint32_t p = src[i];  // BGRA (GDI, alfa non scritto)
+bool RenderText(const std::string& text, std::vector<uint32_t>* rgba, vr::ui::ToastLayout* layout = nullptr) {
+    std::vector<uint32_t> bgra;
+    vr::ui::ToastLayout l;
+    if (!vr::ui::RenderToastBgra(text, &bgra, &l)) return false;
+    rgba->resize(bgra.size());
+    for (size_t i = 0; i < bgra.size(); ++i) {
+        uint32_t p = bgra[i];  // BGRA (GDI, alfa non scritto)
         uint32_t b = p & 0xFF, g = (p >> 8) & 0xFF, rr = (p >> 16) & 0xFF;
         (*rgba)[i] = rr | (g << 8) | (b << 16) | (0xE0u << 24);  // RGBA, fondo al 88%
     }
-    if (oldFont) SelectObject(dc, oldFont);
-    if (font) DeleteObject(font);
-    SelectObject(dc, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(dc);
+    if (!l.fits) vr::log::Line("TOAST: text too long even at " + std::to_string(l.fontPx) + " px, cut: \"" + text + "\"");
+    if (layout) *layout = l;
     return true;
 }
 
@@ -128,7 +100,7 @@ bool Show(const std::string& text) {
     }
     ov->ShowOverlay(g_overlay);
     g_visible = true;
-    g_shownUntil = GetTickCount64() + kShowMs;
+    g_shownUntil = GetTickCount64() + vr::ui::ToastShowMs(text.size());
     vr::log::Line("TOAST: \"" + text + "\"");
     return true;
 }
@@ -174,36 +146,74 @@ void Tick() {
     Show(next);
 }
 
-void HintsTick(bool gameplay) {
-    static ULONGLONG gameplaySince = 0, lastHint = 0;
-    static size_t next = 0;
+// Opzioni che decidono i suggerimenti sugli oggetti e il loro testo (ui_text.h ObjHintText).
+static unsigned ObjHintOptions() {
+    using namespace vr::control;
+    unsigned o = 0;
+    if (g_grabProps) o |= vr::ui::kObjOptGrab;
+    if (g_gravityGloves) o |= vr::ui::kObjOptGloves;
+    if (g_propCombat && g_propThrowDamage) o |= vr::ui::kObjOptThrowDmg;
+    if (g_propShield) o |= vr::ui::kObjOptShield;
+    if (g_propCombat && g_propMelee) o |= vr::ui::kObjOptMelee;
+    if (g_disarm) o |= vr::ui::kObjOptDisarm;
+    if (g_grenadeBack) o |= vr::ui::kObjOptGrenade;
+    if (g_weaponPickup) o |= vr::ui::kObjOptGun;
+    if (g_propExplosive) o |= vr::ui::kObjOptExplosive;
+    return o;
+}
+
+void HintsTick(bool gameplay, int turret, unsigned objectSituations) {
+    static vr::ui::HintSequence seq;
     static bool done = false, counted = false;
-    if (done) return;
+    static int lastMode = -1;
+    static unsigned objSession = 0;  // suggerimenti sugli oggetti visti in questa sessione ("hints on")
     int mode = vr::control::g_hints.load();  // 0 off, 1 on, 2 auto
+    // "hints on" dal menu o dalla console a sessione iniziata: prima "done"
+    // restava fermo dal primo tick (auto con 3 sessioni gia' contate) e non si
+    // vedeva niente fino al riavvio.
+    if (mode != lastMode) {
+        lastMode = mode;
+        done = false;
+    }
+    // Suggerimenti contestuali sugli oggetti (regressione finale del gameplay,
+    // 27/10): prima della serie dei comandi, che finita ("done") esce subito.
+    // Con "hints auto" una volta per profilo (bit salvati in "objecthints"),
+    // anche dopo le 3 sessioni della serie; con "hints on" una volta per
+    // sessione. Lo stesso intervallo di 7 s della serie (seq.lastHint).
+    if (mode != 0 && objectSituations && vr::control::g_toasts) {
+        const unsigned shown = mode == 2 ? vr::control::g_objectHintsShown.load() : objSession;
+        const unsigned opt = ObjHintOptions();
+        const unsigned long long now = GetTickCount64();
+        const int which = vr::ui::ObjHintStep(now, gameplay, turret >= 0, objectSituations, opt, shown, seq.lastHint);
+        if (which >= 0) {
+            seq.lastHint = now;
+            objSession |= 1u << which;
+            char b[96];
+            std::snprintf(b, sizeof(b), "HINT: object hint %d (situations 0x%02X, options 0x%03X)", which, objectSituations, opt);
+            vr::log::Line(b);
+            Notify(vr::ui::ObjHintText(which, opt));
+            if (mode == 2) {
+                const unsigned n = shown | (1u << which);
+                vr::control::g_objectHintsShown = n;
+                vr::control::SaveIniValue("objecthints", std::to_string(n));
+            }
+        }
+    }
+    if (done) return;
     if (mode == 0 || (mode == 2 && vr::control::g_hintsShown.load() >= 3)) {
         done = true;
         return;
     }
-    ULONGLONG now = GetTickCount64();
-    if (!gameplay) {
-        gameplaySince = 0;
-        return;
-    }
-    if (!gameplaySince) gameplaySince = now;
-    if (now - gameplaySince < 15000 || now - lastHint < 7000) return;
-    static const char* const kHints[] = {
-        "Aim with the gun in your right hand; left hand on the barrel = two-handed",
-        "Right trigger: fire. Left trigger or gun to the eye: aim down the sights",
-        "A: action / cover. B: melee (or punch / hit with the gun). X: reload. Y: next weapon",
-        "Left grip: grenade (quick throw with the left hand). Right grip: squad orders",
-        "Reload by hand: grip the magazine under the gun, pull it, grip at your belt, push it in",
-        "Right stick held + direction: D-pad. Both sticks held 1 s: recenter (3 s: standing height)",
-        "Gunstock: aim at something far, look at it, hold B + Y for 1 s",
-    };
-    if (next < sizeof(kHints) / sizeof(kHints[0])) {
-        Notify(kHints[next++]);
-        lastHint = now;
-        if (!counted) {
+    // Testi e sequenza in ui_text.h (HintSequence). Review WI-4c round 2: la
+    // serie parla dell'arma in mano, quindi su una torretta aspetta (prima sulla
+    // minigun del prologo arrivavano "Other hand on the barrel = two-handed", la
+    // mira, la ricarica a mano e il calcio) e si vede il suggerimento della presa
+    // della torretta; a piedi la serie riprende da dove era.
+    bool weapon = false;
+    const char* show = seq.Step(GetTickCount64(), gameplay, turret, &weapon);
+    if (show) {
+        Notify(show);
+        if (weapon && !counted) {
             counted = true;
             if (mode == 2) {
                 int n = vr::control::g_hintsShown.load() + 1;
@@ -211,9 +221,62 @@ void HintsTick(bool gameplay) {
                 vr::control::SaveIniValue("hintsshown", std::to_string(n));
             }
         }
-    } else {
-        done = true;
     }
+    if (seq.WeaponDone()) done = true;
+}
+
+// Collaudo senza visore ("toastdump <cartella>", review WI-4c round 1): ogni
+// suggerimento, le due guide e i due suggerimenti della torretta e gli avvisi
+// del calcio (round 2) disegnati dal renderer vero in BMP (toast_00.bmp ...),
+// con l'impaginazione nel log.
+void DumpForTest(const std::string& dir) {
+    std::vector<std::string> texts(vr::ui::kHints, vr::ui::kHints + vr::ui::kHintCount);
+    texts.push_back(vr::ui::kToastTurretNormal);
+    texts.push_back(vr::ui::kToastTurretGunstock);
+    texts.push_back(vr::ui::kHintTurretNormal);
+    texts.push_back(vr::ui::kHintTurretGunstock);
+    texts.push_back(std::string(vr::ui::kToastMigrationKept) + "15.4 deg");
+    texts.push_back(vr::ui::kToastMigrationNoStock);
+    texts.push_back(vr::ui::kToastStockHint);
+    // Suggerimenti contestuali sugli oggetti, ogni variante (regressione finale del gameplay).
+    for (const char* t : {vr::ui::kObjHintNearGloves, vr::ui::kObjHintNearPlain, vr::ui::kObjHintHeldBoth, vr::ui::kObjHintHeldThrow,
+                          vr::ui::kObjHintHeldShield, vr::ui::kObjHintMeleeBoth, vr::ui::kObjHintMeleeSwing, vr::ui::kObjHintMeleeDisarm,
+                          vr::ui::kObjHintGrenadeText, vr::ui::kObjHintGunText, vr::ui::kObjHintExplosiveText})
+        texts.push_back(t);
+    int bad = 0;
+    for (size_t i = 0; i < texts.size(); ++i) {
+        std::vector<uint32_t> bgra;
+        vr::ui::ToastLayout l;
+        if (!vr::ui::RenderToastBgra(texts[i], &bgra, &l)) continue;
+        char name[64];
+        std::snprintf(name, sizeof(name), "\\toast_%02u.bmp", static_cast<unsigned>(i));
+        const std::string path = dir + name;
+        BITMAPFILEHEADER fh = {};
+        BITMAPINFOHEADER ih = {};
+        ih.biSize = sizeof(ih);
+        ih.biWidth = kW;
+        ih.biHeight = -kH;
+        ih.biPlanes = 1;
+        ih.biBitCount = 32;
+        ih.biCompression = BI_RGB;
+        fh.bfType = 0x4D42;
+        fh.bfOffBits = sizeof(fh) + sizeof(ih);
+        fh.bfSize = fh.bfOffBits + static_cast<DWORD>(bgra.size() * 4);
+        FILE* f = nullptr;
+        if (fopen_s(&f, path.c_str(), "wb") == 0 && f) {
+            fwrite(&fh, sizeof(fh), 1, f);
+            fwrite(&ih, sizeof(ih), 1, f);
+            fwrite(bgra.data(), 4, bgra.size(), f);
+            fclose(f);
+        }
+        bad += l.fits ? 0 : 1;
+        char b[400];
+        std::snprintf(b, sizeof(b), "TOASTDUMP: %s %d px, %d line(s), text %dx%d of %dx%d, %s, shown %.1f s: \"%s\"", name + 1, l.fontPx,
+                      l.lines, l.textW, l.textH, kW - 2 * vr::ui::kToastPadX, kH - 2 * vr::ui::kToastPadY, l.fits ? "fits" : "CUT",
+                      vr::ui::ToastShowMs(texts[i].size()) / 1000.0, texts[i].c_str());
+        vr::log::Line(b);
+    }
+    vr::log::Line("TOASTDUMP: " + std::to_string(texts.size()) + " toasts, " + std::to_string(bad) + " cut, in " + dir);
 }
 
 }  // namespace vr::toast

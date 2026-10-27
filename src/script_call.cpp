@@ -3,11 +3,14 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <sstream>
+#include <atomic>
 #include <map>
 #include <set>
 #include <vector>
@@ -298,7 +301,7 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
         } else if (type == "ClassProperty") {
             void* o = FindClassObject(a);
             std::memcpy(dst, &o, 4);
-        } else if (type == "ObjectProperty") {
+        } else if (type == "ObjectProperty" || type == "ComponentProperty") {
             void* o = ResolveObject(pc, pawn, a);
             std::memcpy(dst, &o, 4);
         } else if (type == "StructProperty" && a.find(',') != std::string::npos) {
@@ -353,7 +356,7 @@ void RunCall(void* pc, void* pawn, const std::string& line) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%g", f);
         ret = buf;
-    } else if (type == "ObjectProperty" || type == "ClassProperty") {
+    } else if (type == "ObjectProperty" || type == "ClassProperty" || type == "ComponentProperty") {
         ret = v ? FullName(reinterpret_cast<void*>(v)) : "None";
     } else if (type == "StrProperty") {
         const wchar_t* d = reinterpret_cast<const wchar_t*>(v);
@@ -457,15 +460,68 @@ int32_t NameIndex(const std::string& text) {
 
 std::string NameFromIndex(int32_t idx) { return NameText(idx); }
 
+// Oggetto vivo: il suo indice (+0x04) punta a lui in GObjects. Un puntatore
+// rimasto dal livello precedente punta a memoria liberata (o riusata) e non
+// passa: il suo posto in GObjects e' vuoto o di un altro oggetto.
+bool LiveObject(void* obj) {
+    uint32_t idx = 0, data = 0, num = 0, slot = 0;
+    return obj && SafeRead(static_cast<char*>(obj) + 0x04, &idx, 4) &&
+           SafeRead(reinterpret_cast<void*>(kGObjects), &data, 4) && SafeRead(reinterpret_cast<void*>(kGObjects + 4), &num, 4) &&
+           idx < num && SafeRead(reinterpret_cast<void*>(data + 4 * idx), &slot, 4) && slot == reinterpret_cast<uint32_t>(obj);
+}
+
+std::atomic<bool> g_clearObjectFaults{false};
+void ClearObjectFaults() { g_clearObjectFaults = true; }
+
 bool CallFunction(void* obj, const char* name, void* parms) {
     if (!obj) return false;
+    // Crash al cambio di livello (26/10): al primo tick del livello nuovo il
+    // mirino chiamava GetBoneLocation sulla mesh di Walker del livello
+    // vecchio, gia' liberata. ProcessEvent su memoria liberata: eccezione
+    // ("SCRIPT: exception ... on None..SkeletalMeshComponent") e, nelle stesse
+    // partite, liste libere di FMallocWindows rovinate e crash al caricamento
+    // seguente (memset su un indirizzo spazzatura). Mai ProcessEvent su un
+    // oggetto che non e' piu' in GObjects.
+    if (!LiveObject(obj)) {
+        static std::atomic<uint32_t> skipped{0};
+        const uint32_t n = ++skipped;
+        if (n <= 10 || n % 1000 == 0) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "SCRIPT: %s skipped on %p: not a live object (stale pointer), %u so far", name, obj, n);
+            vr::log::Line(b);
+        }
+        return false;
+    }
     static std::map<std::pair<uint32_t, std::string>, void*> cache;
-    static std::set<std::string> faulted;  // funzioni che hanno sollevato un'eccezione: mai piu' (L25)
+    // Funzioni che hanno sollevato un'eccezione: mai piu' (L25). Per UFunction,
+    // non per nome (voce 2, 26/10): un'eccezione in YDestructibleObject.TakeDamage
+    // spegneva anche YGamePawn.TakeDamage del lancio che ferisce.
+    static std::set<void*> faulted;
+    // Interrogazioni delle ossa (WI-3): l'eccezione dipende dall'oggetto (mesh
+    // appena creata o gia' liberata al caricamento di un livello), non dalla
+    // funzione. Prima un solo errore spegneva GetBoneLocation per tutta la
+    // sessione: braccia (misure), bodylog, armdebug e ancora del corpo. Ora si
+    // esclude solo quell'oggetto (insieme a parte: "faulted" e' per UFunction
+    // dalla voce 2 della copia A, merge 27/10).
+    static std::set<std::string> faultedObj;
+    const bool perObject = std::strcmp(name, "GetBoneLocation") == 0 || std::strcmp(name, "GetBoneName") == 0 ||
+                           std::strcmp(name, "GetBoneQuaternion") == 0;
+    // Chiave per oggetto (WI-3 fix 1): puntatore piu' FName (indice e numero) e
+    // Outer. Il gioco riusa i blocchi liberati: una mesh nuova di Walker allo
+    // stesso indirizzo di una esclusa perdeva GetBoneLocation per tutto il
+    // livello. Le esclusioni per oggetto si azzerano anche al cambio di Pawn
+    // (ClearObjectFaults).
+    char objKey[128] = {};
+    if (perObject)
+        std::snprintf(objKey, sizeof(objKey), "%s@%p:%u.%u:%08X", name, obj, Field(obj, kOffName), Field(obj, kOffName + 4),
+                      Field(obj, kOffOuter));
+    if (g_clearObjectFaults.exchange(false)) faultedObj.clear();
     auto key = std::make_pair(Field(obj, kOffClass), std::string(name));
-    if (!faulted.empty() && faulted.count(name)) return false;
+    if (perObject && !faultedObj.empty() && faultedObj.count(objKey)) return false;
     auto it = cache.find(key);
     void* func = it != cache.end() ? it->second : (cache[key] = FindMethod(obj, name));
     if (!func) return false;
+    if (!faulted.empty() && faulted.count(func)) return false;
     // Funzioni "native(N)" con opcode (Move, MoveSmooth, SetLocation,
     // SetPhysics...): UObject::ProcessEvent (0x005AAF20) le ignora in silenzio
     // se iNative (UFunction+0x98) != 0. Meglio saperlo che credere di averle
@@ -473,8 +529,8 @@ bool CallFunction(void* obj, const char* name, void* parms) {
     uint16_t iNative = 0;
     std::memcpy(&iNative, static_cast<char*>(func) + kOffFuncINative, 2);
     if (iNative != 0) {
-        if (!faulted.count(name)) {
-            faulted.insert(name);
+        if (!faulted.count(func)) {
+            faulted.insert(func);
             char b[200];
             std::snprintf(b, sizeof(b), "SCRIPT: %s.%s is an opcode native (iNative %u), ProcessEvent ignores it: call disabled",
                           ClassName(obj).c_str(), name, iNative);
@@ -484,11 +540,15 @@ bool CallFunction(void* obj, const char* name, void* parms) {
     }
     if (CallProcessEvent(obj, func, parms)) return true;
     // Prima l'eccezione veniva inghiottita in silenzio e la chiamata ripetuta
-    // a ogni tick: ora una riga nel log e quella funzione resta disattivata.
-    faulted.insert(name);
-    char b[200];
-    std::snprintf(b, sizeof(b), "SCRIPT: exception calling %s.%s on %s (func %p); that call is disabled for this session",
-                  ClassName(obj).c_str(), name, FullName(obj).c_str(), func);
+    // a ogni tick: ora una riga nel log e quella funzione resta disattivata
+    // (le interrogazioni delle ossa: solo su quell'oggetto).
+    if (perObject)
+        faultedObj.insert(objKey);
+    else
+        faulted.insert(func);
+    char b[240];
+    std::snprintf(b, sizeof(b), "SCRIPT: exception calling %s.%s on %s %p (func %p); that call is disabled for this session%s",
+                  ClassName(obj).c_str(), name, FullName(obj).c_str(), obj, func, perObject ? " on this object" : "");
     vr::log::Line(b);
     return false;
 }

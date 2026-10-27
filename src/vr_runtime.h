@@ -10,10 +10,12 @@ struct ID3D11Device;
 // attivo (Oculus, Virtual Desktop VDXR, SteamVR, Pimax...). Il resto del codice
 // chiama sempre e solo questi accessori. Scelta con "runtime steamvr|openxr|auto"
 // nell'ini, letta prima di tutto il resto (la sessione parte da CreateDevice,
-// prima del caricamento dell'ini).
+// prima del caricamento dell'ini). "runtime fake [openvr|openxr] [hz] [ms]"
+// (collaudi, 25/10): runtime finto senza visore (vr_fake.cpp), anche con il
+// file specopsvr_novr.
 namespace vr::rt {
 
-enum class Backend { None, OpenVR, OpenXR };
+enum class Backend { None, OpenVR, OpenXR, Fake };
 
 // Backend in uso (None prima del primo Init).
 Backend Active();
@@ -26,9 +28,11 @@ void Shutdown();
 bool Alive();
 // OpenXR non ha applicazioni "Background": ogni Init da' una sessione completa.
 bool SceneOnly();
-// Nome dell'ini: "steamvr", "openxr" o "auto"; openxrjson = percorso json del runtime (vuoto = quello attivo).
+// Nome dell'ini: "steamvr", "openxr", "auto" o "fake"; openxrjson = percorso json del runtime (vuoto = quello attivo).
 void Configure(const std::string& choice, const std::string& openxrJson);
 std::string Choice();
+// L'ini chiede il runtime finto ("runtime fake ..."): con specopsvr_novr si avvia solo quello.
+bool FakeChosen();
 
 // Interfacce (nullptr se il backend non e' inizializzato).
 vr::IVRSystem* System();
@@ -46,5 +50,19 @@ ID3D11Device* SharedD3D11();
 // Secondi da adesso a quando il frame che si sta preparando arriva sul display
 // (prossimo vsync + vsync->fotoni); 0 se ignoto.
 float SecondsToPhotons();
+
+// Da chiamare subito dopo l'attesa del compositor (WaitGetPoses): secondi da
+// adesso ai fotoni del frame che quell'attesa ha aperto (WI-1). Con SteamVR
+// (e il runtime finto con semantica openvr) WaitGetPoses torna 2-3 ms prima
+// del vsync ("running start") e il frame va sul vsync DOPO: SecondsToPhotons
+// (fino al prossimo vsync) era un frame corto e "predict auto" prediceva un
+// frame in meno. OpenXR: il tempo previsto del frame iniziato.
+float FramePhotonsSeconds();
+
+// Nome del thread chiamante per le righe dell'attesa del mutex OpenXR (review 2
+// WI-1): Present (OnPresent) e sessione (MonitorLoop). Solo un thread_local:
+// innocuo con ogni backend.
+enum class ThreadRole { Present, Session };
+void NameThread(ThreadRole role);
 
 }  // namespace vr::rt

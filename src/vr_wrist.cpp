@@ -33,6 +33,11 @@ vr::VROverlayHandle_t g_overlay = vr::k_ulOverlayHandleInvalid;
 unsigned g_overlayGen = 0;
 bool g_visible = false;
 vr::TrackedDeviceIndex_t g_device = vr::k_unTrackedDeviceIndexInvalid;
+// Trasparenza data all'overlay (voce 5, sfumatura). Rimessa a 1 a ogni
+// overlay creato: uno nuovo (sessione nuova) poteva riavere lo stesso
+// handle, e con il valore vecchio (0) nessuna chiamata finche' la distanza
+// non cambiava (revisione 26/10).
+float g_alphaSet = 1.0f;
 
 // Nome breve dell'arma dalla classe (YWeapon_M4A1 -> M4A1).
 std::string ShortWeapon(const std::string& cls) {
@@ -176,6 +181,7 @@ void Tick() {
         }
         ov->SetOverlaySortOrder(g_overlay, 500);
         g_drawn = Data();
+        g_alphaSet = 1.0f;  // overlay nuovo: parte opaco
         vr::log::Line("WRIST: overlay created.");
     }
     // Controller di supporto (ruolo); se il ruolo non e' un controller, il
@@ -206,6 +212,19 @@ void Tick() {
     if (!g_visible) {
         ov->ShowOverlay(g_overlay);
         g_visible = true;
+    }
+    {
+        // Voce 5 ("solidhands"): l'HUD sta sul controller vero; quando la mano
+        // disegnata se ne stacca (premuta su un tavolo, sull'oggetto pesante)
+        // sfuma da 5 cm a 10 cm, per non restare sospeso accanto al polso.
+        // Con il backend OpenXR la trasparenza entra nei pixel dell'overlay
+        // (vr_openxr.cpp OverlayShim::SetOverlayAlpha, UploadOverlays).
+        const float sep = vr::control::g_supportHandSepCm.load();
+        const float a = sep <= 5.0f ? 1.0f : (sep >= 10.0f ? 0.0f : 1.0f - (sep - 5.0f) / 5.0f);
+        if (std::fabs(a - g_alphaSet) > 0.02f || (a != g_alphaSet && (a == 0.0f || a == 1.0f))) {
+            ov->SetOverlayAlpha(g_overlay, a);
+            g_alphaSet = a;
+        }
     }
 }
 

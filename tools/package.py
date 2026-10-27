@@ -223,9 +223,7 @@ if (-not (Test-Path $prev)) { Write-Host 'No previous version found (d3d9.dll.pr
 if (Get-Process SpecOpsTheLine -ErrorAction SilentlyContinue) { Write-Host 'Close the game first.'; exit 1 }
 Copy-Item -Force (Join-Path $dst 'd3d9.dll') (Join-Path $dst 'd3d9.dll.rolledback')
 Copy-Item -Force $prev (Join-Path $dst 'd3d9.dll')
-Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dst 'specopsvr_update.pending'), (Join-Path $dst 'specopsvr_boot.count')
-Add-Content -Path (Join-Path $dst 'specopsvr.ini') -Value "`r`nautoupdate off  # set by rollback.bat; remove to get updates again"
-Write-Host 'The previous version is back. Automatic updates were turned off in specopsvr.ini.'
+Write-Host 'The previous version is back for the next launch. Updates stay on: a newer release will be installed when it comes out.'
 """
 
 RESET_PS1 = r"""
@@ -311,7 +309,7 @@ UNINSTALL
 
 UPDATES
   The mod checks GitHub at start-up and installs new versions by itself for
-  the next launch ("autoupdate off" in specopsvr.ini disables it). New
+  the next launch (always on). New
   versions first come out as test (pre-release) builds: "updatechannel beta"
   gets them too. If an update causes problems, close the game and run
   rollback.bat to go back to the previous version. A version that dies twice

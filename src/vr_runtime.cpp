@@ -1,5 +1,6 @@
 #include "vr_runtime.h"
 #include "vr_openxr.h"
+#include "vr_fake.h"
 #include "control.h"
 #include "logger.h"
 
@@ -24,6 +25,7 @@ std::mutex g_cfgMutex;
 std::string g_choice;      // "" = non ancora letto
 bool g_autoSettled = false;  // runtime auto: backend scelto (un Init riuscito)
 std::string g_openxrJson;  // override del json del runtime OpenXR
+std::string g_fakeProfile;  // "runtime fake <profilo>": semantica, Hz, ms (vr_fake.cpp)
 
 // La sessione parte da CreateDevice, prima che l'ini sia caricato dai hook:
 // "runtime" e "openxrjson" si leggono direttamente dal file (come fa
@@ -44,7 +46,11 @@ void ReadChoiceFromIni() {
         if (key == "runtime") {
             in >> v;
             for (auto& c : v) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-            if (v == "openxr" || v == "auto" || v == "steamvr" || v == "openvr") g_choice = v == "openvr" ? "steamvr" : v;
+            if (v == "openxr" || v == "auto" || v == "steamvr" || v == "openvr" || v == "fake") g_choice = v == "openvr" ? "steamvr" : v;
+            if (v == "fake") {
+                std::getline(in, g_fakeProfile);
+                for (auto& c : g_fakeProfile) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            }
         } else if (key == "openxrjson") {
             std::string rest;
             std::getline(in, rest);
@@ -126,8 +132,15 @@ const char* BackendName() {
     switch (g_active) {
     case Backend::OpenVR: return "SteamVR (OpenVR)";
     case Backend::OpenXR: return "OpenXR";
+    case Backend::Fake: return "fake runtime";
     default: return "none";
     }
+}
+
+bool FakeChosen() {
+    ReadChoiceFromIni();
+    std::lock_guard<std::mutex> lock(g_cfgMutex);
+    return g_choice == "fake";
 }
 
 void Configure(const std::string& choice, const std::string& openxrJson) {
@@ -142,11 +155,22 @@ std::string Choice() {
 
 bool Init(vr::EVRApplicationType type, std::string* error) {
     ReadChoiceFromIni();
-    std::string choice, json;
+    std::string choice, json, fakeProfile;
     {
         std::lock_guard<std::mutex> lock(g_cfgMutex);
         choice = g_choice;
         json = g_openxrJson;
+        fakeProfile = g_fakeProfile;
+    }
+    // Runtime finto (collaudi): nessun runtime vero viene caricato ne' contattato.
+    // Scelto una volta per partita, come gli altri.
+    if (g_active == Backend::Fake || (g_active == Backend::None && choice == "fake")) {
+        if (g_active == Backend::None) {
+            g_active = Backend::Fake;
+            vr::fake::Configure(fakeProfile);
+            vr::log::Line("VR runtime: fake runtime (runtime fake" + fakeProfile + "): no headset, SteamVR and OpenXR not used.");
+        }
+        return vr::fake::Init(error);
     }
     if (!g_autoSettled && choice == "auto" && json.empty()) {
         // Virtual Desktop preferito quando l'utente lo usa (streamer avviato,
@@ -221,25 +245,43 @@ bool Init(vr::EVRApplicationType type, std::string* error) {
 void Shutdown() {
     if (g_active == Backend::OpenXR) vr::xr::Shutdown();
     else if (g_active == Backend::OpenVR) vr::VR_Shutdown();
+    else if (g_active == Backend::Fake) vr::fake::Shutdown();
 }
 
 bool Alive() {
     if (g_active == Backend::OpenXR) return vr::xr::Alive();
+    if (g_active == Backend::Fake) return vr::fake::Alive();
     return VrServerRunning();
 }
 
-bool SceneOnly() { return g_active == Backend::OpenXR; }
+// OpenXR e il runtime finto non hanno applicazioni "Background".
+bool SceneOnly() { return g_active == Backend::OpenXR || g_active == Backend::Fake; }
 
-vr::IVRSystem* System() { return g_active == Backend::OpenXR ? vr::xr::System() : vr::VRSystem(); }
-vr::IVRCompositor* Compositor() { return g_active == Backend::OpenXR ? vr::xr::Compositor() : vr::VRCompositor(); }
-vr::IVROverlay* Overlay() { return g_active == Backend::OpenXR ? vr::xr::Overlay() : vr::VROverlay(); }
-vr::IVRInput* Input() { return g_active == Backend::OpenXR ? vr::xr::Input() : vr::VRInput(); }
-vr::IVRRenderModels* RenderModels() {
-    return g_active == Backend::OpenXR ? vr::xr::RenderModels() : vr::VRRenderModels();
+// Il runtime finto non tocca mai openvr_api.dll (VRSystem() & co.).
+vr::IVRSystem* System() {
+    return g_active == Backend::Fake ? vr::fake::System() : g_active == Backend::OpenXR ? vr::xr::System() : vr::VRSystem();
 }
-vr::IVRSettings* Settings() { return g_active == Backend::OpenXR ? vr::xr::Settings() : vr::VRSettings(); }
+vr::IVRCompositor* Compositor() {
+    return g_active == Backend::Fake ? vr::fake::Compositor() : g_active == Backend::OpenXR ? vr::xr::Compositor() : vr::VRCompositor();
+}
+vr::IVROverlay* Overlay() {
+    return g_active == Backend::Fake ? vr::fake::Overlay() : g_active == Backend::OpenXR ? vr::xr::Overlay() : vr::VROverlay();
+}
+vr::IVRInput* Input() {
+    return g_active == Backend::Fake ? vr::fake::Input() : g_active == Backend::OpenXR ? vr::xr::Input() : vr::VRInput();
+}
+vr::IVRRenderModels* RenderModels() {
+    return g_active == Backend::Fake     ? vr::fake::RenderModels()
+           : g_active == Backend::OpenXR ? vr::xr::RenderModels()
+                                         : vr::VRRenderModels();
+}
+vr::IVRSettings* Settings() {
+    return g_active == Backend::Fake ? vr::fake::Settings() : g_active == Backend::OpenXR ? vr::xr::Settings() : vr::VRSettings();
+}
 vr::IVRApplications* Applications() {
-    return g_active == Backend::OpenXR ? vr::xr::Applications() : vr::VRApplications();
+    return g_active == Backend::Fake     ? vr::fake::Applications()
+           : g_active == Backend::OpenXR ? vr::xr::Applications()
+                                         : vr::VRApplications();
 }
 
 ID3D11Device* SharedD3D11() { return g_active == Backend::OpenXR ? vr::xr::D3D11Device() : nullptr; }
@@ -247,7 +289,40 @@ ID3D11Device* SharedD3D11() { return g_active == Backend::OpenXR ? vr::xr::D3D11
 float SecondsToPhotons() {
     if (g_active == Backend::OpenXR) return vr::xr::SecondsToPhotons();
     if (g_active == Backend::OpenVR) return OpenVrSecondsToPhotons();
+    if (g_active == Backend::Fake) return vr::fake::SecondsToPhotons();
     return 0.0f;
+}
+
+float FramePhotonsSeconds() {
+    if (g_active == Backend::OpenXR || (g_active == Backend::Fake && vr::fake::OpenXrSemantics())) return SecondsToPhotons();
+    const float s = SecondsToPhotons();  // fino al prossimo vsync + vsync->fotoni
+    // Il frame in piu' solo con "predictframe on", o "auto" confermato dalla
+    // riga POSEAGE (review WI-1: l'ipotesi del "running start" era provata
+    // solo col runtime finto, scritto con la stessa ipotesi; su SteamVR e Steam
+    // Link non verificata, e un frame di troppo fa nuotare il mondo).
+    const int mode = vr::control::g_predictFrameMode.load();
+    if (mode == 0 || (mode == 2 && !vr::control::g_predictFrameAutoOn.load())) return s;
+    vr::IVRSystem* sys = System();
+    if (s <= 0.0f || !sys) return s;
+    static float hz = 0.0f;
+    static ULONGLONG lastProps = 0;
+    if (GetTickCount64() - lastProps > 2000) {
+        lastProps = GetTickCount64();
+        hz = sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+    }
+    if (hz < 30.0f) return s;
+    const float frame = 1.0f / hz;
+    float since = 0.0f;
+    if (!sys->GetTimeSinceLastVsync(&since, nullptr)) return s;
+    since = std::fmod(since < 0.0f ? 0.0f : since, frame);
+    // Nella seconda meta' del frame = attesa finita al "running start": il
+    // frame va sul vsync dopo il prossimo. Nella prima (attesa tornata tardi,
+    // dopo il vsync) va sul prossimo.
+    return frame - since < 0.5f * frame ? s + frame : s;
+}
+
+void NameThread(ThreadRole role) {
+    vr::xr::NameLockWaitThread(role == ThreadRole::Present ? vr::xr::LockWaitThread::Present : vr::xr::LockWaitThread::Session);
 }
 
 }  // namespace vr::rt

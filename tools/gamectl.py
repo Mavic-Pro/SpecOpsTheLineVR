@@ -29,8 +29,11 @@ import time
 
 GAME_DIR = os.environ.get("SPECOPS_GAME_DIR",
                           r"D:\SteamLibrary\steamapps\common\SpecOps_TheLine\Binaries\Win32")
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE_NAME = "SpecOpsTheLine.exe"
+# Seconda copia del gioco per lavori in parallelo (25/10): SPECOPS_GAME_DIR,
+# SPECOPS_EXE (eseguibile rinominato, cosi' pid e kill non toccano l'altra copia),
+# SPECOPS_PROJECT_DIR (sorgenti e dll di quella copia), SPECOPS_DIRECT=1 (niente Steam).
+PROJECT_DIR = os.environ.get("SPECOPS_PROJECT_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXE_NAME = os.environ.get("SPECOPS_EXE", "SpecOpsTheLine.exe")
 APP_ID = "50300"
 LOG = os.path.join(GAME_DIR, "specopsvr.log")
 CMD_FILE = os.path.join(GAME_DIR, "specopsvr_cmd.txt")
@@ -137,7 +140,19 @@ def _close_popups():
         time.sleep(0.3)
 
 
+def no_foreground():
+    """Seconda copia del gioco (SPECOPS_EXE diverso da SpecOpsTheLine.exe) con
+    specopsvr_keepfocus accanto alla dll: la finestra non va mai portata in
+    primo piano (25/10: toglieva il fuoco all'altra copia e ne bloccava i
+    collaudi col pad). La dll risponde da sola a GetForegroundWindow /
+    GetActiveWindow / GetFocus (display_spoof), il pad finto continua a
+    funzionare senza fuoco."""
+    return EXE_NAME.lower() != "specopstheline.exe" and os.path.exists(os.path.join(GAME_DIR, "specopsvr_keepfocus"))
+
+
 def focus():
+    if no_foreground():
+        return True  # niente primo piano, cursore o tasti (vedi no_foreground)
     hwnd = game_window()
     if not hwnd:
         print("finestra del gioco non trovata")
@@ -171,6 +186,9 @@ def focus():
 
 
 def key(name, hold=0.08):
+    if no_foreground():
+        print("input di sistema rifiutato: seconda copia senza primo piano (andrebbe alla finestra attiva)")
+        return
     focus()
     _key_event(name, False)
     time.sleep(hold)
@@ -178,6 +196,9 @@ def key(name, hold=0.08):
 
 
 def mouse(dx, dy, steps=20):
+    if no_foreground():
+        print("input di sistema rifiutato: seconda copia senza primo piano (andrebbe alla finestra attiva)")
+        return
     focus()
     for _ in range(steps):
         inp = INPUT(type=0)
@@ -187,6 +208,9 @@ def mouse(dx, dy, steps=20):
 
 
 def click(hold=0.05, button="left"):
+    if no_foreground():
+        print("input di sistema rifiutato: seconda copia senza primo piano (andrebbe alla finestra attiva)")
+        return
     focus()
     down, up = (0x0002, 0x0004) if button == "left" else (0x0008, 0x0010)
     inp = INPUT(type=0)
@@ -204,11 +228,18 @@ def steam_exe():
 
 
 def launch(args):
+    # SPECOPS_RES=LxA (es. 1600x1667): sostituisce ResX/ResY (copia B piu' piccola, 25/10: due copie sulla stessa GPU).
+    res = os.environ.get('SPECOPS_RES', '')
+    if 'x' in res:
+        w, h = res.split('x', 1)
+        args = [a for a in args if not a.startswith(('ResX=', 'ResY='))] + ['ResX=' + w, 'ResY=' + h]
     if game_pid():
         print("gioco gia' in esecuzione")
         return
-    subprocess.Popen([steam_exe(), "-applaunch", APP_ID, *args])
-    for _ in range(40):
+    direct = os.environ.get("SPECOPS_DIRECT") == "1"
+    if not direct:
+        subprocess.Popen([steam_exe(), "-applaunch", APP_ID, *args])
+    for _ in range(0 if direct else 40):
         time.sleep(1)
         if game_pid():
             print("avviato, pid", game_pid())
