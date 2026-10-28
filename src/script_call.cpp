@@ -1,3 +1,4 @@
+#include "game_addrs.h"
 #include "script_call.h"
 #include "logger.h"
 
@@ -20,8 +21,8 @@ namespace vr::script {
 namespace {
 
 // Layout verificato il 16/10 con tools/ue3.py.
-constexpr uintptr_t kGNames = 0x014C1EC8;    // TArray<FNameEntry*>, testo a +0x10
-constexpr uintptr_t kGObjects = 0x014D41EC;  // TArray<UObject*>
+const uintptr_t& kGNames = vr::addr::g[vr::addr::GNames];    // TArray<FNameEntry*>, testo a +0x10
+const uintptr_t& kGObjects = vr::addr::g[vr::addr::GObjects];  // TArray<UObject*>
 constexpr uintptr_t kOffOuter = 0x28, kOffName = 0x2C, kOffClass = 0x34;
 constexpr uintptr_t kOffSuper = 0x3C;
 constexpr int kVtProcessEvent = 66;

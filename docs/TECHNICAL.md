@@ -34,6 +34,49 @@ The mod is a proxy `d3d9.dll` placed next to the game. It loads the real
 | `pure_utils.h` / `twohand_math.h` | Pure maths and logic shared with `tests/unit_tests.cpp` |
 | `bridge/protube_bridge.cpp` | 64-bit ProTubeVR bridge (embedded in d3d9.dll) |
 
+## Game addresses and non-Steam copies (28/10)
+
+The mod was reverse engineered on the Steam `SpecOpsTheLine.exe` (TimeDateStamp
+0x50041F0C, no ASLR). Every fixed address it uses (functions, hook points in
+the middle of functions, return addresses, globals such as GObjects/GNames/
+GWorld, vtables, import-table slots) is now resolved at start by
+`src/game_addrs.cpp`, first thing in `DllMain`:
+
+1. if the expected bytes are at the Steam address, that address is used
+   (Steam exe, or a copy whose code is identical: same build with the DRM
+   wrapper removed);
+2. otherwise the signature is searched in `.text`, and is used only if it
+   matches exactly once;
+3. otherwise the value stays 0: the code that needs it skips its feature
+   (MinHook refuses a null target, direct calls and IAT patches check for 0)
+   instead of hooking a random place.
+
+Import-table slots are found by DLL + function name/ordinal. The old
+`kXxxAddr` constants are now `const uintptr_t&` references into
+`vr::addr::g[]`, so the code that uses them did not change.
+
+Signatures (`src/game_sigs.inc`) are generated, never written by hand:
+`python tools/gensigs.py`. Bytes that change between builds are wildcards:
+every dword in the `.reloc` table and the rel32 operand of call/jmp/jcc. The
+window can start a few instructions after the address (prologues are shared by
+many functions) and grows until it is unique, with at least 12 fixed bytes.
+To add an address, add it to the lists in `gensigs.py` and run it again.
+`python tools/gensigs.py --check <exe>` prints which signatures resolve in
+another executable, offline.
+
+The log says `ADDR: n/49 game addresses resolved (... at the Steam layout, ...
+by signature)` plus one line per address found by signature or missing. With a
+different exe the headset toast says how many addresses are missing.
+
+Testing on the Steam copy: the file `specopsvr_forcesigscan` in the game folder
+skips step 1, so everything is resolved by searching; `tools/regress.py` must
+pass both with and without it.
+
+Limits: a build compiled differently can also move struct fields (Pawn,
+PlayerController offsets...); those offsets are not covered by signatures.
+Lookups by class/function/property name through GObjects/GNames work on any
+build once those two globals are found.
+
 ## Rendering
 
 - **Device**: when `gpushare` is on, `Direct3DCreate9Ex` + `CreateDeviceEx`.

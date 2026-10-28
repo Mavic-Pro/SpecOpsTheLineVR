@@ -45,6 +45,10 @@ configure_file("${CMAKE_SOURCE_DIR}/src/resources.rc.in" "${CMAKE_BINARY_DIR}/ge
 add_library(d3d9proxy SHARED
     ${CMAKE_BINARY_DIR}/generated/resources.rc
     src/dllmain.cpp
+    src/game_addrs.cpp
+    src/game_addrs.h
+    src/game_sigs.inc
+    src/sig_scan.h
     src/logger.cpp
     src/logger.h
     src/real_d3d9.cpp

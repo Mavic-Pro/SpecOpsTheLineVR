@@ -1,3 +1,4 @@
+#include "game_addrs.h"
 #include "hooks.h"
 #include "logger.h"
 #include "control.h"
@@ -443,10 +444,14 @@ HRESULT WINAPI Hooked_BeginScene(IDirect3DDevice9* self) {
 // ruotando, ma sparisce anche parte del bloom/foschia (in UE3 DOF e bloom
 // sono lo stesso passaggio). Riapplicato periodicamente perche' il gioco
 // rilegge le impostazioni (es. cambiando le opzioni grafiche).
-constexpr uintptr_t kGSystemSettings = 0x014D77B0;
-constexpr uintptr_t kGSystemSettingsVTable = 0x0113A00C;
+const uintptr_t& kGSystemSettings = vr::addr::g[vr::addr::GSystemSettings];
+const uintptr_t& kGSystemSettingsVTable = vr::addr::g[vr::addr::GSystemSettingsVTable];
 constexpr int kSettingMotionBlur = 4 + 0x30;
 constexpr int kSettingDepthOfField = 4 + 0x38;
+// AmbientOcclusion +0x3C (stessa tabella, 28/10). In VR fa ghosting (tester
+// 28/10): il preset VR lo spegne all'avvio, ma il menu Grafica del gioco lo
+// riaccendeva. Con vrpreset on resta spento anche dopo.
+constexpr int kSettingAmbientOcclusion = 4 + 0x3C;
 
 void ApplyPostFxSettings() {
     static int frame = 0;
@@ -468,6 +473,11 @@ void ApplyPostFxSettings() {
         *motionBlur = value;
         *depthOfField = value;
         vr::log::Line(std::string("POSTFX: motion blur and depth of field ") + (value ? "on" : "off"));
+    }
+    auto* ao = reinterpret_cast<int32_t*>(kGSystemSettings + kSettingAmbientOcclusion);
+    if (vr::control::g_vrPreset && *ao != 0) {
+        *ao = 0;
+        vr::log::Line("POSTFX: ambient occlusion switched back off (ghosting in VR; vrpreset off to allow it).");
     }
 }
 
@@ -2061,8 +2071,8 @@ HRESULT WINAPI Hooked_SetVertexShaderConstantF(
 // APawn::execGetPawnViewLocation, trovato nella tabella di registrazione
 // delle funzioni native di UE3 (vedi README, sezione Fase 2). E' una
 // funzione membro C++ (thiscall): il puntatore al Pawn arriva in ECX.
-constexpr uintptr_t kExecGetPawnViewLocationAddr = 0x00BBD730;
-constexpr uintptr_t kExecGetViewTargetAddr = 0x0057E900;  // APlayerController::execGetViewTarget
+const uintptr_t& kExecGetPawnViewLocationAddr = vr::addr::g[vr::addr::ExecGetPawnViewLocation];
+const uintptr_t& kExecGetViewTargetAddr = vr::addr::g[vr::addr::ExecGetViewTarget];  // APlayerController::execGetViewTarget
 // Offset confermati empiricamente nella struct APawn (vedi README). NOTA:
 // +0x674 si e' rivelato essere la rotazione del CORPO (per l'animazione),
 // NON la camera -- vedi sotto per il vero oggetto camera.
@@ -2077,7 +2087,7 @@ constexpr int kOffsetYaw = 0x674;       // int32, unita' Rotator UE3 (65536=360Â
 // il setter generico usato dalla VM di UnrealScript per le proprieta'); lo
 // filtriamo controllando un valore-firma a [ecx+0x64] (il float 0.05, bit
 // pattern 0x3D4CCCCD) per riconoscere specificamente l'istanza camera.
-constexpr uintptr_t kCameraHookAddr = 0x007ECAB2;
+const uintptr_t& kCameraHookAddr = vr::addr::g[vr::addr::CameraHook];
 constexpr int kCameraSignatureOffset = 0x64;
 constexpr uint32_t kCameraSignatureValue = 0x3D4CCCCD;  // float 0.05f
 constexpr int kCameraOffsetX = 0x10;
@@ -2568,8 +2578,8 @@ DWORD WINAPI CameraWriteBpThread(LPVOID param) {
 // della camera, aggiungiamo il delta della testa. Siamo sul thread di gioco
 // e subito dopo la scrittura del gioco, quindi niente piu' sovrascritture.
 // Nessuna patch di codice: solo un puntatore nella tabella di import.
-constexpr uintptr_t kIatMemcpy = 0x01109438;
-constexpr uintptr_t kIatMemmove = 0x0110943C;
+const uintptr_t& kIatMemcpy = vr::addr::g[vr::addr::IatMemcpy];
+const uintptr_t& kIatMemmove = vr::addr::g[vr::addr::IatMemmove];
 
 typedef void*(__cdecl* Memcpy_t)(void* dst, const void* src, size_t n);
 Memcpy_t g_memcpyReal = nullptr;
@@ -2674,9 +2684,10 @@ std::atomic<float> g_forcedMotionOld{0.0f};  // diagnostica: il calcolo di prima
 // +0x98), quindi CallFunction "riusciva" senza muovere nulla (21/10: la
 // room-scale non ha mai spostato Walker, ne' con Move ne' con MoveSmooth).
 // execMoveSmooth azzera prima il bit 0x400 di Actor+0xA4 (bJustTeleported).
-constexpr uintptr_t kActorMoveSmoothAddr = 0x0088FB70;
+const uintptr_t& kActorMoveSmoothAddr = vr::addr::g[vr::addr::ActorMoveSmooth];
 bool CallMoveSmoothNative(void* actor, const float* delta, int* ret) {
     typedef int(__thiscall * MoveSmooth_t)(void*, const float*);
+    if (!kActorMoveSmoothAddr) return false;
     __try {
         *reinterpret_cast<uint32_t*>(static_cast<char*>(actor) + 0xA4) &= ~0x400u;
         *ret = reinterpret_cast<MoveSmooth_t>(kActorMoveSmoothAddr)(actor, delta);
@@ -2789,7 +2800,7 @@ void CaptureCopyStack(void* returnAddress, void** stackTop) {
     for (int i = 0; i < 512 && n < kCopyStackDepth; ++i) {
         uint32_t v = 0;
         if (!TrySafeReadUint32(stackTop + i, &v)) break;
-        if (v >= 0x00401000 && v < 0x01109000) g_copyStack[n++] = v;
+        if (v >= vr::addr::TextBegin() && v < vr::addr::TextEnd()) g_copyStack[n++] = v;
     }
 }
 std::atomic<int> g_lastCopySize{0};
@@ -2863,11 +2874,12 @@ void UpdatePawnViewLocation(char* cam) {
 // fucile e mani (verificato con screenshot il 16/10; gli impatti cadono sul
 // mirino anche con la testa girata). Rischio: muri molto vicini (coperture).
 // Solo in prima persona durante il gameplay; altrimenti valore originale.
-constexpr uintptr_t kNearClipPlaneAddr = 0x0141578C;
+const uintptr_t& kNearClipPlaneAddr = vr::addr::g[vr::addr::NearClipPlane];
 
 void ApplyNearPlane(char* cam) {
     static float original = -1.0f;
     float* nearPlane = reinterpret_cast<float*>(kNearClipPlaneAddr);
+    if (!nearPlane) return;
     if (original < 0.0f) {
         float v = *nearPlane;
         if (!(v > 0.5f && v < 100.0f)) return;  // valore inatteso: non tocchiamo
@@ -3258,7 +3270,7 @@ void ApplyEyeOffset(char* cam) {
 // (trovati dalle loro stringhe DescribeCommand -> vtable -> costruttore).
 // Lo chiamiamo una volta per occhio con la camera spostata; ogni chiamata
 // produce un Present sul thread di rendering (vedi Hooked_Present).
-constexpr uintptr_t kViewportDrawAddr = 0x008F6A80;
+const uintptr_t& kViewportDrawAddr = vr::addr::g[vr::addr::ViewportDraw];
 typedef void(__thiscall* ViewportDraw_t)(void* self, int bShouldPresent);
 ViewportDraw_t g_ViewportDraw_Original = nullptr;
 std::atomic<uint32_t> g_stereoDraws{0};
@@ -3378,11 +3390,12 @@ void LogStats() {
 // secondo stato creato con AllocateViewState (0x00C4F370: new FSceneViewState,
 // 0x2F0 byte, lo stesso che usa il motore). Se il motore ricrea il suo (reset
 // del device, cambio di risoluzione) si ricrea anche il nostro.
-constexpr uintptr_t kAllocateViewStateAddr = 0x00C4F370;
+const uintptr_t& kAllocateViewStateAddr = vr::addr::g[vr::addr::AllocateViewState];
 constexpr uint32_t kOffPcPlayer = 0x388, kOffLpViewState = 0x88;
 typedef void*(__cdecl* AllocateViewState_t)();
 
 void* CallAllocateViewState() {
+    if (!kAllocateViewStateAddr) return nullptr;
     __try {
         return reinterpret_cast<AllocateViewState_t>(kAllocateViewStateAddr)();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4104,7 +4117,7 @@ public:
 // CalcSceneView (0x0075C460) per costruire la proiezione: FOV * PI/360 ->
 // FPerspectiveMatrix. Le copie del FOV in memoria (PlayerController+0x3C0..,
 // camera+0x7C0) NON hanno effetto (verificato il 16/10 misurando c0-c3).
-constexpr uintptr_t kGetFovAngleAddr = 0x006F1EA0;
+const uintptr_t& kGetFovAngleAddr = vr::addr::g[vr::addr::GetFovAngle];
 typedef float(__thiscall* GetFovAngle_t)(void* self);
 GetFovAngle_t g_GetFovAngle_Original = nullptr;
 
@@ -4116,7 +4129,7 @@ constexpr uintptr_t kOffPawnCurrentWeaponFov = 0x1594;  // YGamePawn.m_currentWe
 // ULocalPlayer::CalcSceneView (ritorno a 0x0075CAC5 o 0x0075CBBA) durante il
 // Draw di un occhio: M[0][0], M[1][1] (scala) e M[2][0], M[2][1] (centro),
 // riga z della convenzione a vettori riga di UE3.
-constexpr uintptr_t kPerspectiveMatrixAddr = 0x009EAE80;
+const uintptr_t& kPerspectiveMatrixAddr = vr::addr::g[vr::addr::PerspectiveMatrix];
 typedef void*(__thiscall* PerspectiveMatrix_t)(void* self, float halfFov, float w, float h, float minZ);
 PerspectiveMatrix_t g_PerspectiveMatrix_Original = nullptr;
 
@@ -4125,7 +4138,7 @@ public:
     void* Detour(float halfFov, float w, float h, float minZ) {
         void* r = g_PerspectiveMatrix_Original(this, halfFov, w, h, minZ);
         uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
-        if (g_drawOffCenter && (ret == 0x0075CAC5 || ret == 0x0075CBBA)) {
+        if (g_drawOffCenter && (ret == vr::addr::g[vr::addr::CsvRetPerspectiveA] || ret == vr::addr::g[vr::addr::CsvRetPerspectiveB])) {
             float* m = static_cast<float*>(r);
             static int logged = 0;
             if (logged < 2) {
@@ -4302,7 +4315,7 @@ bool PatchIat(uintptr_t slot, const char* name, void* replacement, Memcpy_t* out
     HMODULE crt = GetModuleHandleA("MSVCR90.dll");
     void* expected = crt ? reinterpret_cast<void*>(GetProcAddress(crt, name)) : nullptr;
     void** entry = reinterpret_cast<void**>(slot);
-    if (!expected || *entry != expected) {
+    if (!slot || !expected || *entry != expected) {
         vr::log::Line(std::string("IAT: entry ") + name + " unexpected, hook NOT installed.");
         return false;
     }
@@ -4327,7 +4340,7 @@ struct FmodVec {
 typedef int(__stdcall* SetListener_t)(void* self, int listener, const FmodVec* pos, const FmodVec* vel,
                                       const FmodVec* fwd, const FmodVec* up);
 SetListener_t g_setListenerReal = nullptr;
-constexpr uintptr_t kIatFmodSetListener = 0x01109878;
+const uintptr_t& kIatFmodSetListener = vr::addr::g[vr::addr::IatFmodSetListener];
 
 int __stdcall Hooked_SetListener(void* self, int listener, const FmodVec* pos, const FmodVec* vel, const FmodVec* fwd,
                                  const FmodVec* up) {
@@ -4367,7 +4380,7 @@ void InstallAudioListenerHook() {
                  ev, "?set3DListenerAttributes@EventSystem@FMOD@@QAG?AW4FMOD_RESULT@@HPBUFMOD_VECTOR@@000@Z"))
            : nullptr;
     void** entry = reinterpret_cast<void**>(kIatFmodSetListener);
-    if (!expected || *entry != expected) {
+    if (!entry || !expected || *entry != expected) {
         vr::log::Line("AUDIO: FMOD listener entry unexpected, audio hook NOT installed.");
         return;
     }
@@ -6974,7 +6987,7 @@ bool PatchCode(uintptr_t addr, const uint8_t* expected, const uint8_t* replaceme
 // quadrata per il visore restavano bande nere sopra e sotto. Prima di ogni
 // chiamata li riportiamo a tutto schermo. (Il ramo bConstrainAspectRatio a
 // 0x0075CA71 NON e' la causa: provato a disattivarlo, nessun effetto.)
-constexpr uintptr_t kCalcSceneViewAddr = 0x0075C460;
+const uintptr_t& kCalcSceneViewAddr = vr::addr::g[vr::addr::CalcSceneView];
 typedef void*(__thiscall* CalcSceneView_t)(void* self, void* a, void* b, void* c, void* d, void* e);
 CalcSceneView_t g_CalcSceneView_Original = nullptr;
 void* g_localPlayer = nullptr;
@@ -6982,7 +6995,7 @@ void* g_localPlayer = nullptr;
 // APlayerController::GetPlayerViewPoint(out Location, out Rotation) @
 // 0x00AB83F0: wrapper C++ dell'evento UnrealScript (thiscall, ret 8),
 // chiamato da CalcSceneView a 0x0075C602 per ottenere la vista.
-constexpr uintptr_t kGetPlayerViewPointAddr = 0x00AB83F0;
+const uintptr_t& kGetPlayerViewPointAddr = vr::addr::g[vr::addr::GetPlayerViewPoint];
 typedef void(__thiscall* GetPlayerViewPoint_t)(void* self, float* outLoc, int32_t* outRot);
 GetPlayerViewPoint_t g_GetPlayerViewPoint_Original = nullptr;
 bool g_inCalcSceneView = false;  // solo thread di gioco
@@ -6994,8 +7007,8 @@ bool g_inCalcSceneView = false;  // solo thread di gioco
 // const FVector& Start, DWORD TraceFlags, const FVector& Extent, light).
 // Usato cosi' da AActor::execFastTrace (0x0083CA90) con flag 0x2286. Nel
 // risultato: Actor a +4, Location a +8 (il tempo si ricava dalla posizione).
-constexpr uintptr_t kSingleLineCheckAddr = 0x009BDE30;
-constexpr uintptr_t kGWorldAddr = 0x014DF734;
+const uintptr_t& kSingleLineCheckAddr = vr::addr::g[vr::addr::SingleLineCheck];
+const uintptr_t& kGWorldAddr = vr::addr::g[vr::addr::GWorld];
 // + TRACE_Pawns (0x1): la testa non entra piu' nei compagni di squadra e il
 // mirino si ferma sul nemico invece che sul muro dietro di lui (playtest
 // 19/10). Il Pawn di Walker e' la sorgente, quindi escluso.
@@ -7017,6 +7030,7 @@ bool TraceLine(void* source, const float* start, const float* end, float* hitTim
         alignas(16) unsigned char hit[0x100] = {};
         void* actor = nullptr;
         __try {
+            if (!kGWorldAddr || !kSingleLineCheckAddr) return false;
             void* world = *reinterpret_cast<void**>(kGWorldAddr);
             if (!world) return false;
             const float extent[3] = {0.0f, 0.0f, 0.0f};
@@ -7072,6 +7086,7 @@ bool TraceLineView(void* source, const float* start, const float* end, float* hi
         alignas(16) unsigned char hit[0x100] = {};
         bool ok = false;
         __try {
+            if (!kGWorldAddr || !kSingleLineCheckAddr) return false;
             void* world = *reinterpret_cast<void**>(kGWorldAddr);
             if (!world) return false;
             const float extent[3] = {0.0f, 0.0f, 0.0f};
@@ -7162,6 +7177,7 @@ bool TraceViewPass(void* source, const float* start, const float* end, DWORD fla
         LARGE_INTEGER q0 = {}, q1 = {};
         QueryPerformanceCounter(&q0);
         __try {
+            if (!kGWorldAddr || !kSingleLineCheckAddr) return false;
             void* world = *reinterpret_cast<void**>(kGWorldAddr);
             if (!world) return false;
             const float extent[3] = {0.0f, 0.0f, 0.0f};
@@ -7280,7 +7296,7 @@ void UpdateAimMarker(const float* aimOrigin, const float* eyeLoc, const int32_t*
 // corrompe la memoria e fa crashare il gioco (17/10, al caricamento di un
 // livello). Prima di ogni scrittura: l'oggetto deve essere ancora in GObjects
 // al suo indice (UObject +0x04) con la stessa classe (+0x34).
-constexpr uintptr_t kGObjectsAddr = 0x014D41EC;
+const uintptr_t& kGObjectsAddr = vr::addr::g[vr::addr::GObjects];
 uint32_t ObjClass(void* obj) {
     uint32_t c = 0;
     if (obj) TrySafeReadUint32(static_cast<char*>(obj) + 0x34, &c);
@@ -11929,6 +11945,7 @@ constexpr uintptr_t kOffWeaponMuzzleBone = 0x2E8;
 bool TraceLineActor(void* source, const float* start, const float* end, float* hitTime, void** actor) {
     *actor = nullptr;
     __try {
+        if (!kGWorldAddr || !kSingleLineCheckAddr) return false;
         void* world = *reinterpret_cast<void**>(kGWorldAddr);
         if (!world) return false;
         alignas(16) unsigned char hit[0x100] = {};
@@ -12326,6 +12343,7 @@ constexpr uint32_t kDbnoBits = 0x10000 | 0x40000;  // m_isKnockedDown | m_isDown
 // FCheckResult: Actor +4, Location +8, Component +0x30, BoneName +0x34.
 bool TraceHitActor(void* source, const float* start, const float* end, void** actor, float* loc, int32_t* bone) {
     __try {
+        if (!kGWorldAddr || !kSingleLineCheckAddr) return false;
         void* world = *reinterpret_cast<void**>(kGWorldAddr);
         if (!world) return false;
         alignas(16) unsigned char hit[0x100] = {};
@@ -12607,7 +12625,7 @@ constexpr uintptr_t kOffPcSelectedMarkable = 0xE98;  // m_currentSelectedTactica
 // la mano di supporto) la convalida non finiva mai ("not taken by the
 // game", log 22/10). Con un bersaglio della mod, le chiamate del gioco con
 // un altro candidato si scartano.
-constexpr uintptr_t kSelectMarkableAddr = 0x008389D0;
+const uintptr_t& kSelectMarkableAddr = vr::addr::g[vr::addr::SelectMarkable];
 typedef void(__thiscall* SelectMarkable_t)(void* pc, void* markable, float screenDist);
 SelectMarkable_t g_SelectMarkable_Original = nullptr;
 std::atomic<void*> g_squadModPick{nullptr};
@@ -13314,13 +13332,13 @@ void UpdateSquadCommandAim(char* cam, void* pawn) {
 // raggio va dalla sua origine al punto in cui arriva la canna: il colpo va
 // dove punta la canna del fucile visibile, qualunque calcolo faccia lo script
 // prima (17/10: i colpi andavano a sinistra del mirino).
-constexpr uintptr_t kCalcWeaponFireAddr = 0x004A3D50;
+const uintptr_t& kCalcWeaponFireAddr = vr::addr::g[vr::addr::CalcWeaponFire];
 
 // UCanvas::execProject (0x00A15D90): quante volte per tick l'HUD proietta
 // punti del mondo sulla tela (M19: quei punti sono gia' nella proiezione
 // decentrata dell'occhio e il rimappaggio della tela li sposta una seconda
 // volta; prima di correggere serve sapere chi lo usa). Contati in PROFILE.
-constexpr uintptr_t kCanvasProjectAddr = 0x00A15D90;
+const uintptr_t& kCanvasProjectAddr = vr::addr::g[vr::addr::CanvasProject];
 std::atomic<uint32_t> g_canvasProjectCalls{0};
 typedef void(__thiscall* ExecCanvasProject_t)(void* self, void* stack, void* result);
 ExecCanvasProject_t g_ExecCanvasProject_Original = nullptr;
@@ -13347,7 +13365,8 @@ void* CanvasProjectThunkAddress() {
 // scalati per l'altezza della finestra quasi quadrata (2400x2500), erano
 // larghi 4444 px e tagliati a destra (21/10): si dichiara un'altezza 16:9
 // (larghezza * 9/16), cosi' il menu si dispone per la larghezza.
-constexpr uintptr_t kViewportSizeAddr = 0x00B45070, kUiViewportSizeAddr = 0x00574390;
+const uintptr_t& kViewportSizeAddr = vr::addr::g[vr::addr::ViewportSize];
+const uintptr_t& kUiViewportSizeAddr = vr::addr::g[vr::addr::UiViewportSize];
 typedef void(__thiscall* ViewportSize_t)(void* self, float* out);
 typedef int(__thiscall* UiViewportSize_t)(void* self, float* out);
 ViewportSize_t g_ViewportSize_Original = nullptr;
@@ -13391,7 +13410,7 @@ public:
 // (0x00F539E0, slot +0x150 della vtable del scene client, chiamata da
 // UUIScene::UpdateViewportSize e dagli aggiornamenti delle scene attive):
 // e' la vera sorgente della dimensione con cui i menu si dispongono.
-constexpr uintptr_t kSceneViewportSizeAddr = 0x00F539E0;
+const uintptr_t& kSceneViewportSizeAddr = vr::addr::g[vr::addr::SceneViewportSize];
 typedef int(__thiscall* SceneViewportSize_t)(void* self, void* scene, float* out);
 SceneViewportSize_t g_SceneViewportSize_Original = nullptr;
 class SceneViewportSizeThunk {
@@ -13419,7 +13438,7 @@ void* UiViewportSizeThunkAddress() {
 }
 
 // Filtro dei crash del motore: LONG __cdecl(EXCEPTION_POINTERS*) (vedi l'installazione).
-constexpr uintptr_t kEngineCrashFilterAddr = 0x00827770;
+const uintptr_t& kEngineCrashFilterAddr = vr::addr::g[vr::addr::EngineCrashFilter];
 typedef LONG(__cdecl* EngineCrashFilter_t)(EXCEPTION_POINTERS* info);
 EngineCrashFilter_t g_EngineCrashFilter_Original = nullptr;
 LONG __cdecl Hooked_EngineCrashFilter(EXCEPTION_POINTERS* info) {
@@ -13469,9 +13488,9 @@ constexpr uintptr_t kOffPawnAimTargetEnd = 0x140C;
 // (FUN_00F62930), 0x00C2727C in AYWeapon_execCalcWeaponFire (gli script).
 // Solo le prime due sono proiettili; il ritorno e' l'indirizzo dopo la call
 // (il detour di MinHook entra con un salto: [esp] e' quello del chiamante).
-constexpr uintptr_t kCwfRetInstant = 0x0093FEA7;
-constexpr uintptr_t kCwfRetShotgun = 0x00F6302E;
-constexpr uintptr_t kCwfRetScript = 0x00C27281;
+const uintptr_t& kCwfRetInstant = vr::addr::g[vr::addr::CwfRetInstant];
+const uintptr_t& kCwfRetShotgun = vr::addr::g[vr::addr::CwfRetShotgun];
+const uintptr_t& kCwfRetScript = vr::addr::g[vr::addr::CwfRetScript];
 
 void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FVec3 end, void* impact) {
     const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -13676,7 +13695,7 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
 // e il muro lo considera gia' MuzzleStart (il colpo parte prima dell'ostacolo
 // se la canna e' dentro): Raised diventa None. YRWS_NoAim (1, zone in cui lo
 // script vieta la mira) resta del gioco.
-constexpr uintptr_t kRaiseWeaponAddr = 0x0052F2B0;
+const uintptr_t& kRaiseWeaponAddr = vr::addr::g[vr::addr::RaiseWeapon];
 constexpr uint8_t kRaiseWeaponRaised = 2;  // YE_RaiseWeaponState.YRWS_Raised
 typedef void(__thiscall* RaiseWeapon_t)(void* self, uint8_t state);
 RaiseWeapon_t g_RaiseWeapon_Original = nullptr;
@@ -14138,7 +14157,7 @@ void KeepGoodBones(void* mesh, bool log) {
     }
 }
 
-constexpr uintptr_t kUpdateSkelPoseAddr = 0x006455E0;
+const uintptr_t& kUpdateSkelPoseAddr = vr::addr::g[vr::addr::UpdateSkelPose];
 typedef void(__thiscall* UpdateSkelPose_t)(void* self, float dt, int tickFaceFx);
 UpdateSkelPose_t g_UpdateSkelPose_Original = nullptr;
 
@@ -14562,8 +14581,10 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
         else
             vr::log::Line("ERROR: hook on the squad target validation failed.");
     }
-    void* cwfTarget = reinterpret_cast<void*>(kCalcWeaponFireAddr);
-    if (MH_CreateHook(cwfTarget, reinterpret_cast<void*>(&Hooked_CalcWeaponFire),
+    // Senza il ritorno della chiamata dagli script (CwfRetScript) non si
+    // distinguerebbero i colpi veri dalle chiamate degli script: niente hook.
+    void* cwfTarget = vr::addr::Ok(vr::addr::CwfRetScript) ? reinterpret_cast<void*>(kCalcWeaponFireAddr) : nullptr;
+    if (cwfTarget && MH_CreateHook(cwfTarget, reinterpret_cast<void*>(&Hooked_CalcWeaponFire),
                       reinterpret_cast<void**>(&g_CalcWeaponFire_Original)) == MH_OK &&
         MH_EnableHook(cwfTarget) == MH_OK) {
         vr::log::Line("Hook on YWeapon::CalcWeaponFire installed (shots from the barrel).");

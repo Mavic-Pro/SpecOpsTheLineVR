@@ -273,7 +273,7 @@ constexpr const char* kControls[] = {
     "X: reload                  Y: next weapon",
     "LEFT GRIP: grenade (left-hand throw) / on the barrel: two-handed grip (or just rest the hand there)",
     "RIGHT GRIP: squad orders (look at the target) / grab ropes, ziplines, turrets",
-    "LEFT MENU BUTTON: pause     RIGHT STICK HELD + direction: D-pad",
+    "LEFT MENU BUTTON: pause (then LS click: this menu)     RIGHT STICK HELD + direction: D-pad",
     "BOTH STICKS 1 s: recenter   BOTH STICKS 3 s: also save your standing height",
     "B + Y 1 s: gunstock calibration (stock at your cheek, look through the sights at something far)",
     "RELOAD BY HAND: grip the magazine under the gun, pull it out, grip at your belt, push it in",

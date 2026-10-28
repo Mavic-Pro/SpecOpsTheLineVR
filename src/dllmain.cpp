@@ -14,18 +14,19 @@
 #include "updater.h"
 #include "haptics_ext.h"
 #include "control.h"
+#include "game_addrs.h"
 #include "vr_toast.h"
 
 namespace {
 
 std::atomic<bool> g_createDeviceHookInstalled = false;
 
-// La mod usa indirizzi fissi dell'eseguibile Steam analizzato (build del
-// 12/07/2012). Con un altro eseguibile (copia non Steam, altra versione) gli
-// agganci possono finire nel punto sbagliato: fino alla 0.9.13 la mod restava
-// inattiva; dal 22/10 (richiesta dell'utente) aggancia comunque e mostra un
-// avviso nel visore "copia non Steam, non testata in questa versione"
-// (vr::control::g_nonSteamExe). L'impronta resta nel log.
+// La mod e' stata scritta sull'eseguibile Steam (build del 12/07/2012). Dal
+// 28/10 gli indirizzi del gioco si risolvono all'avvio (game_addrs.cpp: byte
+// attesi all'indirizzo Steam, altrimenti ricerca per firma), quindi una copia
+// non Steam funziona se le firme si trovano; quelle mancanti spengono solo le
+// funzioni che ne dipendono. L'impronta dell'exe resta nel log e l'avviso nel
+// visore (vr::control::g_nonSteamExe) dice quante funzioni mancano.
 constexpr DWORD kSupportedTimeDateStamp = 0x50041F0C;
 constexpr DWORD kSupportedSizeOfImage = 0x012C7000;
 bool g_supportedExe = true;
@@ -62,10 +63,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         }
         vr::updater::Start();  // anche con un eseguibile non supportato: una versione nuova potrebbe supportarlo
         g_supportedExe = CheckGameExecutable();
-        if (!g_supportedExe) {
+        vr::addr::Resolve();
+        if (!g_supportedExe || !vr::addr::AllAtSteamAddresses()) {
             vr::control::g_nonSteamExe = true;
-            vr::log::Line("WARNING: this is not the Steam executable the mod was built against (non-Steam copy or "
-                          "other version): untested in this version, the hooks are installed anyway.");
+            vr::log::Line(std::string("NOTE: this is not the Steam executable the mod was built against (non-Steam "
+                                      "copy or other version): ") +
+                          (vr::addr::MissingList().empty()
+                               ? "every game address was found, everything should work."
+                               : "some game addresses were not found, the features that need them stay off (see the "
+                                 "ADDR lines above). Please send this log to the mod's GitHub issues."));
         }
         vr::display::InstallDesktopSizeSpoof();
         vr::input::InstallXInputHooks();

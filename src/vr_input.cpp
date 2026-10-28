@@ -1,3 +1,4 @@
+#include "game_addrs.h"
 #include "vr_input.h"
 #include "logger.h"
 #include "control.h"
@@ -47,8 +48,8 @@ constexpr WORD kStart = 0x0010, kBack = 0x0020, kLThumb = 0x0040, kRThumb = 0x00
 constexpr WORD kLB = 0x0100, kRB = 0x0200, kA = 0x1000, kB = 0x2000, kX = 0x4000, kY = 0x8000;
 
 // IAT di SpecOpsTheLine.exe: XINPUT1_3 ordinale 3 (SetState) e 2 (GetState).
-constexpr uintptr_t kIatXInputSetState = 0x01109748;
-constexpr uintptr_t kIatXInputGetState = 0x0110974C;
+const uintptr_t& kIatXInputSetState = vr::addr::g[vr::addr::IatXInputSetState];
+const uintptr_t& kIatXInputGetState = vr::addr::g[vr::addr::IatXInputGetState];
 
 typedef DWORD(WINAPI* XInputGetState_t)(DWORD, XState*);
 typedef DWORD(WINAPI* XInputSetState_t)(DWORD, XVibration*);
@@ -1833,6 +1834,20 @@ void ApplyVrStickRules(XGamepad* pad) {
             pad->wButtons = kStart;
             return;
         }
+        // Menu della mod di nuovo aperto dopo averlo chiuso (tester 28/10: si
+        // apriva solo all'avvio): click dello stick sinistro nel menu di pausa
+        // o nei menu del gioco, dove LS non fa nulla. In gioco LS resta LS.
+        {
+            static bool lsWas = false;
+            const bool lsNow = (pad->wButtons & kLThumb) != 0;
+            const bool inMenus = vr::control::g_gamePaused || vr::control::g_cinemaActive;
+            if (lsNow && !lsWas && inMenus && !vr::control::g_vrDashboard && !vr::menu::IsOpen()) {
+                vr::menu::Show(true);
+                vr::log::Line("VRMENU: opened with the left stick click.");
+            }
+            lsWas = lsNow;
+            if (inMenus) pad->wButtons &= ~kLThumb;
+        }
         if (vr::control::g_vrDashboard || vr::menu::IsOpen()) {  // dashboard o menu del mod: pad neutro
             *pad = {};
             return;
@@ -2046,6 +2061,10 @@ DWORD WINAPI Hooked_XInputSetState(DWORD user, XVibration* vib) {
 
 bool PatchSlot(uintptr_t slot, const char* name, void* replacement, void** original) {
     HMODULE xinput = GetModuleHandleA("XINPUT1_3.dll");
+    if (!slot) {
+        vr::log::Line(std::string("INPUT: IAT entry ") + name + " not found, leaving it alone.");
+        return false;
+    }
     void** entry = reinterpret_cast<void**>(slot);
     void* current = *entry;
     HMODULE owner = nullptr;

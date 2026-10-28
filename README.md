@@ -304,9 +304,8 @@ virtual cinema screen.
 ## Requirements
 
 - Windows 10/11, a recent NVIDIA/AMD GPU.
-- *Spec Ops: The Line*. Developed and tested on the Steam version; other
-  copies (non-Steam executables) are untested: the mod still starts and shows
-  a notice in the headset, but it may not work on them.
+- *Spec Ops: The Line*. Developed and tested on the Steam version; non-Steam
+  copies are welcome too, see [Non-Steam copies](#non-steam-copies).
 - A PC VR headset with two motion controllers. With the default
   `runtime auto` the mod picks by itself: **Virtual Desktop (VDXR)** when the
   Virtual Desktop Streamer is running, otherwise **SteamVR**. `runtime openxr`
@@ -373,6 +372,7 @@ angle). If the copy cannot be made, the old file is migrated as before.
 | A / B / X / Y | Action-cover / melee / reload / next weapon |
 | B + Y held for 1 s | Gunstock calibration (stock angle) |
 | Left menu button | Pause (hold 0.6 s: Back / objectives) |
+| Left stick click in the pause menu or the game's menus | Open the in-headset settings menu again |
 | Right stick held + direction | D-pad (secondary fire, grenade type) |
 | Both sticks held for 1 s | Recenter (stand straight and look ahead) |
 | Both sticks held for 3 s | Also set and save your standing height (`height` in the ini) |
@@ -481,7 +481,8 @@ there is plenty of headroom:
 ## Configuration
 
 The **in-headset settings menu** opens by itself on the game's main menu
-(point the controller laser and pull the trigger; PLAY closes it): *Basic*
+(point the controller laser and pull the trigger; PLAY closes it). To open it
+again later, pause the game and click the left stick: *Basic*
 has the main options with a short explanation, *Advanced* every option of the
 ini (except `updatechannel`, which is set only in the file), *Controls* the
 full control list. Changes apply at once and are saved.
@@ -497,6 +498,24 @@ writing them to `specopsvr_cmd.txt` in the same folder. If something looks
 wrong, most features can be switched off one by one (`ads off`,
 `coverpeek off`, `coverlean off`, `turretaim stick`, `cinemawalker screen`, `gesture melee off`,
 `vrinput legacy`).
+
+## Non-Steam copies
+
+Since 0.10.1 the mod no longer depends on the exact Steam executable. At start
+it checks the game code it needs; with another executable (retail/other store
+copy, other build) it **searches for that code by signature**. Whatever it
+finds works as usual; whatever it cannot find is switched off instead of
+hooking the wrong place, so the game does not crash because of it.
+
+The headset tells you the result once the game starts:
+
+- *Non-Steam copy of the game: all game addresses found*: everything should
+  work. Feedback is still very welcome, it has only been tested on Steam.
+- *Non-Steam copy: N game addresses not found, some features are off*: please
+  help add support for your copy. Run `collect_logs.bat` and
+  [open an issue](https://github.com/Mavic-Pro/SpecOpsTheLineVR/issues/new)
+  with the zip. The `ADDR:` lines at the top of `specopsvr.log` say exactly what
+  is missing. Do not send game files, the log is enough.
 
 ## Reporting bugs
 

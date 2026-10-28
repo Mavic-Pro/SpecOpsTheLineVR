@@ -3,6 +3,7 @@
 #include "pure_utils.h"
 #include "twohand_math.h"
 #include "ui_text.h"
+#include "sig_scan.h"
 // windows.h (da ui_text.h) definisce far / near vuoti: i test li usano come nomi.
 #undef far
 #undef near
@@ -6563,7 +6564,43 @@ static void TestMenuStepRanges() {
     CHECK(StepConfigNumber("predictmax", "250", +1) == "250" && StepConfigNumber("turretgroundup", "89", +1) == "89");
 }
 
+// Firme dell'exe (game_addrs): parsing, jolly, unicita'.
+static void TestSigScan() {
+    using namespace vr::sig;
+    Pattern p = Parse("8B ?? 04 c3");
+    CHECK(p.valid && p.bytes.size() == 4 && p.fixed[1] == 0 && p.fixed[3] == 1 && p.bytes[3] == 0xC3);
+    CHECK(!Parse("8B 4").valid && !Parse("zz").valid && !Parse("?? ??").valid);
+    Pattern lead = Parse("?? ?? 33 C4");
+    CHECK(lead.valid && lead.anchor == 2);
+    const uint8_t buf[] = {0x90, 0x8B, 0x11, 0x04, 0xC3, 0x8B, 0x22, 0x04, 0xC3, 0x8B, 0x33, 0x05, 0xC3, 0x8B, 0x44};
+    auto hits = FindAll(p, buf, sizeof(buf), 8);
+    CHECK(hits.size() == 2 && hits[0] == 1 && hits[1] == 5);
+    CHECK(FindAll(p, buf, sizeof(buf), 1).size() == 1);
+    CHECK(FindAll(Parse("05 C3"), buf, sizeof(buf)).size() == 1);
+    CHECK(FindAll(Parse("8B ?? ?? ??"), buf, sizeof(buf), 8).size() == 3);  // l'ultimo 8B non ha 3 byte dopo
+    CHECK(FindAll(lead, buf, sizeof(buf)).empty());
+    CHECK(MatchAt(p, buf, sizeof(buf), 5) && !MatchAt(p, buf, sizeof(buf), 9) && !MatchAt(p, buf, sizeof(buf), 14));
+    // Ogni firma generata deve essere valida, con almeno 12 byte fissi.
+    int bad = 0, n = 0;
+    auto check = [&](const char* pat) {
+        Pattern q = Parse(pat);
+        size_t fixed = 0;
+        for (auto f : q.fixed) fixed += f;
+        ++n;
+        if (!q.valid || fixed < 12) ++bad;
+    };
+#define SIG_CODE(name, va, skip, pat) check(pat);
+#define SIG_DATA(name, va, ref, off, pat) check(pat);
+#define SIG_IAT(name, va, dll, fn, ord)
+#include "game_sigs.inc"
+#undef SIG_CODE
+#undef SIG_DATA
+#undef SIG_IAT
+    CHECK(n >= 30 && bad == 0);
+}
+
 int main() {
+    TestSigScan();
     TestCorpseDrag();
     TestMeleeHit();
     TestDisarm();

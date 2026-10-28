@@ -1,3 +1,4 @@
+#include "game_addrs.h"
 #include "props.h"
 
 #include "control.h"
@@ -45,7 +46,7 @@ double ProfMs() {
     return static_cast<double>(c.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
 }
 
-constexpr uintptr_t kGObjects = 0x014D41EC;
+const uintptr_t& kGObjects = vr::addr::g[vr::addr::GObjects];
 constexpr uintptr_t kOffName = 0x2C, kOffClass = 0x34, kOffSuper = 0x3C;
 constexpr uintptr_t kOffActorLocation = 0x54;
 constexpr uintptr_t kOffActorPhysics = 0x94;          // Actor.Physics (10 = PHYS_RigidBody)
@@ -6251,7 +6252,8 @@ bool GloveTick(int h, void* pawn, const float* hp, const float ha[3][3], bool gr
 // 0x2286 = World | StopAtAnyHit); senza StopAtAnyHit, serve il piu' vicino.
 // Con estensione la trace prende il cilindro dei Pawn (BlockNonZeroExtent), a
 // estensione zero la mesh fisica con l'osso (BlockZeroExtent, come "hittest").
-constexpr uintptr_t kSingleLineCheck = 0x009BDE30, kGWorld = 0x014DF734;
+const uintptr_t& kSingleLineCheck = vr::addr::g[vr::addr::SingleLineCheck];
+const uintptr_t& kGWorld = vr::addr::g[vr::addr::GWorld];
 constexpr uint32_t kHitTraceFlags = 0x1 | 0x2 | 0x4 | 0x10 | 0x80 | 0x2000;
 // TRACE_ComplexCollision: le mesh statiche con la collisione poligono per
 // poligono anche se hanno quella semplice (lo usano i proiettili: Actor.Trace
@@ -6279,6 +6281,7 @@ struct TraceResult {
 
 bool EngineTrace(void* source, const float* start, const float* end, float extent, TraceResult* out, uint32_t flags = kHitTraceFlags) {
     __try {
+        if (!kGWorld || !kSingleLineCheck) return false;
         void* world = *reinterpret_cast<void**>(kGWorld);
         if (!world) return false;
         alignas(16) unsigned char hit[0x100] = {};
@@ -7971,8 +7974,8 @@ double g_noiseNext = 0.0;
 // Il gestore gira al giro dell'IA, dopo la chiamata: PropNoise arma la sonda
 // col punto dell'urto, il Tick scrive il conteggio 1,5 s dopo.
 namespace noiseprobe {
-constexpr uintptr_t kHearStimFill = 0x00E428A0;
-constexpr uintptr_t kRetFromBotHandler = 0x00A367A3;
+const uintptr_t& kHearStimFill = vr::addr::g[vr::addr::HearStimFill];
+const uintptr_t& kRetFromBotHandler = vr::addr::g[vr::addr::RetFromBotHandler];
 constexpr int kMaxBots = 16;
 typedef void(__thiscall* HearStimFill_t)(void* stim, uint32_t subtype, uint32_t handle, const float* pos, float volume);
 HearStimFill_t g_orig = nullptr;
@@ -10412,6 +10415,7 @@ bool WorldBlocked(void* source, const float* a, const float* b, bool pawns, floa
     for (int k = 0; k < 4; ++k) {
         alignas(16) unsigned char hit[0x100] = {};
         __try {
+            if (!kGWorld || !kSingleLineCheck) return false;
             void* world = *reinterpret_cast<void**>(kGWorld);
             if (!world) return false;
             const float ext[3] = {0.0f, 0.0f, 0.0f};
@@ -14613,10 +14617,11 @@ void ShieldTick(void* walker, double now) {
 // parte da YGamePawn.m_fireStartLoc (+0x17F8) verso m_aimAtPosition
 // (+0x140C), con il cono di dispersione dell'arma.
 typedef float(__thiscall* InstantFire_t)(void* weapon, int shots);
-constexpr uintptr_t kInstantFireAddr = 0x0093F510;
+const uintptr_t& kInstantFireAddr = vr::addr::g[vr::addr::InstantFire];
 constexpr uintptr_t kOffPawnWeapon = 0x1594;  // YGamePawn.m_currentWeapon
 
 bool CallInstantFire(void* weapon, int shots) {
+    if (!kInstantFireAddr) return false;
     __try {
         reinterpret_cast<InstantFire_t>(kInstantFireAddr)(weapon, shots);
         return true;
@@ -14636,7 +14641,7 @@ void EnemyFireTest(void* walker, const EnemyFireReq& r) {
     const uint32_t vt = w ? U32(w, 0) : 0;
     const std::string wc = w ? vr::script::ClassName(w) : std::string("none");
     const uint32_t slot = vt ? U32(reinterpret_cast<void*>(static_cast<uintptr_t>(vt)), 0x424) : 0;
-    if (!w || wc.rfind("YWeapon", 0) != 0 || slot != kInstantFireAddr) {
+    if (!w || wc.rfind("YWeapon", 0) != 0 || !kInstantFireAddr || slot != kInstantFireAddr) {
         std::snprintf(b, sizeof(b), "PROPS: enemyfire: the pawn has no YWeapon with the instant-hit routine (weapon %s, vtable +0x424 = %08X)", wc.c_str(),
                       slot);
         vr::log::Line(b);

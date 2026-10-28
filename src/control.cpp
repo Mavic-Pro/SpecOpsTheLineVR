@@ -2,6 +2,7 @@
 #include "vr_runtime.h"
 #include "vr_openxr.h"
 #include "audio_diag.h"
+#include "game_addrs.h"
 #include "default_ini.h"
 #include "logger.h"
 #include "pure_utils.h"
@@ -2776,7 +2777,10 @@ void Poll() {
         static ULONGLONG firstPoll = now;
         if ((shown == 0) || (shown == 1 && now - firstPoll > 90000)) {
             ++shown;
-            vr::toast::Notify("Non-Steam copy of the game: untested in this version of the mod");
+            const int missing = static_cast<int>(vr::addr::Count) - vr::addr::ResolvedCount();
+            vr::toast::Notify(missing == 0 ? "Non-Steam copy of the game: all game addresses found"
+                                           : "Non-Steam copy: " + std::to_string(missing) +
+                                                 " game addresses not found, some features are off (see the log)");
         }
     }
 

@@ -1,3 +1,4 @@
+#include "game_addrs.h"
 #include "display_spoof.h"
 #include "logger.h"
 #include "control.h"
@@ -13,17 +14,17 @@ namespace vr::display {
 namespace {
 
 // Voci della IAT di SpecOpsTheLine.exe (USER32), vedi README.
-constexpr uintptr_t kIatGetSystemMetrics = 0x01109660;
-constexpr uintptr_t kIatSystemParametersInfoW = 0x01109664;
-constexpr uintptr_t kIatSetWindowPos = 0x011096C4;
-constexpr uintptr_t kIatMoveWindow = 0x01109570;
-constexpr uintptr_t kIatGetClientRect = 0x01109614;
+const uintptr_t& kIatGetSystemMetrics = vr::addr::g[vr::addr::IatGetSystemMetrics];
+const uintptr_t& kIatSystemParametersInfoW = vr::addr::g[vr::addr::IatSystemParametersInfoW];
+const uintptr_t& kIatSetWindowPos = vr::addr::g[vr::addr::IatSetWindowPos];
+const uintptr_t& kIatMoveWindow = vr::addr::g[vr::addr::IatMoveWindow];
+const uintptr_t& kIatGetClientRect = vr::addr::g[vr::addr::IatGetClientRect];
 // Solo collaudi (specopsvr_keepfocus): chi e' in primo piano (import dell'exe, 25/10).
-constexpr uintptr_t kIatGetForegroundWindow = 0x011095C4;
-constexpr uintptr_t kIatGetActiveWindow = 0x011096A4;
-constexpr uintptr_t kIatGetFocus = 0x011096D0;
-constexpr uintptr_t kIatShowWindow = 0x0110963C;
-constexpr uintptr_t kIatSetWindowPlacement = 0x0110968C;
+const uintptr_t& kIatGetForegroundWindow = vr::addr::g[vr::addr::IatGetForegroundWindow];
+const uintptr_t& kIatGetActiveWindow = vr::addr::g[vr::addr::IatGetActiveWindow];
+const uintptr_t& kIatGetFocus = vr::addr::g[vr::addr::IatGetFocus];
+const uintptr_t& kIatShowWindow = vr::addr::g[vr::addr::IatShowWindow];
+const uintptr_t& kIatSetWindowPlacement = vr::addr::g[vr::addr::IatSetWindowPlacement];
 
 // Desktop minimo riportato al gioco. La finestra reale puo' uscire dallo
 // schermo: conta solo la dimensione del back buffer.
@@ -71,7 +72,7 @@ bool Patch(uintptr_t slot, const char* name, void* replacement, void** outOrigin
     HMODULE user32 = GetModuleHandleA("user32.dll");
     void* expected = user32 ? reinterpret_cast<void*>(GetProcAddress(user32, name)) : nullptr;
     void** entry = reinterpret_cast<void**>(slot);
-    if (!expected || *entry != expected) {
+    if (!slot || !expected || *entry != expected) {
         vr::log::Line(std::string("DISPLAY: IAT entry ") + name + " unexpected, leaving it alone.");
         return false;
     }
@@ -117,7 +118,7 @@ BOOL WINAPI Hooked_SetWindowPos(HWND h, HWND after, int x, int y, int cx, int cy
         for (int i = 0; i < 400 && found < 14; ++i) {
             uint32_t v = 0;
             if (!SafeRead(sp + i, &v)) break;
-            if (v >= 0x00401000 && v < 0x01109000) {
+            if (v >= vr::addr::TextBegin() && v < vr::addr::TextEnd()) {
                 char b[16];
                 std::snprintf(b, sizeof(b), " %08X", v);
                 stack += b;
@@ -388,7 +389,7 @@ void KeepSubclass() {
     // davanti creava un ciclo infinito fino all'esaurimento dello stack
     // (audit 20/10). In quel caso si lascia stare, una volta per tutte.
     uintptr_t a = reinterpret_cast<uintptr_t>(cur);
-    if (a < 0x00401000 || a >= 0x01109000) {
+    if (a < vr::addr::TextBegin() || a >= vr::addr::TextEnd()) {
         static bool logged = false;
         if (!logged) {
             logged = true;
