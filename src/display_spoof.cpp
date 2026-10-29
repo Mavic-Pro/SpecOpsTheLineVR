@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cwctype>
 #include <intrin.h>
 #include <string>
 
@@ -25,6 +26,7 @@ const uintptr_t& kIatGetActiveWindow = vr::addr::g[vr::addr::IatGetActiveWindow]
 const uintptr_t& kIatGetFocus = vr::addr::g[vr::addr::IatGetFocus];
 const uintptr_t& kIatShowWindow = vr::addr::g[vr::addr::IatShowWindow];
 const uintptr_t& kIatSetWindowPlacement = vr::addr::g[vr::addr::IatSetWindowPlacement];
+const uintptr_t& kIatGetCommandLineW = vr::addr::g[vr::addr::IatGetCommandLineW];
 
 // Desktop minimo riportato al gioco. La finestra reale puo' uscire dallo
 // schermo: conta solo la dimensione del back buffer.
@@ -68,9 +70,9 @@ BOOL WINAPI Hooked_SystemParametersInfoW(UINT action, UINT param, PVOID pv, UINT
     return ok;
 }
 
-bool Patch(uintptr_t slot, const char* name, void* replacement, void** outOriginal) {
-    HMODULE user32 = GetModuleHandleA("user32.dll");
-    void* expected = user32 ? reinterpret_cast<void*>(GetProcAddress(user32, name)) : nullptr;
+bool Patch(uintptr_t slot, const char* name, void* replacement, void** outOriginal, const char* dll = "user32.dll") {
+    HMODULE module = GetModuleHandleA(dll);
+    void* expected = module ? reinterpret_cast<void*>(GetProcAddress(module, name)) : nullptr;
     void** entry = reinterpret_cast<void**>(slot);
     if (!slot || !expected || *entry != expected) {
         vr::log::Line(std::string("DISPLAY: IAT entry ") + name + " unexpected, leaving it alone.");
@@ -82,6 +84,32 @@ bool Patch(uintptr_t slot, const char* name, void* replacement, void** outOrigin
     *entry = replacement;
     VirtualProtect(entry, sizeof(void*), old, &old);
     return true;
+}
+
+// Gioco sempre in finestra (28/10, issue #3): in fullscreen esclusivo il device
+// D3D9Ex non nasceva (CreateDeviceEx senza display mode -> D3DERR_INVALIDCALL) e
+// il gioco renderizzava alla risoluzione del monitor invece che a quella del
+// visore; la risoluzione automatica usa comunque "setres ...w". UE3 legge la
+// riga di comando con GetCommandLineW in WinMain: "-windowed" vince anche
+// sull'impostazione Fullscreen salvata dal gioco; un "-fullscreen" esplicito
+// diventa "-windowed".
+typedef LPWSTR(WINAPI* GetCommandLineW_t)();
+GetCommandLineW_t g_GetCommandLineW_Real = nullptr;
+
+LPWSTR WINAPI Hooked_GetCommandLineW() {
+    static std::wstring line = [] {
+        std::wstring s = g_GetCommandLineW_Real();
+        std::wstring lower = s;
+        for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
+        const std::wstring fs = L"-fullscreen";
+        for (size_t at = lower.find(fs); at != std::wstring::npos; at = lower.find(fs, at + 1)) {
+            s.replace(at, fs.size(), L"-windowed  ");
+            lower.replace(at, fs.size(), L"-windowed  ");
+        }
+        if (lower.find(L"-windowed") == std::wstring::npos) s += L" -windowed";
+        return s;
+    }();
+    return &line[0];
 }
 
 // Diagnostica: chi ridimensiona la finestra del gioco (e a quanto)?
@@ -505,6 +533,10 @@ void InstallDesktopSizeSpoof() {
           reinterpret_cast<void**>(&g_ShowWindow_Real));
     Patch(kIatSetWindowPlacement, "SetWindowPlacement", reinterpret_cast<void*>(&Hooked_SetWindowPlacement),
           reinterpret_cast<void**>(&g_SetWindowPlacement_Real));
+    if (Patch(kIatGetCommandLineW, "GetCommandLineW", reinterpret_cast<void*>(&Hooked_GetCommandLineW),
+              reinterpret_cast<void**>(&g_GetCommandLineW_Real), "kernel32.dll"))
+        vr::log::Line("DISPLAY: game forced to windowed mode (-windowed on its command line; exclusive fullscreen "
+                      "breaks the GPU path and the headset resolution).");
     vr::log::Line(std::string("DISPLAY: desktop reported to the game >= ") + std::to_string(kMinWidth) + "x" +
                   std::to_string(kMinHeight) + (a && b ? " (active)" : " (NOT active)"));
 }

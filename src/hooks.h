@@ -12,6 +12,9 @@ void* PlayerControllerAlive();
 // Walker su una postazione fissa (torretta, minigun dell'elicottero).
 bool OnTurret();
 extern bool g_d3d9ex;
+// Test ("presentunhook"): toglie il nostro hook dal codice di Present, come fa
+// un altro programma che lo riscrive; la mod deve riagganciarsi da sola.
+void TestUnhookPresent();
 
 // Aggancia IDirect3D9::CreateDevice sull'oggetto appena creato dal vero d3d9.dll.
 // Da qui, al primo CreateDevice riuscito, agganciamo anche i metodi del device

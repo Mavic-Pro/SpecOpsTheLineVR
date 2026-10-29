@@ -17,6 +17,7 @@
 #include "audio_diag.h"
 #include "vr_input.h"
 #include "props.h"
+#include "real_d3d9.h"
 
 #include <tlhelp32.h>
 #include <intrin.h>
@@ -580,6 +581,8 @@ HRESULT WINAPI Hooked_Clear(IDirect3DDevice9* self, DWORD Count, const D3DRECT* 
     return hr;
 }
 
+void CheckPresentHook(IDirect3DDevice9* device);
+
 HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
     uint64_t count = ++g_frameCount;
     if (count == 1) {
@@ -589,6 +592,7 @@ HRESULT WINAPI Hooked_EndScene(IDirect3DDevice9* self) {
     }
     if (vr::control::g_vsDiag) EndFrameVsConstAnalysis();
     vr::display::KeepSubclass();
+    CheckPresentHook(self);
     vr::control::Poll();
     ApplyPostFxSettings();
     return g_EndScene_Original(self);
@@ -1028,23 +1032,21 @@ void MirrorWindowThread() {
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     RegisterClassW(&wc);
     // Finestra 16:9 senza bordi (registrazioni video): la parte centrale
-    // dell'occhio destro ritagliata a 16:9, 1920x1080 o quanto ci sta nello
-    // schermo (22/10: prima era alta quanto lo schermo con le proporzioni
-    // dell'occhio, quasi quadrata, e il ritaglio dopo perdeva risoluzione).
-    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-    int w = sw < 1920 ? sw : 1920, hgt = w * 9 / 16;
-    if (hgt > sh) {
-        hgt = sh;
-        w = hgt * 16 / 9;
-    }
+    // dell'occhio destro ritagliata a 16:9, sempre 1920x1080 (22/10: prima era
+    // alta quanto lo schermo con le proporzioni dell'occhio, quasi quadrata).
+    // Dal 28/10 e' un'opzione del menu per OBS ("Window Capture" di "SpecOpsVR
+    // mirror", che cattura anche una finestra coperta): non piu' sempre in primo
+    // piano, sta dietro alle altre e non copre OBS ne' il desktop.
+    const int w = 1920, hgt = 1080;
     DWORD style = WS_POPUP | WS_VISIBLE;
-    HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, wc.lpszClassName, L"SpecOpsVR mirror", style, 0, 0, w, hgt,
-                             nullptr, nullptr, wc.hInstance, nullptr);
+    HWND h = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"SpecOpsVR mirror", style, 0, 0, w, hgt, nullptr,
+                             nullptr, wc.hInstance, nullptr);
     if (!h) {
         vr::log::Line("MIRRORWIN: window creation failed.");
         return;
     }
     ShowWindow(h, SW_SHOWNOACTIVATE);
+    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     g_mirrorHwnd = h;
     vr::log::Line("MIRRORWIN: mirror window opened (right eye).");
     MSG msg;
@@ -1137,9 +1139,16 @@ void PresentMirror(IDirect3DDevice9* dev, HWND mirror) {
     if (dst) dst->Release();
 }
 
-HRESULT WINAPI Hooked_Present(
-    IDirect3DDevice9* self, const RECT* pSourceRect, const RECT* pDestRect,
-    HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) {
+// Present intercettati (qualunque via): EndScene li confronta con i propri per
+// accorgersi di un hook di Present scavalcato (vedi CheckPresentHook).
+std::atomic<uint32_t> g_presentHits{0};
+// Present gia' in corso su questo thread: un secondo aggancio (vtable sopra
+// l'hook nel codice, o la swap chain del device) passa diritto.
+thread_local int t_presentDepth = 0;
+
+template <class F>
+HRESULT PresentBody(IDirect3DDevice9* self, F&& callOriginal) {
+    g_presentHits.fetch_add(1, std::memory_order_relaxed);
     g_lastPresentMs = GetTickCount64();
     int eye = vr::control::g_presentEye.exchange(-1);
     {
@@ -1230,11 +1239,119 @@ HRESULT WINAPI Hooked_Present(
     UpdateMirrorWindow();
     HWND mirror = vr::control::g_mirrorWin ? g_mirrorHwnd.load() : nullptr;
     PresentMirror(self, mirror);
-    HRESULT hr = g_Present_Original(self, pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+    HRESULT hr = callOriginal();
     const double presMs = ProfMs() - tPres;
     g_lastPresentMs2 = presMs;
     g_profPresent += presMs;
     return hr;
+}
+
+HRESULT WINAPI Hooked_Present(IDirect3DDevice9* self, const RECT* src, const RECT* dst, HWND wnd,
+                              const RGNDATA* dirty) {
+    if (t_presentDepth > 0) return g_Present_Original(self, src, dst, wnd, dirty);
+    ++t_presentDepth;
+    HRESULT hr = PresentBody(self, [&] { return g_Present_Original(self, src, dst, wnd, dirty); });
+    --t_presentDepth;
+    return hr;
+}
+
+// Aggancio di riserva (issue #3, 28/10): sul PC di un tester il nostro hook nel
+// codice di Present smetteva di essere chiamato dopo il primo frame (EndScene a
+// 650 fps, Present fermo a 1, niente al visore; RivaTuner iniettato nel gioco
+// riscrive l'inizio di Present). Se succede, si aggancia la voce della vtable
+// del device e, se neanche cosi' arrivano Present, quella della swap chain
+// implicita (gioco che presenta dalla swap chain).
+Present_t g_PresentVtPrev = nullptr;
+typedef HRESULT(WINAPI* SwapPresent_t)(IDirect3DSwapChain9*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
+SwapPresent_t g_SwapPresentPrev = nullptr;
+
+HRESULT WINAPI Hooked_PresentVt(IDirect3DDevice9* self, const RECT* src, const RECT* dst, HWND wnd,
+                                const RGNDATA* dirty) {
+    if (t_presentDepth > 0) return g_PresentVtPrev(self, src, dst, wnd, dirty);
+    ++t_presentDepth;
+    HRESULT hr = PresentBody(self, [&] { return g_PresentVtPrev(self, src, dst, wnd, dirty); });
+    --t_presentDepth;
+    return hr;
+}
+
+HRESULT WINAPI Hooked_SwapPresent(IDirect3DSwapChain9* sc, const RECT* src, const RECT* dst, HWND wnd,
+                                  const RGNDATA* dirty, DWORD flags) {
+    IDirect3DDevice9* dev = nullptr;
+    if (t_presentDepth > 0 || sc == g_mirrorChain || FAILED(sc->GetDevice(&dev)) || !dev)
+        return g_SwapPresentPrev(sc, src, dst, wnd, dirty, flags);
+    dev->Release();  // il device vive quanto la swap chain
+    ++t_presentDepth;
+    HRESULT hr = PresentBody(dev, [&] { return g_SwapPresentPrev(sc, src, dst, wnd, dirty, flags); });
+    --t_presentDepth;
+    return hr;
+}
+
+bool SwapVtableEntry(void* obj, int index, void* replacement, void** previous) {
+    void** entry = *reinterpret_cast<void***>(obj) + index;
+    DWORD old;
+    if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &old)) return false;
+    *previous = *entry;
+    *entry = replacement;
+    VirtualProtect(entry, sizeof(void*), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(void*));
+    return true;
+}
+
+std::string DescribeCodeStart(void* fn) {
+    const uint8_t* p = static_cast<const uint8_t*>(fn);
+    char b[96];
+    std::snprintf(b, sizeof(b), "%s [%02X %02X %02X %02X %02X]",
+                  DescribeAddress(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(fn))).c_str(), p[0], p[1], p[2],
+                  p[3], p[4]);
+    std::string s = b;
+    if (p[0] == 0xE9) {  // jmp rel32: chi ha agganciato
+        uint32_t to = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p)) + 5 + *reinterpret_cast<const int32_t*>(p + 1);
+        s += " -> " + DescribeAddress(to);
+    }
+    return s;
+}
+
+// Da EndScene (thread di rendering): 300 EndScene di fila senza un Present
+// intercettato = hook scavalcato. Livello 1 vtable del device, livello 2 swap chain.
+std::atomic<bool> g_testPresentUnhook{false};
+void* g_presentTarget = nullptr;
+
+void CheckPresentHook(IDirect3DDevice9* device) {
+    static uint32_t lastHits = 0, quietEnds = 0;
+    static int level = 0;
+    if (g_testPresentUnhook.exchange(false) && g_presentTarget) {
+        MH_DisableHook(g_presentTarget);
+        vr::log::Line("PRESENT: test: our hook in Present's code removed (presentunhook).");
+    }
+    const uint32_t hits = g_presentHits.load(std::memory_order_relaxed);
+    if (hits != lastHits) {
+        lastHits = hits;
+        quietEnds = 0;
+        return;
+    }
+    if (++quietEnds < 300 || level >= 2) return;
+    quietEnds = 0;
+    if (level == 0) {
+        level = 1;
+        void* entry = VTableEntry(device, kIDirect3DDevice9_Present);
+        vr::log::Line("PRESENT: 300 frames without our Present hook being called (another program rewrote it?). "
+                      "Present code: " + DescribeCodeStart(g_presentTarget) + ", vtable entry: " + DescribeCodeStart(entry) +
+                      ". Hooking the device vtable instead.");
+        if (!SwapVtableEntry(device, kIDirect3DDevice9_Present, reinterpret_cast<void*>(&Hooked_PresentVt),
+                             reinterpret_cast<void**>(&g_PresentVtPrev)))
+            vr::log::Line("PRESENT: vtable hook FAILED.");
+        return;
+    }
+    level = 2;
+    IDirect3DSwapChain9* sc = nullptr;
+    if (SUCCEEDED(device->GetSwapChain(0, &sc)) && sc) {
+        vr::log::Line("PRESENT: still no Present through the device: hooking the swap chain's Present (" +
+                      DescribeCodeStart(VTableEntry(sc, 3)) + ").");
+        if (!SwapVtableEntry(sc, 3, reinterpret_cast<void*>(&Hooked_SwapPresent),
+                             reinterpret_cast<void**>(&g_SwapPresentPrev)))
+            vr::log::Line("PRESENT: swap chain hook FAILED.");
+        sc->Release();
+    }
 }
 
 
@@ -14444,6 +14561,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     ok &= MH_CreateHook(resetTarget, &Hooked_Reset,
                          reinterpret_cast<void**>(&g_Reset_Original)) == MH_OK;
     ok &= MH_EnableHook(presentTarget) == MH_OK;
+    g_presentTarget = presentTarget;
     ok &= MH_EnableHook(resetTarget) == MH_OK;
     ok &= MH_EnableHook(beginSceneTarget) == MH_OK;
     ok &= MH_EnableHook(endSceneTarget) == MH_OK;
@@ -14724,6 +14842,20 @@ HRESULT WINAPI Hooked_CreateIndexBuffer(IDirect3DDevice9* d, UINT len, DWORD usa
     return hr;
 }
 
+bool g_createDeviceInner = false;
+// CreateDeviceEx fallito una volta: niente piu' oggetti D3D9Ex in questa sessione.
+bool g_gpushareFellBack = false;
+
+// File "specopsvr_forcedevexfail" nella cartella del gioco: simula il fallimento
+// di CreateDeviceEx per provare il fallback.
+bool GpuShareFailTestRequested() {
+    char exe[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string flag = exe;
+    flag = flag.substr(0, flag.find_last_of("\\/")) + "\\specopsvr_forcedevexfail";
+    return GetFileAttributesA(flag.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 void InstallExResourceHooks(IDirect3DDevice9* device) {
     struct H {
         int index;
@@ -14753,7 +14885,23 @@ HRESULT WINAPI Hooked_CreateDevice(
     IDirect3D9* self, UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow,
     DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters,
     IDirect3DDevice9** ppReturnedDeviceInterface) {
+    // Chiamata interna del fallback (oggetto D3D9 normale con la stessa CreateDevice
+    // agganciata): passa diritta, i device hook li installa il chiamante.
+    if (g_createDeviceInner)
+        return g_CreateDevice_Original(self, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
+                                       pPresentationParameters, ppReturnedDeviceInterface);
     vr::log::Line("CreateDevice called (Adapter=" + std::to_string(Adapter) + ").");
+    if (pPresentationParameters) {
+        const D3DPRESENT_PARAMETERS& p = *pPresentationParameters;
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "CreateDevice params: windowed %d, %ux%u, format %d, refresh %u Hz, buffers %u, "
+                      "multisample %d/%lu, swap %d, flags 0x%lX, behavior 0x%lX.",
+                      p.Windowed, p.BackBufferWidth, p.BackBufferHeight, static_cast<int>(p.BackBufferFormat),
+                      p.FullScreen_RefreshRateInHz, p.BackBufferCount, static_cast<int>(p.MultiSampleType),
+                      p.MultiSampleQuality, static_cast<int>(p.SwapEffect), p.Flags, BehaviorFlags);
+        vr::log::Line(buf);
+    }
     // Vsync off: il ritmo lo da' WaitGetPoses del visore, e in stereo
     // sincrono ci sono due Present per tick.
     if (pPresentationParameters) pPresentationParameters->PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
@@ -14765,12 +14913,29 @@ HRESULT WINAPI Hooked_CreateDevice(
     }
 
     HRESULT hr = E_FAIL;
+    bool exFallback = false;
     if (g_d3d9ex) {
         IDirect3D9Ex* ex = nullptr;
         IDirect3DDevice9Ex* devEx = nullptr;
-        if (SUCCEEDED(self->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&ex))) && ex) {
+        // Fullscreen esclusivo: CreateDeviceEx vuole il display mode, con nullptr
+        // risponde D3DERR_INVALIDCALL.
+        D3DDISPLAYMODEEX mode = {};
+        D3DDISPLAYMODEEX* fullscreenMode = nullptr;
+        if (pPresentationParameters && !pPresentationParameters->Windowed) {
+            mode.Size = sizeof(mode);
+            mode.Width = pPresentationParameters->BackBufferWidth;
+            mode.Height = pPresentationParameters->BackBufferHeight;
+            mode.RefreshRate = pPresentationParameters->FullScreen_RefreshRateInHz;
+            mode.Format = pPresentationParameters->BackBufferFormat;
+            mode.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
+            fullscreenMode = &mode;
+        }
+        if (GpuShareFailTestRequested()) {
+            hr = D3DERR_INVALIDCALL;
+            vr::log::Line("GPUSHARE: CreateDeviceEx skipped (specopsvr_forcedevexfail test file).");
+        } else if (SUCCEEDED(self->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void**>(&ex))) && ex) {
             hr = ex->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters,
-                                    nullptr, &devEx);
+                                    fullscreenMode, &devEx);
             ex->Release();
         }
         if (SUCCEEDED(hr) && devEx) {
@@ -14778,13 +14943,31 @@ HRESULT WINAPI Hooked_CreateDevice(
             vr::log::Line("GPUSHARE: device created with CreateDeviceEx.");
             InstallExResourceHooks(devEx);
         } else {
-            vr::log::Line("GPUSHARE: CreateDeviceEx failed hr=" + std::to_string(hr) + ", normal device.");
+            vr::log::Line("GPUSHARE: CreateDeviceEx failed hr=" + std::to_string(hr) + " (windowed " +
+                          std::to_string(pPresentationParameters ? pPresentationParameters->Windowed : -1) +
+                          "), normal device.");
             g_d3d9ex = false;
+            g_gpushareFellBack = true;
+            exFallback = true;
         }
     }
     if (!g_d3d9ex) {
-        hr = g_CreateDevice_Original(self, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
-                                     pPresentationParameters, ppReturnedDeviceInterface);
+        // Un device creato con CreateDevice da un oggetto D3D9Ex rifiuta il pool
+        // MANAGED (il gioco andava in errore fatale alla prima CreateTexture): il
+        // fallback crea il device da un oggetto D3D9 normale, come con gpushare off.
+        IDirect3D9* plain = nullptr;
+        if (exFallback && vr::realdll::Direct3DCreate9_Real) plain = vr::realdll::Direct3DCreate9_Real(D3D_SDK_VERSION);
+        if (plain) {
+            g_createDeviceInner = true;
+            hr = plain->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters,
+                                     ppReturnedDeviceInterface);
+            g_createDeviceInner = false;
+            plain->Release();  // il device tiene il suo riferimento
+            vr::log::Line("GPUSHARE: fallback device created from a plain D3D9 object, hr=" + std::to_string(hr) + ".");
+        } else {
+            hr = g_CreateDevice_Original(self, Adapter, DeviceType, hFocusWindow, BehaviorFlags,
+                                         pPresentationParameters, ppReturnedDeviceInterface);
+        }
     }
 
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
@@ -14832,8 +15015,10 @@ bool g_d3d9ex = false;
 
 void* PlayerControllerAlive() { return LivePlayerController(); }
 bool OnTurret() { return g_onTurret.load(); }
+void TestUnhookPresent() { g_testPresentUnhook = true; }
 
 bool GpuShareRequested() {
+    if (g_gpushareFellBack) return false;
     char path[MAX_PATH] = {};
     HMODULE self = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCSTR>(&GpuShareRequested), &self);

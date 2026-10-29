@@ -103,6 +103,7 @@ std::vector<Item> BasicItems() {
         {"roomscale", "Room-scale", "Walker follows your real steps (collisions included).", Kind::OnOff},
         {"headcollision", "Head in walls", "push = leaning into a wall, crate or squadmate stops your view at the surface (sliding along it stays 1:1); off = the view goes through.", Kind::Choice, {"push", "off"}},
         {"seated", "Seated play", "auto = detected when you put the headset on or recenter (sitting: your eyes go to Walker's eye height, no real crouch); on / off force it.", Kind::Choice, {"auto", "on", "off"}},
+        {"mirrorwin", "Recording window", "A 1920x1080 window on the PC showing your view (right eye, 16:9) for OBS: add a Window Capture of \"SpecOpsVR mirror\" (Windows 10 capture method). It stays behind your other windows and never takes the focus.", Kind::OnOff},
         {"hints", "Controller hints", "Short hints in the headset during the first sessions, and one per object situation (auto: once per profile; on: every session).", Kind::Choice, {"auto", "on", "off"}},
         {"vrmenu", "This menu at start", "Open this menu on the game's main menu at every start.", Kind::Choice, {"on", "off"}},
         {"runtime", "VR runtime", "steamvr = through SteamVR; openxr = Quest Link or Virtual Desktop (VDXR) directly, no SteamVR; auto (default) = Virtual Desktop (VDXR) when its Streamer runs, otherwise SteamVR. Restart the game.", Kind::Choice, {"steamvr", "openxr", "auto"}},

@@ -77,6 +77,7 @@ IAT = [
     ('IatGetFocus', 0x011096D0, 'USER32.dll', 'GetFocus'),
     ('IatShowWindow', 0x0110963C, 'USER32.dll', 'ShowWindow'),
     ('IatSetWindowPlacement', 0x0110968C, 'USER32.dll', 'SetWindowPlacement'),
+    ('IatGetCommandLineW', 0x01109184, 'KERNEL32.dll', 'GetCommandLineW'),
     ('IatMemcpy', 0x01109438, 'MSVCR90.dll', 'memcpy'),
     ('IatMemmove', 0x0110943C, 'MSVCR90.dll', 'memmove'),
     ('IatFmodSetListener', 0x01109878, 'fmod_event.dll',

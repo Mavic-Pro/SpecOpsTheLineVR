@@ -8,6 +8,7 @@
 #include "pure_utils.h"
 #include "twohand_math.h"
 #include "vr_toast.h"
+#include "hooks.h"
 #include "vr_menu.h"
 #include "vr_input.h"
 #include "props.h"
@@ -509,6 +510,10 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
     // Chiavi di taratura del WI-1 (review 25/10): qui e non nella catena di
     // Execute, che ha gia' il limite di annidamento del compilatore (C1061).
     auto clampf = [](float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); };
+    if (cmd == "presentunhook") {
+        vr::hooks::TestUnhookPresent();
+        return true;
+    }
     if (cmd == "xroverscan") {
         float v = 1.5f;
         in >> v;
