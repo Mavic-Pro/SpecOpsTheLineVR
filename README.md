@@ -455,10 +455,12 @@ and the HUD stay the same in both eyes (before, each step zoomed the two eyes
 differently, giving double vision and two markers). Its
 thresholds are in Advanced (`dynresdown`, `dynresslow`, `dynresup`,
 `dynresdwell`, `dynresbackoff`).
-`submitpose on` (Advanced) tells the headset the exact pose each frame was
-drawn with; it is off until tested on more headsets (with an OpenXR runtime,
-for example Virtual Desktop, the view is then drawn `xroverscan` degrees wider
-per side).
+`submitpose auto` (default, Advanced) tells the headset the exact pose each
+frame was drawn with whenever the world would shake without it, which happens
+above all when the game runs below the headset's refresh rate; after 5 calm
+seconds it goes back to plain frames. `on` / `off` force it. With an OpenXR
+runtime (for example Virtual Desktop) the view is drawn `xroverscan` degrees
+wider per side for it.
 On SteamVR (Steam Link) `predictframe auto` adds one frame to the head
 prediction only after the log's `POSEAGE` line has shown, twice in a row,
 that the drawn pose is one frame behind SteamVR's own pose for that frame;
