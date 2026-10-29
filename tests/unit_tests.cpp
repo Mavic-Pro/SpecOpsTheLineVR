@@ -3533,6 +3533,81 @@ static void TestLockWaitStats() {
 
 // Voci Advanced a parole (review 2 WI-1): i valori dell'ini distribuito sono
 // nella lista (cosi' il menu le fa scorrere) e il predefinito e' il primo.
+// "submitpose auto" (issue #4): acceso quando il mondo tremerebbe, spento dopo 5 s calmi.
+static void TestSubmitPoseAuto() {
+    using vr::pure::SubmitPoseAuto;
+    const double kRad = 3.14159265358979 / 180.0;
+    // Ritardo costante (v fisso, anche grande): nessun tremolio, resta spento.
+    {
+        SubmitPoseAuto a;
+        const float v[3] = {0.0f, static_cast<float>(1.0 * kRad), 0.0f};
+        bool changed = false;
+        for (int i = 0; i < 900; ++i) changed = changed || a.Frame(v, i * 11.1);
+        CHECK(!a.on && !changed);
+    }
+    // PC lento: v che alterna +-0,3 deg (salti di 0,6 deg) -> acceso in pochi frame.
+    SubmitPoseAuto a;
+    int onAt = -1;
+    double t = 0.0;
+    for (int i = 0; i < 90; ++i, t += 11.1) {
+        const float v[3] = {0.0f, static_cast<float>((i % 2 ? 0.3 : -0.3) * kRad), 0.0f};
+        if (a.Frame(v, t) && a.on && onAt < 0) onAt = i;
+    }
+    CHECK(a.on && onAt >= 1 && onAt <= 90);
+    // Un salto isolato oltre spikeDeg accende subito.
+    {
+        SubmitPoseAuto b;
+        const float v0[3] = {0, 0, 0}, v1[3] = {static_cast<float>(1.5 * kRad), 0, 0};
+        b.Frame(v0, 0.0);
+        CHECK(b.Frame(v1, 11.1) && b.on);
+    }
+    // Calmo: resta acceso fino a 5 s, poi si spegne una volta.
+    int offAt = -1, changes = 0;
+    const double calmStart = t;
+    for (int i = 0; i < 900; ++i, t += 11.1) {
+        const float v[3] = {0.0f, static_cast<float>(0.3 * kRad), 0.0f};
+        if (a.Frame(v, t)) {
+            ++changes;
+            if (!a.on) offAt = i;
+        }
+    }
+    CHECK(!a.on && changes == 1 && offAt >= 0);
+    CHECK(offAt * 11.1 >= 5000.0 && offAt * 11.1 < 12000.0 && t > calmStart);
+    // PC veloce (passi casuali, rms ~0,07 deg, qualche passo da 0,3): spento.
+    {
+        SubmitPoseAuto e;
+        unsigned r = 12345u;
+        float y = 0.0f;
+        for (int i = 0; i < 2000; ++i) {
+            r = r * 1103515245u + 12345u;
+            const float u = static_cast<float>((r >> 8) & 0xFFFF) / 65535.0f;
+            y += static_cast<float>(((u - 0.5f) * 0.2f + (i % 97 == 0 ? 0.3f : 0.0f)) * kRad);
+            const float v[3] = {0.0f, y, 0.0f};
+            e.Frame(v, i * 11.1);
+        }
+        CHECK(!e.on);
+    }
+    // Tremolio lieve (passi di 0,05 deg): spento.
+    {
+        SubmitPoseAuto c;
+        for (int i = 0; i < 900; ++i) {
+            const float v[3] = {static_cast<float>((i % 2 ? 0.025 : -0.025) * kRad), 0, 0};
+            c.Frame(v, i * 11.1);
+        }
+        CHECK(!c.on);
+    }
+    // Gap: nessun salto finto dopo un buco (cinema, cannocchiale).
+    {
+        SubmitPoseAuto d;
+        const float v0[3] = {0, 0, 0}, v1[3] = {static_cast<float>(5.0 * kRad), 0, 0};
+        d.Frame(v0, 0.0);
+        d.Gap();
+        CHECK(!d.Frame(v1, 11.1) && !d.on);
+    }
+    const std::vector<std::string>* w = vr::pure::AdvancedWordChoices("submitpose");
+    CHECK(w && w->size() == 3 && (*w)[0] == "auto");
+}
+
 static void TestAdvancedWordChoices() {
     const std::vector<std::string>* pf = AdvancedWordChoices("predictframe");
     CHECK(pf && pf->size() == 3 && (*pf)[0] == "auto" && (*pf)[1] == "on" && (*pf)[2] == "off");
@@ -6696,6 +6771,7 @@ int main() {
     TestComputedMigration();
     TestMenuSteps();
     TestAdvancedWordChoices();
+    TestSubmitPoseAuto();
     TestLockWaitStats();
     TestParseVersion();
     TestJson();

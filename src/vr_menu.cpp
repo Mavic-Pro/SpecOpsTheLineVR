@@ -24,7 +24,9 @@ namespace vr::menu {
 
 namespace {
 
-constexpr int kW = 1100, kH = 820;
+// Lista in alto (kListH), sotto il riquadro con la descrizione intera della
+// voce puntata (29/10: le descrizioni lunghe erano tagliate a una riga).
+constexpr int kW = 1100, kListH = 820, kH = 1000;
 constexpr int kRowH = 58, kTop = 86, kRowsPerPage = 11;
 
 enum class Kind { OnOff, Choice, Number, Text };
@@ -68,7 +70,7 @@ std::vector<Item> BasicItems() {
         {"height", "Standing height", "auto = your real height measured while playing (hold both sticks 3 s to save it); fixed = Walker's eye height whatever your height.", Kind::Choice, {"auto", "fixed"}},
         {"snapturn", "Turning", "0 = smooth turning with the right stick, 30/45 = snap turns in degrees.", Kind::Choice, {"0", "30", "45"}},
         {"vignette", "Comfort vignette", "Darkens the edges while moving: 0 off, 0.5 light, 1 strong.", Kind::Choice, {"0", "0.5", "1"}},
-        {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) in your view.", Kind::Choice, {"0.3 100", "0.35 100", "0.4 100", "0.5 100", "0.6 100"}},
+        {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) towards the centre of your view: lower = ammo and weapon icons closer to the centre, easier to see, but smaller.", Kind::Choice, {"0.25 100", "0.3 100", "0.35 100", "0.4 100", "0.5 100", "0.6 100"}},
         {"fpbody", "Walker's body", "full = Walker's body under you, his eyes on yours and his neck under your neck; arms = only his arms, hands and gun (torso and legs hidden).", Kind::Choice, {"full", "arms"}},
         // Review 2 del follow-up (27/10): il corpo che torna sotto la testa cambia cio' che il corpo fa dopo ogni sguardo: Basic.
         {"bodyalign", "Body under the head", "Seconds your head must stay still before Walker's body turns back under it, so looking down shows your chest, not his shoulder (0 = off: it can stay up to 45 deg off). Only with tracked controllers; it waits while you aim or near a wall.", Kind::Choice, {"0", "0.4", "1"}},
@@ -127,6 +129,17 @@ std::atomic<int> g_request{0};  // 1 apri, -1 chiudi
 vr::VROverlayHandle_t g_overlay = vr::k_ulOverlayHandleInvalid;
 unsigned g_overlayGen = 0;
 int g_hoverX = -1, g_hoverY = -1;
+// Righe disegnate (rettangolo e indice della voce) per la voce puntata.
+struct RowHit {
+    RECT r;
+    int item;
+};
+std::vector<RowHit> g_rows;
+int RowAt(int x, int y) {
+    for (const RowHit& h : g_rows)
+        if (x >= h.r.left && x < h.r.right && y >= h.r.top && y < h.r.bottom) return h.item;
+    return -1;
+}
 bool g_dirty = true;
 float g_placedYaw = 0.0f;
 ULONGLONG g_awaySince = 0;
@@ -146,6 +159,7 @@ struct DumpReq {
     std::string path;
     int tab;
     int vd;
+    int hoverRow = -1;  // "basic@3": il laser sulla riga 3 della pagina (riquadro della descrizione)
 };
 std::vector<DumpReq> g_dumpReq;
 
@@ -223,7 +237,7 @@ void LoadIni() {
         Item it;
         it.key = key;
         it.label = key;
-        it.help = help.size() > 160 ? help.substr(0, 157) + "..." : help;
+        it.help = help;  // intera: la riga la taglia, il riquadro sotto la mostra tutta
         it.value = rest;
         std::string low;
         for (char ch : rest) low += static_cast<char>(tolower(static_cast<unsigned char>(ch)));
@@ -340,6 +354,7 @@ bool Render(std::vector<uint32_t>* rgba) {
     HFONT title = MakeFont(34, FW_SEMIBOLD), body = MakeFont(26, FW_NORMAL), fontSmall = MakeFont(19, FW_NORMAL),
           mono = MakeFont(22, FW_NORMAL);
     g_hits.clear();
+    g_rows.clear();
     RECT all = {0, 0, kW, kH};
     HBRUSH bg = CreateSolidBrush(RGB(22, 24, 30));
     FillRect(dc, &all, bg);
@@ -388,7 +403,7 @@ bool Render(std::vector<uint32_t>* rgba) {
         // Passo delle righe che le fa entrare tutte anche sotto l'avviso di
         // Virtual Desktop (review WI-4c: con l'avviso la 13a riga, TURRET,
         // finiva a y 816-864 in un pannello alto 820).
-        const int pitch = vr::ui::ControlsRowPitch(static_cast<int>(topY), kH, vr::ui::kControlsCount);
+        const int pitch = vr::ui::ControlsRowPitch(static_cast<int>(topY), kListH, vr::ui::kControlsCount);
         LONG widest = 0, bottom = 0;
         for (size_t i = 0; i < vr::ui::kControlsCount; ++i) {
             RECT r = {30, topY + static_cast<LONG>(i) * pitch, kW - 30, topY + static_cast<LONG>(i) * pitch + pitch - 4};
@@ -409,6 +424,13 @@ bool Render(std::vector<uint32_t>* rgba) {
             int i = g_scroll + row;
             Item& it = items[i];
             LONG y = topY + row * kRowH;
+            g_rows.push_back({{20, y, kW - 20, y + kRowH}, i});
+            if (RowAt(g_hoverX, g_hoverY) == i) {
+                RECT hr = {20, y, kW - 20, y + kRowH - 2};
+                HBRUSH hb = CreateSolidBrush(RGB(34, 38, 48));
+                FillRect(dc, &hr, hb);
+                DeleteObject(hb);
+            }
             SelectObject(dc, body);
             SetTextColor(dc, RGB(240, 240, 240));
             RECT rl = {30, y, 620, y + 30};
@@ -439,14 +461,40 @@ bool Render(std::vector<uint32_t>* rgba) {
             }
         }
         if (n > rows) {
-            Button(dc, {kW - 200, kH - 60, kW - 110, kH - 16}, "UP", false, 5, body);
-            Button(dc, {kW - 100, kH - 60, kW - 20, kH - 16}, "DOWN", false, 6, body);
+            Button(dc, {kW - 200, kListH - 60, kW - 110, kListH - 16}, "UP", false, 5, body);
+            Button(dc, {kW - 100, kListH - 60, kW - 20, kListH - 16}, "DOWN", false, 6, body);
             SelectObject(dc, fontSmall);
             SetTextColor(dc, RGB(150, 150, 160));
             char pg[64];
             std::snprintf(pg, sizeof(pg), "%d-%d of %d", g_scroll + 1, (std::min)(n, g_scroll + rows), n);
-            RECT rp = {30, kH - 56, 600, kH - 20};
+            RECT rp = {30, kListH - 56, 600, kListH - 20};
             DrawTextA(dc, pg, -1, &rp, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+    if (g_tab != 2) {
+        // Descrizione intera della voce puntata.
+        RECT panel = {20, kListH, kW - 20, kH - 12};
+        HBRUSH pb = CreateSolidBrush(RGB(32, 35, 44));
+        FillRect(dc, &panel, pb);
+        DeleteObject(pb);
+        const std::vector<Item>& items = g_tab == 0 ? g_basic : g_advanced;
+        const int hovered = RowAt(g_hoverX, g_hoverY);
+        RECT rt = {36, kListH + 8, kW - 36, kListH + 40};
+        RECT rd = {36, kListH + 42, kW - 36, kH - 20};
+        if (hovered >= 0 && hovered < static_cast<int>(items.size())) {
+            const Item& it = items[hovered];
+            SelectObject(dc, body);
+            SetTextColor(dc, RGB(240, 240, 240));
+            DrawTextA(dc, it.label.c_str(), -1, &rt, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            SelectObject(dc, fontSmall);
+            SetTextColor(dc, RGB(200, 205, 215));
+            DrawTextA(dc, it.help.empty() ? "(no description)" : it.help.c_str(), -1, &rd,
+                      DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_END_ELLIPSIS);
+        } else {
+            SelectObject(dc, fontSmall);
+            SetTextColor(dc, RGB(150, 150, 160));
+            DrawTextA(dc, "Point at an option to read its full description here.", -1, &rt,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
     }
     GdiFlush();
@@ -589,8 +637,19 @@ void DumpNow(const DumpReq& d) {
     g_scroll = 0;
     g_forceVd = d.vd;
     g_lastControls = ControlsMetrics();
+    const int hx = g_hoverX, hy = g_hoverY;
+    if (d.hoverRow >= 0) {
+        std::vector<uint32_t> first;
+        Render(&first);  // righe della pagina (g_rows)
+        if (d.hoverRow < static_cast<int>(g_rows.size())) {
+            g_hoverX = g_rows[d.hoverRow].r.left + 10;
+            g_hoverY = g_rows[d.hoverRow].r.top + 10;
+        }
+    }
     std::vector<uint32_t> px;
     const bool ok = Render(&px);
+    g_hoverX = hx;
+    g_hoverY = hy;
     g_tab = tab;
     g_scroll = scroll;
     g_forceVd = vd;
@@ -673,7 +732,14 @@ void TestCycle(const std::string& key, int dir) {
 }
 void TestDump(const std::string& path, const std::string& tab, const std::string& vd) {
     std::lock_guard<std::mutex> lock(g_cycleMutex);
-    g_dumpReq.push_back({path, tab == "controls" ? 2 : (tab == "advanced" ? 1 : 0), vd == "vd" ? 1 : (vd == "novd" ? 0 : -1)});
+    std::string t = tab;
+    int hover = -1;
+    const size_t at = t.find('@');
+    if (at != std::string::npos) {
+        hover = std::atoi(t.c_str() + at + 1);
+        t = t.substr(0, at);
+    }
+    g_dumpReq.push_back({path, t == "controls" ? 2 : (t == "advanced" ? 1 : 0), vd == "vd" ? 1 : (vd == "novd" ? 0 : -1), hover});
 }
 bool IsOpen() { return g_open; }
 
@@ -760,9 +826,10 @@ void Tick(bool cinema) {
                 return -1;
             };
             int before = hitAt(g_hoverX, g_hoverY), after = hitAt(x, y);
+            const int rowBefore = RowAt(g_hoverX, g_hoverY), rowAfter = RowAt(x, y);
             g_hoverX = x;
             g_hoverY = y;
-            if (before != after) g_dirty = true;
+            if (before != after || rowBefore != rowAfter) g_dirty = true;
             break;
         }
         case vr::VREvent_MouseButtonDown:

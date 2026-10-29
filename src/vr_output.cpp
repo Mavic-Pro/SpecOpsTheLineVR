@@ -859,6 +859,7 @@ void ApplyFades(vr::IVRCompositor* compositor) {
 void WorkerLoop() {
     vr::log::Line("VR-OUTPUT: output thread started.");
     int submits = 0, posedSubmits = 0, mismatchedPairs = 0;
+    float spAutoRms = 0.0f;  // "submitpose auto": rms lento, per la riga POSEAGE
     // WI-2: coppie inviate con occhi di tick diversi (sinistro del tick n,
     // destro del n-1: ruotando la testa vergenza sbagliata, la scala del mondo
     // sembra cambiare; bug 3 del tester, mai misurato nel visore) e salto massimo.
@@ -1185,7 +1186,29 @@ void WorkerLoop() {
         vr::EVRCompositorError errL, errR;
         // Cannocchiale escluso (WI-1): l'immagine guarda lungo la canna, la posa
         // della testa farebbe muovere l'ingrandimento con la testa.
-        if (!cinema && vr::control::g_submitWithPose && pk[0].poseValid && pk[1].poseValid && !pk[0].scope && !pk[1].scope) {
+        // "submitpose auto" (issue #4): quanto tremerebbe il mondo senza la posa,
+        // dalla variazione fra posa di disegno e posa del frame del runtime.
+        static vr::pure::SubmitPoseAuto spAuto;
+        spAutoRms = spAuto.Rms();
+        if (!cinema && pk[0].poseValid && waitHmd.bPoseIsValid && !pk[0].scope) {
+            float rv[3];
+            vr::pure::RelativeRotationVector(pk[0].pose.m, waitHmd.mDeviceToAbsoluteTracking.m, rv);
+            if (spAuto.Frame(rv, QpcMs())) {
+                vr::control::g_submitPoseAutoOn = spAuto.on;
+                if (vr::control::g_submitPoseAuto) {
+                    char sb[200];
+                    std::snprintf(sb, sizeof(sb),
+                                  spAuto.on ? "SUBMITPOSE: auto -> with render pose (world shake without it: rms %.3f deg, step %.3f deg)"
+                                            : "SUBMITPOSE: auto -> plain frames (calm for 5 s: rms %.3f deg, step %.3f deg)",
+                                  spAuto.Rms(), spAuto.lastStep);
+                    vr::log::Line(sb);
+                }
+            }
+        } else {
+            spAuto.Gap();
+        }
+        const bool posedWanted = vr::control::g_submitWithPose && (!vr::control::g_submitPoseAuto || spAuto.on);
+        if (!cinema && posedWanted && pk[0].poseValid && pk[1].poseValid && !pk[0].scope && !pk[1].scope) {
             // Con la posa usata per disegnare: il compositor riproietta da
             // quella alla posa reale al momento della visualizzazione.
             vr::VRTextureWithPose_t pl = {}, pr = {};
@@ -1293,13 +1316,16 @@ void WorkerLoop() {
                                       : pfMode == 1 ? "on"
                                       : pfMode == 0 ? "off"
                                       : (vr::control::g_predictFrameAutoOn.load() ? "auto (on)" : "auto (off)");
-                char pb[400];
+                char pb[520];
                 std::snprintf(pb, sizeof(pb),
                               "POSEAGE: render pose vs the runtime's frame pose over %u frames: angle rms %.3f p99 %.3f deg; render "
                               "pose predicted %+.1f ms vs the runtime's (median of %u frames turning > 10 deg/s, + = later); "
-                              "measured head-to-photons %.1f ms; predictframe %s",
+                              "measured head-to-photons %.1f ms; predictframe %s; submitpose %s (world shake without the pose: rms %.3f deg)",
                               static_cast<unsigned>(a.size()), std::sqrt(sq / a.size()), a[static_cast<size_t>(0.99 * (a.size() - 1))],
-                              medOff, static_cast<unsigned>(o.size()), g_photonLatencyMs.load(), pfState);
+                              medOff, static_cast<unsigned>(o.size()), g_photonLatencyMs.load(), pfState,
+                              !vr::control::g_submitPoseAuto ? (vr::control::g_submitWithPose ? "on" : "off")
+                              : (vr::control::g_submitPoseAutoOn ? "auto (with pose)" : "auto (plain)"),
+                              spAutoRms);
                 vr::log::Line(pb);
                 paAng.clear();
                 paOff.clear();

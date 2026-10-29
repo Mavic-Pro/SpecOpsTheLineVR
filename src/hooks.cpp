@@ -3885,7 +3885,12 @@ public:
             if (paused != vr::control::g_gamePaused.load()) vr::log::Line(paused ? "PAUSE: game paused." : "PAUSE: game resumed.");
             vr::control::g_gamePaused = paused;
         }
-        bool wanted = vr::control::g_cinemaEnabled && (vr::control::g_cinemaForce || lockedScene || noWalker);
+        // Menu di pausa (29/10, tester: "the menu is too close and to the right"):
+        // la Scaleform della pausa non passa dalla matrice dell'HUD, quindi in 3D
+        // era disegnata uguale in pixel nei due occhi: vicina e spostata. Sullo
+        // schermo virtuale, come gli altri menu del gioco.
+        bool wanted = vr::control::g_cinemaEnabled &&
+                      (vr::control::g_cinemaForce || lockedScene || noWalker || vr::control::g_gamePaused);
         // Camera del gioco lontana da Walker (morte, inquadrature): nero subito,
         // non 0,6 s di camera del gioco in 3D con la testa sopra; se torna su
         // Walker l'immagine riappare, se diventa schermo virtuale anche

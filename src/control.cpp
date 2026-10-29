@@ -62,7 +62,12 @@ std::atomic<bool> g_cinemaForce{false};
 std::atomic<float> g_cinemaWidthM{3.2f}, g_cinemaDistM{2.6f};
 std::atomic<int> g_outputTest{0};
 std::atomic<float> g_outputScale{1.0f};
-std::atomic<bool> g_submitWithPose{false};  // 19/10: con la posa, bande nere e fisheye muovendo la testa
+std::atomic<bool> g_submitWithPose{true};  // 29/10 (issue #4): di nuovo acceso, senza la posa il mondo tremava sui PC lenti
+// "submitpose auto" (predefinito dal 29/10): la posa solo quando il mondo tremerebbe
+// senza (vr::pure::SubmitPoseAuto in vr_output.cpp); g_submitWithPose resta acceso
+// (overscan OpenXR fisso, niente salti di scala).
+std::atomic<bool> g_submitPoseAuto{true};
+std::atomic<bool> g_submitPoseAutoOn{false};
 std::atomic<float> g_xrOverscanDeg{1.5f};
 std::atomic<bool> g_pairCheck{false};
 std::atomic<float> g_turnWithHeadDeg{45.0f};
@@ -277,7 +282,7 @@ std::atomic<bool> g_stickPitch{false};
 std::atomic<void*> g_playerController{nullptr};
 std::atomic<float> g_vignette{0.0f};
 std::atomic<float> g_motionAmount{0.0f};
-std::atomic<float> g_hudScale{0.4f};
+std::atomic<float> g_hudScale{0.3f};
 std::atomic<float> g_hudDepth{100.0f};
 std::atomic<bool> g_sixDof{true};
 std::atomic<float> g_posScale{50.0f};
@@ -2275,7 +2280,8 @@ void ExecuteNormalized(const std::string& line) {
     } else if (cmd == "submitpose") {
         std::string v;
         in >> v;
-        g_submitWithPose = OnOff(cmd, v, true);
+        g_submitPoseAuto = v == "auto";
+        g_submitWithPose = v == "auto" ? true : OnOff(cmd, v, true);
     } else if (cmd == "threadlag") {
         std::string v;
         in >> v;
@@ -2604,8 +2610,16 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // 12 (0.10.0, 27/10): un ini piu' vecchio si mette da parte e si riparte dai
 // predefiniti distribuiti (vr::pure::kResetConfigVersion, LoadConfigFile): i
 // cambi qui sopra valgono solo se il salvataggio non riesce.
-constexpr int kConfigVersion = vr::pure::kResetConfigVersion;
-static_assert(kConfigVersion == 12, "configversion: 10 = copia A (solidhands), 11 = fix del tester (copia B), 12 = reset 0.10.0");
+// 13 (29/10, issue #4 "jitterfest"): "submitpose off" -> auto (la posa quando serve);
+// "hud 0.4 100" -> 0.3 (tester 29/10: icona di arma e munizioni da guardare
+// all'estremo in basso a destra, col visore premuto sul viso). Senza la posa il
+// compositor riproiettava ogni frame dalla posa che il runtime aveva predetto
+// per quel vsync, non da quella con cui il gioco aveva disegnato: il mondo
+// tremava di 0.3-0.6 deg rms appena il gioco scendeva sotto la frequenza del
+// visore (runtime finto, openxr 90 Hz a 80/60/45 fps; openvr 72 Hz anche a fps
+// piena); con la posa 0.004 deg. Sui PC veloci quasi non si vedeva.
+constexpr int kConfigVersion = 13;
+static_assert(kConfigVersion > vr::pure::kResetConfigVersion, "configversion: 12 = reset 0.10.0, 13 = submitpose auto");
 // "submitpose" resta qui di proposito: la rimozione vale solo per gli ini
 // prima della versione 8 (righe del comando nascosto, anche un vecchio
 // "submitpose on" messo a mano); dopo arriva la riga distribuita. Dal WI-1
@@ -2626,7 +2640,8 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
         {8, "reload physical", "reload simple"}, {8, "hud 0.5 100", "hud 0.4 100"},
         {9, "marker off", "marker on"}, {9, "runtime steamvr", "runtime auto"},
         {10, "solidhands off", "solidhands held"},
-        {vr::pure::kTesterFixesConfigVersion, "headcollision on", "headcollision push"}};
+        {vr::pure::kTesterFixesConfigVersion, "headcollision on", "headcollision push"},
+        {13, "submitpose off", "submitpose auto"}, {13, "hud 0.4 100", "hud 0.3 100"}};
     // WI-4a: il commento di aimpitch (4 righe) diventa quello di holdmode
     // (vr::pure::kAimpitchCommentChanges), la riga dopo MigrateAimpitchLine.
     std::vector<vr::pure::ConfigChange> changes(std::begin(kChanges), std::end(kChanges));

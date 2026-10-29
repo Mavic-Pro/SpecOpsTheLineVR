@@ -68,6 +68,8 @@ extern std::atomic<float> g_outputScale;
 // (Submit_TextureWithPose): la riproiezione del visore corregge dalla posa
 // giusta. Senza, l'immagine "nuotava" muovendo la testa (segnalazione 18/10).
 extern std::atomic<bool> g_submitWithPose;
+extern std::atomic<bool> g_submitPoseAuto;
+extern std::atomic<bool> g_submitPoseAutoOn;
 // OpenXR con "submitpose on": gradi in piu' per lato del campo visivo disegnato
 // e dichiarato ("xroverscan <gradi>", 1,5; WI-1, review: chiave di taratura).
 extern std::atomic<float> g_xrOverscanDeg;

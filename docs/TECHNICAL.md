@@ -8072,6 +8072,88 @@ build, so every result below is on that dll.
     9 noise, 10 disarm and 11 corpses. Each item's own run already checked it on
     `cpTutorialFight` (sections above).
 
+## Issue #4 "jitterfest": posed submit when needed (29/10)
+
+Tester report (issue #4, also on Discord; the same tester's issue #2 had "camera
+overall is too jittery" and "world scale constantly changes"): constant jitter,
+unplayable after a few minutes, lowering the graphics settings did not help. Not
+reproducible on the developer's PC.
+
+- **Cause.** With `submitpose off` the eyes are drawn with the head pose the mod
+  predicts (`predict auto`, the measured head-to-photons time), but the layer
+  declares the pose the runtime predicted for the frame it is submitted in
+  (OpenXR: `xrLocateViews` at that frame's `predictedDisplayTime`; OpenVR: the
+  pose of `WaitGetPoses`). The compositor reprojects from the declared pose, so
+  every difference between the two shows as the world turning by it, and the
+  difference changes every frame. While the game holds the headset rate the two
+  predictions nearly agree; as soon as it runs below the rate, frames land one
+  vsync later than predicted and the error becomes a whole frame of head motion.
+  That is why a fast PC does not see it and lowering the graphics does not help
+  when the game is CPU bound.
+- **Reproduced** on the fake runtime (`runtime fake openxr 90 45` and `openvr 72
+  45`, `mode hmd`, `fake preset b2`, `fpscap` to play a slower PC; scratchpad
+  `slowpc.py`). World step = frame-to-frame change of the world as displayed:
+
+  | runtime, game fps | `submitpose off`: world step rms / p99, frames over 0.1 deg | `submitpose on` |
+  |---|---|---|
+  | openxr 90 Hz, 90 fps | 0.069 / 0.242 deg, 3% | 0.004 / 0.007 deg, 0% |
+  | openxr 90 Hz, 80 fps | 0.302 / 1.231 deg, 57% | 0.004 / 0.007, 0% |
+  | openxr 90 Hz, 60 fps | 0.385 / 0.728 deg, 90% | 0.004 / 0.007, 0% |
+  | openxr 90 Hz, 45 fps | 0.558 / 2.257 deg, 55% | 0.004 / 0.007, 0% |
+  | openvr 72 Hz, 72 fps | 0.298 / 1.021 deg, 34% | 0.004 / 0.007, 0% |
+  | openvr 72 Hz, 60 fps | 0.338 / 1.213 deg, 81% | 0.004 / 0.007, 0% |
+  | openvr 72 Hz, 45 fps | 0.459 / 1.173 deg, 96% | 0.374 / 1.821, 4.7% (repeated frames) |
+
+  Render pose vs declared without the pose: 0.34-0.79 deg rms, 0.5-1.1 mm.
+  The cost of the posed submit is the reprojection edge: p99 1.1-1.8 deg against
+  `xroverscan 1.5` per side on OpenXR (thin black slivers at most, at 45 fps).
+- **Fix: `submitpose auto`** (new default; `on` / `off` force it), `configversion
+  13`: `submitpose off` -> auto for inis still at the old default
+  (`kConfigVersion` is now 13, separate from `kResetConfigVersion` 12). In
+  `auto` the output thread estimates, every frame, how much the world would
+  move without the pose: the change from the previous frame of the rotation
+  between the render pose and the runtime's pose for the frame
+  (`vr::pure::SubmitPoseAuto`, unit-tested). A constant lag does not show; its
+  changes do. It switches to posed frames when the slow rms (~250 frames) is
+  over 0.20 deg, the fast rms (~10 frames) over 0.60 deg or one step over 1 deg,
+  and back to plain frames after 5 s with the slow rms under 0.15 deg.
+  `g_submitWithPose` stays on in auto, so the OpenXR overscan (and the declared
+  field of view) never changes with the switches. `SUBMITPOSE:` lines log each
+  switch; `POSEAGE` ends with the state and the estimate.
+  - Calibration (fake openxr 90 Hz, `preset b2`): the estimate reads 0.06-0.20
+    deg at 90 fps and 0.23-0.39 deg at 60 fps (true world step without the pose:
+    0.05 and 0.38 deg rms). Thin margin: thresholds 0.12 and 0.40 kept it on at
+    90 fps.
+  - Final run: 90 fps -> plain frames after the start-up spike (world step
+    0.049-0.050 deg rms, as before); 60 and 45 fps -> posed within a second
+    (0.004 deg); back at 90 fps it stayed posed for the 30 s measured (errs on
+    the safe side).
+  - `posed` was turned off on 19/10 for "black bands and fisheye" on Link; that
+    was before `predict auto` (the render pose was then ~53 ms old, so the
+    compositor reprojected by a whole latency) and on the same day as the
+    inverted projection fix.
+- **Headset checks.** On Link and on VD/VDXR: no black bands or warping when
+  turning the head fast with posed frames; `SUBMITPOSE` lines in a real
+  session. On a fast PC the jitter can be provoked with `fpscap 45` +
+  `submitpose off`.
+
+### Same tester, 29/10: menu, pause menu, HUD
+
+- **Mod menu descriptions cut** (one line with an ellipsis; Advanced help also
+  cut at 160 characters): the panel is now 1000 px high (was 820, same 1.5 m
+  width); under the list a box shows the full description of the row under the
+  laser, and that row is highlighted. `vrmenu dump <bmp> basic@N` draws it with
+  the laser on row N.
+- **Pause menu "too close and to the right"**: the pause screen (Scaleform)
+  does not go through the HUD's canvas matrix, so in 3D it was the same pixels
+  in both eyes. `WorldInfo.Pauser` set now also asks for the virtual screen
+  (log: `PAUSE: game paused.` then `CINEMA: virtual screen`; content rows
+  356-1085 of 1440, the 16:9 band). The game's own layout keeps the items on
+  the right of that band.
+- **Weapon and ammo icon at the edge**: `hud 0.4 100` -> `0.3 100` (default and
+  configversion 13 migration); the Basic menu also offers 0.25. Smaller HUD
+  text is the trade-off; the Wrist HUD is the other option.
+
 ## Headset session fixes (27/10 evening)
 
 The user's headset session after the final gameplay regression (Quest, Virtual

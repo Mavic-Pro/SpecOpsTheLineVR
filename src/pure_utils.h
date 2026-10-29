@@ -1665,6 +1665,70 @@ inline void RelativeRotationVector(const float a[3][4], const float b[3][4], flo
 // testa che gira. Spento e mediana sotto -0,5 frame = manca un frame; acceso e
 // sopra +0,5 frame = un frame di troppo. Dopo un cambio la finestra seguente
 // si salta (la media del ritardo misurato si assesta in ~150 frame).
+// "submitpose auto" (29/10, issue #4): invio con la posa di disegno solo quando
+// serve. v = vettore di rotazione fra la posa di disegno e quella del frame
+// data dal runtime (RelativeRotationVector). Senza la posa il compositor
+// riproietta da quella del runtime: il mondo mostrato si muove a ogni frame
+// della variazione di v (un ritardo costante non si vede, i suoi cambi si').
+// Acceso subito (rms veloce, ~10 frame, oltre onFastDeg; rms lento, ~250
+// frame, oltre onSlowDeg; o un salto oltre spikeDeg), spento solo dopo calmMs
+// con l'rms lento sotto offDeg. Taratura sul runtime finto (openxr 90 Hz,
+// "fake preset b2"): a 90 fps questa stima oscilla fra 0,06 e 0,20 deg, a 60
+// fps fra 0,23 e 0,39 (il tremolio vero misurato dal runtime: 0,05 e 0,38 rms).
+struct SubmitPoseAuto {
+    float onFastDeg = 0.60f, onSlowDeg = 0.20f, spikeDeg = 1.0f, offDeg = 0.15f;
+    double calmMs = 5000.0;
+    float alphaFast = 0.1f, alphaSlow = 0.004f;  // per frame (~10 e ~250 frame)
+    bool on = false;
+    bool havePrev = false;
+    float prev[3] = {0.0f, 0.0f, 0.0f};
+    double fast2 = 0.0, slow2 = 0.0;
+    double calmSince = -1.0;
+    float lastStep = 0.0f;
+    float Rms() const { return static_cast<float>(std::sqrt(slow2)); }
+    float FastRms() const { return static_cast<float>(std::sqrt(fast2)); }
+    void Gap() { havePrev = false; }  // frame non confrontabili (cinema, cannocchiale, posa non valida)
+    // true = stato cambiato.
+    bool Frame(const float v[3], double nowMs) {
+        if (!havePrev) {
+            for (int i = 0; i < 3; ++i) prev[i] = v[i];
+            havePrev = true;
+            return false;
+        }
+        double d2 = 0.0;
+        for (int i = 0; i < 3; ++i) {
+            const double d = static_cast<double>(v[i]) - prev[i];
+            d2 += d * d;
+            prev[i] = v[i];
+        }
+        const float step = static_cast<float>(std::sqrt(d2) * 57.29577951308232);
+        if (!std::isfinite(step)) return false;
+        lastStep = step;
+        const double s2 = static_cast<double>(step) * step;
+        fast2 += (s2 - fast2) * alphaFast;
+        slow2 += (s2 - slow2) * alphaSlow;
+        if (!on) {
+            if (FastRms() > onFastDeg || Rms() > onSlowDeg || step > spikeDeg) {
+                on = true;
+                calmSince = -1.0;
+                return true;
+            }
+            return false;
+        }
+        if (Rms() < offDeg) {
+            if (calmSince < 0.0) calmSince = nowMs;
+            if (nowMs - calmSince >= calmMs) {
+                on = false;
+                calmSince = -1.0;
+                return true;
+            }
+        } else {
+            calmSince = -1.0;
+        }
+        return false;
+    }
+};
+
 struct PredictFrameAuto {
     bool on = false;
     int votes = 0;     // finestre di fila che chiedono il cambio
@@ -3560,6 +3624,7 @@ inline const std::vector<std::string>* AdvancedWordChoices(const std::string& ke
     static const std::vector<std::pair<std::string, std::vector<std::string>>> kTable = {
         {"predictframe", {"auto", "on", "off"}},
         {"predict", {"auto", "off"}},
+        {"submitpose", {"auto", "on", "off"}},
         {"headcollision", {"push", "off"}},
         {"holdmode", {"normal", "gunstock"}},
         {"crouchview", {"auto", "real", "game"}},
