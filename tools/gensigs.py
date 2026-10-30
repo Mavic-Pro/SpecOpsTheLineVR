@@ -64,6 +64,7 @@ DATA = [
     ('GWorld', 0x014DF734),
     ('GObjects', 0x014D41EC),
     ('GNames', 0x014C1EC8),
+    ('PadSlots', 0x014EB910),
 ]
 # Import-table slots: (id, Steam VA, dll, name or ordinal)
 IAT = [

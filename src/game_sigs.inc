@@ -35,6 +35,7 @@ SIG_DATA(NearClipPlane, 0x0141578C, 0x008F9707, 1, "05 ?? ?? ?? ?? 8B 44 24 38 D
 SIG_DATA(GWorld, 0x014DF734, 0x0040E82E, 1, "0D ?? ?? ?? ?? 8B 41 50 8B 50 0C 83 E2 02 33 C0")
 SIG_DATA(GObjects, 0x014D41EC, 0x00495F69, 1, "15 ?? ?? ?? ?? 8B 0C 82 8B 01 8B 90 74 01 00 00")
 SIG_DATA(GNames, 0x014C1EC8, 0x0074C169, 1, "15 ?? ?? ?? ?? 8B 0C 8A 8D 87 68 01 00 00 51 50")
+SIG_DATA(PadSlots, 0x014EB910, 0x006A1460, 1, "3D ?? ?? ?? ?? 8D 87 DC 01 00 00 50 8D 45 04 50")
 SIG_IAT(IatGetSystemMetrics, 0x01109660, "USER32.dll", "GetSystemMetrics", 0)
 SIG_IAT(IatSystemParametersInfoW, 0x01109664, "USER32.dll", "SystemParametersInfoW", 0)
 SIG_IAT(IatSetWindowPos, 0x011096C4, "USER32.dll", "SetWindowPos", 0)

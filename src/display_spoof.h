@@ -8,6 +8,7 @@
 // in modo che riportino un desktop piu' grande. Va chiamato in DllMain:
 // la nostra dll viene caricata prima che il codice del gioco parta.
 namespace vr::display {
+HWND GameWindow();
 
 void InstallDesktopSizeSpoof();
 

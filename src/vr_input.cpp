@@ -6,10 +6,14 @@
 #include "vr_session.h"
 #include "vr_menu.h"
 #include "hooks.h"
+#include "display_spoof.h"
 #include "vr_output.h"
 #include "pure_utils.h"
 
 #include <windows.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#include <intrin.h>
 #include <openvr.h>
 #include "vr_runtime.h"
 
@@ -56,6 +60,26 @@ typedef DWORD(WINAPI* XInputSetState_t)(DWORD, XVibration*);
 XInputGetState_t g_GetState_Real = nullptr;
 XInputSetState_t g_SetState_Real = nullptr;
 std::atomic<DWORD> g_packet{1};
+
+// Chi legge il pad 0: l'indirizzo di ritorno distingue la lettura del motore (FUN_006d3340,
+// dietro AllowJoystickInput, focus e slot) dalle altre due chiamate di XInputGetState.
+struct PadCaller {
+    std::atomic<uintptr_t> ret{0};
+    std::atomic<unsigned> reads{0};
+};
+PadCaller g_padCallers[4];
+bool g_padSlotFixOff = false;  // solo collaudi ("padtest keep")
+
+void CountPadRead(uintptr_t ret) {
+    for (PadCaller& c : g_padCallers) {
+        uintptr_t cur = c.ret.load();
+        if (cur == 0 && c.ret.compare_exchange_strong(cur, ret)) cur = ret;
+        if (cur == ret) {
+            c.reads.fetch_add(1);
+            return;
+        }
+    }
+}
 
 std::mutex g_fakeMutex;
 XGamepad g_fake = {};
@@ -1985,6 +2009,7 @@ void ApplyVrStickRules(XGamepad* pad) {
 }
 
 DWORD WINAPI Hooked_XInputGetState(DWORD user, XState* state) {
+    if (user == 0) CountPadRead(reinterpret_cast<uintptr_t>(_ReturnAddress()));
     if (user == 0) DryHaptics();  // solo con "hapticlog" e senza runtime VR
     if (user == 0 && state) {
         {
@@ -2088,6 +2113,131 @@ unsigned PadPolls() { return g_packet.load(); }
 std::string WriteActionFiles() { return act::WriteFiles(); }
 bool MagazineRemoved() { return g_gestures.MagazineRemoved(); }
 bool LeftHandOnReload() { return g_leftOnReload.load(); }
+
+namespace {
+// Slot dei pad del motore (TArray a PadSlots, un elemento ogni 0x1F0 byte, creato in
+// FUN_00a06410): +0 dispositivo DirectInput (0 = XInput), +4 layout, +8 ControllerId,
+// +0x1EC "connesso" per XInput.
+constexpr uint32_t kSlotSize = 0x1F0, kSlotConnected = 0x1EC;
+
+bool SafeCopy(void* to, const void* from, size_t n) {
+    __try {
+        std::memcpy(to, from, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+std::string DirectInputName(uint32_t device) {
+    if (!device) return "none";
+    DIDEVICEINSTANCEW di = {};
+    di.dwSize = sizeof(di);
+    auto* d = reinterpret_cast<IDirectInputDevice8W*>(static_cast<uintptr_t>(device));
+    if (FAILED(d->GetDeviceInfo(&di))) return "unknown";
+    char name[260] = {};
+    WideCharToMultiByte(CP_UTF8, 0, di.tszProductName, -1, name, sizeof(name) - 1, nullptr, nullptr);
+    return name;
+}
+}  // namespace
+
+// Una periferica DirectInput con assi/tasti/POV da gamepad (FUN_006a1440) prende lo slot 0
+// al posto di XInput: il motore non chiama piu' XInputGetState per il pad 0 e i controller VR
+// non arrivano al gioco, mentre testa e mani (pose) funzionano. Con il visore il dispositivo
+// passa a uno slot libero, dove il gioco non lo ascolta. Stessa cosa per "connesso": il motore
+// lo azzera dopo una lettura fallita e non riprova piu'.
+void WatchPadPath() {
+    const uintptr_t arr = vr::addr::g[vr::addr::PadSlots];
+    uint32_t data = 0;
+    int32_t num = 0;
+    if (!arr || !SafeCopy(&data, reinterpret_cast<void*>(arr), 4) || !SafeCopy(&num, reinterpret_cast<void*>(arr + 4), 4) ||
+        !data || num < 1 || num > 64)
+        return;
+    char* slots = reinterpret_cast<char*>(static_cast<uintptr_t>(data));
+    uint32_t head[3] = {}, connected = 0;
+    if (!SafeCopy(head, slots, sizeof(head)) || !SafeCopy(&connected, slots + kSlotConnected, 4)) return;
+    const bool scene = vr::session::IsScene();
+    if (scene && !g_padSlotFixOff && head[0]) {
+        for (int j = 1; j < num; ++j) {
+            char* other = slots + j * kSlotSize;
+            uint32_t otherDevice = 1;
+            if (!SafeCopy(&otherDevice, other, 4) || otherDevice) continue;
+            std::string name = DirectInputName(head[0]);
+            static char tmp[kSlotSize];
+            std::memcpy(tmp, slots, kSlotSize);
+            std::memcpy(slots, other, kSlotSize);
+            std::memcpy(other, tmp, kSlotSize);
+            // Ogni slot tiene il proprio ControllerId.
+            *reinterpret_cast<uint32_t*>(slots + 8) = 0;
+            *reinterpret_cast<uint32_t*>(other + 8) = static_cast<uint32_t>(j);
+            *reinterpret_cast<uint32_t*>(slots + 4) = 3;
+            *reinterpret_cast<uint32_t*>(slots + kSlotConnected) = 1;
+            vr::log::Line("INPUT: DirectInput device '" + name + "' had taken game pad 0 (VR controllers ignored): moved to pad " +
+                          std::to_string(j) + ".");
+            head[0] = 0;
+            connected = 1;
+            break;
+        }
+    }
+    if (scene && !head[0] && !connected) {
+        *reinterpret_cast<uint32_t*>(slots + kSlotConnected) = 1;
+        vr::log::Line("INPUT: game pad 0 was marked disconnected, reset.");
+        connected = 1;
+    }
+    // Una riga all'inizio e a ogni cambio, con i lettori del pad degli ultimi secondi.
+    static ULONGLONG lastReport = 0;
+    static std::string lastKey;
+    static int budget = 60;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastReport < 3000) return;
+    lastReport = now;
+    HWND window = vr::display::GameWindow();
+    GUITHREADINFO gui = {};
+    gui.cbSize = sizeof(gui);
+    const bool focus = window && GetGUIThreadInfo(GetWindowThreadProcessId(window, nullptr), &gui) && gui.hwndFocus == window;
+    const bool foreground = window && GetForegroundWindow() == window;
+    char b[160];
+    std::string readers, key;
+    for (PadCaller& c : g_padCallers) {
+        const uintptr_t ret = c.ret.load();
+        const unsigned reads = c.reads.exchange(0);
+        if (!ret) continue;
+        std::snprintf(b, sizeof(b), " %p=%u", reinterpret_cast<void*>(ret), reads);
+        readers += b;
+        std::snprintf(b, sizeof(b), "%p:%d,", reinterpret_cast<void*>(ret), reads ? 1 : 0);
+        key += b;
+    }
+    std::snprintf(b, sizeof(b), "%X,%u,%u,%d,%d,%d", head[0], head[1], connected, focus, foreground, scene);
+    key += b;
+    if (key == lastKey || budget <= 0) return;
+    lastKey = key;
+    --budget;
+    std::snprintf(b, sizeof(b), "PADPATH: pad 0 device %08X layout %u connected %u, slots %d, focus %d foreground %d scene %d, reads:",
+                  head[0], head[1], connected, num, focus, foreground, scene);
+    vr::log::Line(std::string(b) + readers);
+}
+
+// Solo collaudi: mette nello slot 0 un dispositivo DirectInput vero, come farebbe una periferica
+// da gamepad all'avvio. "keep" lascia il problema in piedi per vederne l'effetto.
+void TestPlantDirectInput(bool keep) {
+    g_padSlotFixOff = keep;
+    typedef HRESULT(WINAPI * Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    HMODULE lib = LoadLibraryA("dinput8.dll");
+    Create_t create = lib ? reinterpret_cast<Create_t>(GetProcAddress(lib, "DirectInput8Create")) : nullptr;
+    static const GUID iidW = {0xBF798031, 0x483A, 0x4DA2, {0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00}};
+    static const GUID keyboard = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+    IDirectInput8W* di = nullptr;
+    IDirectInputDevice8W* device = nullptr;
+    uint32_t data = 0;
+    if (!create || FAILED(create(GetModuleHandleA(nullptr), DIRECTINPUT_VERSION, iidW, reinterpret_cast<void**>(&di), nullptr)) ||
+        FAILED(di->CreateDevice(keyboard, &device, nullptr)) ||
+        !SafeCopy(&data, reinterpret_cast<void*>(vr::addr::g[vr::addr::PadSlots]), 4) || !data) {
+        vr::log::Line("PADPATH: test device not planted.");
+        return;
+    }
+    *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(data)) = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(device));
+    vr::log::Line(std::string("PADPATH: test DirectInput device planted in pad 0") + (keep ? " (fix off)." : "."));
+}
 
 void InstallXInputHooks() {
     bool a = PatchSlot(kIatXInputGetState, "XInputGetState", reinterpret_cast<void*>(&Hooked_XInputGetState),

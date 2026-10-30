@@ -503,9 +503,14 @@ HWND WINAPI Hooked_GetActiveWindow() {
     HWND r = g_GetActiveWindow_Real();
     return g_gameWindow && !vr::control::g_exiting ? g_gameWindow : r;
 }
+// La lettura del pad del motore (FUN_006d3340) richiede GetFocus() == finestra del gioco. Col
+// visore il gioco non vede la perdita del focus (WM_KILLFOCUS filtrato) e continua a girare, ma
+// senza questo i controller erano morti con un'altra finestra davanti: testa e mani si
+// muovevano, Walker no (30/10, riprodotto con il blocco note in primo piano).
 HWND WINAPI Hooked_GetFocus() {
     HWND r = g_GetFocus_Real();
-    return g_gameWindow && !vr::control::g_exiting ? g_gameWindow : r;
+    if (!g_gameWindow || vr::control::g_exiting) return r;
+    return TestKeepFocus() || (vr::control::g_keepFocus && HeadsetInUse()) ? g_gameWindow : r;
 }
 
 void InstallDesktopSizeSpoof() {
@@ -514,9 +519,9 @@ void InstallDesktopSizeSpoof() {
               reinterpret_cast<void**>(&g_GetForegroundWindow_Real));
         Patch(kIatGetActiveWindow, "GetActiveWindow", reinterpret_cast<void*>(&Hooked_GetActiveWindow),
               reinterpret_cast<void**>(&g_GetActiveWindow_Real));
-        Patch(kIatGetFocus, "GetFocus", reinterpret_cast<void*>(&Hooked_GetFocus), reinterpret_cast<void**>(&g_GetFocus_Real));
         vr::log::Line("DISPLAY: test mode: the game always sees its own window in the foreground (specopsvr_keepfocus).");
     }
+    Patch(kIatGetFocus, "GetFocus", reinterpret_cast<void*>(&Hooked_GetFocus), reinterpret_cast<void**>(&g_GetFocus_Real));
     bool a = Patch(kIatGetSystemMetrics, "GetSystemMetrics",
                    reinterpret_cast<void*>(&Hooked_GetSystemMetrics),
                    reinterpret_cast<void**>(&g_GetSystemMetrics_Real));

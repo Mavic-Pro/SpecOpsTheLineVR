@@ -515,6 +515,12 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
     // Chiavi di taratura del WI-1 (review 25/10): qui e non nella catena di
     // Execute, che ha gia' il limite di annidamento del compilatore (C1061).
     auto clampf = [](float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); };
+    if (cmd == "padtest") {
+        std::string v;
+        in >> v;
+        vr::input::TestPlantDirectInput(v == "keep");
+        return true;
+    }
     if (cmd == "presentunhook") {
         vr::hooks::TestUnhookPresent();
         return true;
@@ -2791,6 +2797,7 @@ void Poll() {
     if (now - lastPoll < 500) return;
     lastPoll = now;
     vr::script::KeepJoystickInput();
+    vr::input::WatchPadPath();
     // Copia non Steam: avviso nel visore all'avvio e dopo 90 s (la prima volta
     // la sessione VR puo' non esserci ancora).
     if (g_nonSteamExe) {

@@ -34,6 +34,10 @@ void SetFakeInput(float lx, float ly, float rx, float ry, float lt, float rt, un
 
 // Letture del pad 0 servite dalla mod finora (diagnostica: quante per tick).
 unsigned PadPolls();
+
+// Controlli sul percorso del pad 0 nel motore, ogni 0,5 s (vedi vr_input.cpp).
+void WatchPadPath();
+void TestPlantDirectInput(bool keep);
 // Riscrive manifest e binding di SteamVR Input (specopsvr_input/) e ritorna il
 // percorso del manifest ("" se fallisce): comando "inputfiles" per i test.
 std::string WriteActionFiles();
