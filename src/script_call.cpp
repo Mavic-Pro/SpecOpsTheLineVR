@@ -474,6 +474,93 @@ bool LiveObject(void* obj) {
 std::atomic<bool> g_clearObjectFaults{false};
 void ClearObjectFaults() { g_clearObjectFaults = true; }
 
+namespace {
+bool SafeWrite32(void* p, uint32_t v) {
+    __try {
+        *static_cast<volatile uint32_t*>(p) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Offset di una proprieta' nella classe dell'oggetto o in una superclasse, 0 se non c'e'.
+uint32_t PropertyOffset(void* obj, const char* name) {
+    void* c = reinterpret_cast<void*>(Field(obj, kOffClass));
+    for (int depth = 0; c && depth < 32; ++depth) {
+        int guard = 0;
+        for (void* f = reinterpret_cast<void*>(Field(c, kOffChildren)); f && guard < 4096;
+             f = reinterpret_cast<void*>(Field(f, kOffNext)), ++guard)
+            if (_stricmp(ObjectName(f).c_str(), name) == 0) return Field(f, kOffPropOffset);
+        c = reinterpret_cast<void*>(Field(c, kOffSuper));
+    }
+    return 0;
+}
+}  // namespace
+
+// Controller morti, tastiera viva (29/10, anche un tester): WindowsClient.AllowJoystickInput
+// a 0 mentre il gioco gira, e il motore non legge piu' il pad (FUN_006d3340 salta
+// XInputGetState, quindi nemmeno il nostro hook lo vede). L'ini dice 1 e all'avvio e' 1; chi
+// lo azzera non e' ancora noto, da qui la riga nel log con il contesto. Con i controller VR
+// il pad deve restare sempre attivo.
+void KeepJoystickInput() {
+    static void* client = nullptr;
+    static uint32_t off = 0;
+    static int wait = 0;
+    static unsigned restored = 0;
+    static ULONGLONG lastGood = 0;
+    const int32_t name = NameIndex("WindowsClient");
+    if (name < 0) return;
+    if (client && (!LiveObject(client) || static_cast<int32_t>(Field(client, kOffName)) != name)) client = nullptr;
+    if (!client) {
+        // Un giro di GObjects: una volta sola appena trovato, altrimenti ogni ~5 s.
+        if (wait > 0) {
+            --wait;
+            return;
+        }
+        wait = 10;
+        uint32_t data = 0, num = 0;
+        SafeRead(reinterpret_cast<void*>(kGObjects), &data, 4);
+        SafeRead(reinterpret_cast<void*>(kGObjects + 4), &num, 4);
+        for (uint32_t i = 0; data && i < num; ++i) {
+            uint32_t o = 0;
+            if (!SafeRead(reinterpret_cast<void*>(data + 4 * i), &o, 4) || !o) continue;
+            void* obj = reinterpret_cast<void*>(o);
+            if (static_cast<int32_t>(Field(obj, kOffName)) != name) continue;
+            void* cls = reinterpret_cast<void*>(Field(obj, kOffClass));
+            if (static_cast<int32_t>(Field(cls, kOffName)) != name) continue;  // non la classe WindowsClient
+            client = obj;
+            break;
+        }
+        if (!client) return;
+        off = PropertyOffset(client, "AllowJoystickInput");
+        char b[120];
+        std::snprintf(b, sizeof(b), "INPUT: WindowsClient %p, AllowJoystickInput at +0x%X = %u", client, off,
+                      off ? Field(client, off) : 0u);
+        vr::log::Line(b);
+    }
+    if (off == 0 || off > 0x1000) return;
+    const ULONGLONG now = GetTickCount64();
+    uint32_t value = 1;
+    if (!SafeRead(static_cast<char*>(client) + off, &value, 4)) return;
+    if (value != 0) {
+        lastGood = now;
+        return;
+    }
+    if (!SafeWrite32(static_cast<char*>(client) + off, 1)) return;
+    if (++restored <= 20 || restored % 100 == 0) {
+        DWORD foreground = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+        char b[260];
+        std::snprintf(b, sizeof(b),
+                      "INPUT: AllowJoystickInput found 0, set back to 1 (time %u, last seen on %.1f s ago, game in "
+                      "foreground %d, nearby fields %08X %08X [0] %08X %08X)",
+                      restored, static_cast<double>(now - lastGood) * 0.001, foreground == GetCurrentProcessId() ? 1 : 0,
+                      Field(client, off - 8), Field(client, off - 4), Field(client, off + 4), Field(client, off + 8));
+        vr::log::Line(b);
+    }
+}
+
 bool CallFunction(void* obj, const char* name, void* parms) {
     if (!obj) return false;
     // Crash al cambio di livello (26/10): al primo tick del livello nuovo il

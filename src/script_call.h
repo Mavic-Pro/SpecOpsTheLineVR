@@ -36,6 +36,9 @@ bool CallFunction(void* obj, const char* name, void* parms);
 // Azzera le esclusioni per oggetto delle interrogazioni delle ossa (WI-3 fix 1:
 // al cambio di Pawn, cosi' un oggetto nuovo allo stesso indirizzo non le eredita).
 void ClearObjectFaults();
+// Rimette a 1 WindowsClient.AllowJoystickInput se qualcosa l'ha azzerato (controller
+// ignorati dal motore) e lo scrive nel log. Da chiamare periodicamente.
+void KeepJoystickInput();
 
 // "ucall <oggetto> <Funzione> [argomenti]": chiamata generica a una funzione
 // UnrealScript (oggetto = pc|pawn|cheat|world|0x...|Classe[#k]).

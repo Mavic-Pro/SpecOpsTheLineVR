@@ -2790,6 +2790,7 @@ void Poll() {
     ULONGLONG now = GetTickCount64();
     if (now - lastPoll < 500) return;
     lastPoll = now;
+    vr::script::KeepJoystickInput();
     // Copia non Steam: avviso nel visore all'avvio e dopo 90 s (la prima volta
     // la sessione VR puo' non esserci ancora).
     if (g_nonSteamExe) {
