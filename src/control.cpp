@@ -29,6 +29,8 @@
 #include <array>
 #include <map>
 #include "script_call.h"
+#include "screenshot.h"
+#include "vr_output.h"
 #include <sstream>
 
 namespace vr::control {
@@ -61,6 +63,10 @@ std::atomic<bool> g_cinemaActive{false};
 std::atomic<bool> g_cinemaForce{false};
 std::atomic<float> g_cinemaWidthM{3.2f}, g_cinemaDistM{2.6f};
 std::atomic<int> g_outputTest{0};
+std::atomic<float> g_rtDelayMs{0.0f};
+std::atomic<bool> g_xrEndUnlocked{true};
+std::atomic<int> g_xrEndStallMs{0};
+std::atomic<int> g_xrEndStallEvery{60};
 std::atomic<float> g_outputScale{1.0f};
 std::atomic<bool> g_submitWithPose{true};  // 29/10 (issue #4): di nuovo acceso, senza la posa il mondo tremava sui PC lenti
 // "submitpose auto" (predefinito dal 29/10): la posa solo quando il mondo tremerebbe
@@ -200,7 +206,7 @@ std::atomic<int> g_fingerAxis{2}, g_thumbAxis{3};
 std::atomic<int> g_graspDump{0};
 std::atomic<bool> g_ham{false};
 std::atomic<bool> g_cinema3d{false};
-std::atomic<float> g_spreadAds{0.1f}, g_spreadTwoHand{0.5f}, g_spreadOneHand{1.5f};
+std::atomic<float> g_spreadAds{0.1f}, g_spreadTwoHand{0.2f}, g_spreadOneHand{1.5f};
 std::atomic<bool> g_laser{false};
 std::atomic<bool> g_gestureGunMelee{false};
 std::atomic<int> g_vrMenu{1};
@@ -305,7 +311,7 @@ std::atomic<bool> g_twoHand{true};
 std::atomic<float> g_twoHandCm{8.0f};  // WI-4b: presa entro 8 cm dall'astina (prima 12 dalla linea del controller destro)
 std::atomic<float> g_twoHandReleaseCm{15.0f};
 std::atomic<float> g_twoHandDwellSec{0.15f};
-std::atomic<float> g_twoHandFilterHz{1.0f};
+std::atomic<float> g_twoHandFilterHz{4.0f};
 std::atomic<float> g_twoHandGuardCm[3] = {0.0f, 0.0f, 0.0f};
 std::atomic<float> g_stockTolCm{6.0f}, g_stockTolDeg{25.0f};
 std::atomic<int> g_leftHandBusy{0};
@@ -364,6 +370,11 @@ std::atomic<float> g_bodyAlignHoldS{0.4f};
 std::atomic<float> g_bodyAlignDegS{40.0f};
 std::atomic<bool> g_camOwnYaw{true};
 std::atomic<bool> g_armsLead{true};
+std::atomic<bool> g_hitBlood{true};
+std::atomic<bool> g_smoothDt{true};
+std::atomic<bool> g_texShadow{true};
+std::atomic<bool> g_texDynamic{true};
+std::atomic<int> g_tickProfLeft{0};
 std::atomic<bool> g_bodyAlignWallStop{true};
 std::atomic<bool> g_leftGrip{true};
 // WI-3: con l'ancora del collo "bodyback" e' solo una regolazione fine (unita'
@@ -1031,6 +1042,36 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         else vr::log::Line("CONFIG: weightregrip out of range (0-5 s), ignored.");
         return true;
     }
+    if (cmd == "xrendunlock") {
+        std::string v;
+        in >> v;
+        g_xrEndUnlocked = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "xrendstall") {
+        // xrendstall <ms> <ogni N frame>: collaudo, il runtime che resta fermo nella fine del frame (0 = spento).
+        int ms = 0, every = 60;
+        in >> ms >> every;
+        g_xrEndStallMs = ms < 0 ? 0 : (ms > 200 ? 200 : ms);
+        g_xrEndStallEvery = every < 1 ? 1 : every;
+        return true;
+    }
+    if (cmd == "rtdelay") {
+        // rtdelay <ms>: collaudo, attesa attiva del thread di rendering all'inizio di ogni occhio (PC piu' lento).
+        float ms = 0.0f;
+        in >> ms;
+        g_rtDelayMs = ms < 0.0f ? 0.0f : (ms > 50.0f ? 50.0f : ms);
+        return true;
+    }
+    if (cmd == "thumbs") {
+        // thumbs <frame>: miniatura di ogni occhio a ogni frame (specopsvr_shots\\thumbs.bin), vedi screenshot.cpp.
+        int frames = 600;
+        in >> frames;
+        frames = frames < 0 ? 0 : (frames > 4000 ? 4000 : frames);  // ~12 KB per frame
+        ShotPath("thumbs");  // crea la cartella
+        vr::screenshot::StartThumbs(frames, ModuleDirectory() + "\\specopsvr_shots\\thumbs.bin");
+        return true;
+    }
     if (cmd == "synthleftrotvel") {
         // synthleftrotvel <pitch> <yaw> <roll> <ms>: mano sinistra finta che ruota (gradi/s) per <ms> (collaudi del peso).
         float p = 0, y = 0, r = 0;
@@ -1167,6 +1208,42 @@ bool ExecuteExtra(const std::string& cmd, std::istringstream& in) {
         std::string v;
         in >> v;
         g_camOwnYaw = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "hitblood") {  // sangue sullo schermo quando si e' colpiti (YFourthWallHealthFeedback)
+        std::string v;
+        in >> v;
+        g_hitBlood = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "texdynamic") {  // collaudo: texture convertite con o senza D3DUSAGE_DYNAMIC
+        std::string v;
+        in >> v;
+        g_texDynamic = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "texshadow") {  // lock delle texture dalla copia in memoria di sistema (hooks.cpp, TexShadow)
+        std::string v;
+        in >> v;
+        g_texShadow = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "smoothdt") {  // orologio del gioco al passo del visore (vr::pure::GameClock)
+        std::string v;
+        in >> v;
+        g_smoothDt = OnOff(cmd, v, true);
+        return true;
+    }
+    if (cmd == "rtsample") {  // collaudo: campioni dello stack del thread di rendering (righe RTS)
+        float s = 3.0f;
+        in >> s;
+        vr::output::StartRenderSampler(s < 0.1f ? 0.1f : (s > 20.0f ? 20.0f : s));
+        return true;
+    }
+    if (cmd == "tickprof") {  // collaudo: una riga TICKP per tick per i prossimi N tick
+        int n = 0;
+        in >> n;
+        g_tickProfLeft = n < 0 ? 0 : (n > 20000 ? 20000 : n);
         return true;
     }
     if (cmd == "armslead" || cmd == "bodyalignwall") {  // review 2 del follow-up: solo collaudi prima/dopo
@@ -2624,8 +2701,11 @@ void SaveIniValue(const std::string& key, const std::string& value) {
 // tremava di 0.3-0.6 deg rms appena il gioco scendeva sotto la frequenza del
 // visore (runtime finto, openxr 90 Hz a 80/60/45 fps; openvr 72 Hz anche a fps
 // piena); con la posa 0.004 deg. Sui PC veloci quasi non si vedeva.
-constexpr int kConfigVersion = 13;
-static_assert(kConfigVersion > vr::pure::kResetConfigVersion, "configversion: 12 = reset 0.10.0, 13 = submitpose auto");
+// 14 (1/11): "twohandsmooth 1" -> 4 (filtro della linea tra i palmi, vedi twohand_math.h); "spread on 1 0.1 0.5 1.5" ->
+// due mani 0.2: M4 a raffica, cono del gioco fino a 5,7 gradi: con 0.5 a due mani 2,9 gradi, oltre 1 m a 20 m dal mirino
+// verde, a caso ("la mira a due mani a volte imprecisa"); con 0.2 1,1 gradi, ~40 cm (tacche all'occhio 0.1).
+constexpr int kConfigVersion = 14;
+static_assert(kConfigVersion > vr::pure::kResetConfigVersion, "configversion: 12 = reset 0.10.0, 13 = submitpose auto, 14 = twohandsmooth 4");
 // "submitpose" resta qui di proposito: la rimozione vale solo per gli ini
 // prima della versione 8 (righe del comando nascosto, anche un vecchio
 // "submitpose on" messo a mano); dopo arriva la riga distribuita. Dal WI-1
@@ -2647,7 +2727,8 @@ void MigrateConfig(std::vector<std::string>& lines, const std::string& path) {
         {9, "marker off", "marker on"}, {9, "runtime steamvr", "runtime auto"},
         {10, "solidhands off", "solidhands held"},
         {vr::pure::kTesterFixesConfigVersion, "headcollision on", "headcollision push"},
-        {13, "submitpose off", "submitpose auto"}, {13, "hud 0.4 100", "hud 0.3 100"}};
+        {13, "submitpose off", "submitpose auto"}, {13, "hud 0.4 100", "hud 0.3 100"},
+        {14, "twohandsmooth 1", "twohandsmooth 4"}, {14, "spread on 1 0.1 0.5 1.5", "spread on 1 0.1 0.2 1.5"}};
     // WI-4a: il commento di aimpitch (4 righe) diventa quello di holdmode
     // (vr::pure::kAimpitchCommentChanges), la riga dopo MigrateAimpitchLine.
     std::vector<vr::pure::ConfigChange> changes(std::begin(kChanges), std::end(kChanges));

@@ -44,6 +44,9 @@ virtual cinema screen.
 - **Audio in the headset**: the game's sound follows the Windows default
   playback device, so it reaches the headset even when Virtual Desktop or
   Link starts streaming after the game is already running.
+- **Blood on screen** (Basic menu, on by default): when you are hit, blood at the
+  edges of your view and a red arc showing where the hit came from; off removes
+  both (your view still loses its colour when your health is low).
 - **Wrist HUD and laser**: ammo, weapon and health on your support-hand
   wrist like a watch (`wristhud`); on the virtual screen the gun controller
   is a laser pointer for the game's menus, trigger to click (`cinemalaser`).
@@ -70,7 +73,7 @@ virtual cinema screen.
   drawn; hits and physics still use the whole body).
 - **Aim with the gun**: shots, rockets and grenade-launcher rounds leave the
   barrel of the gun you hold, with the game's own spread scaled by your
-  stance (sights at the eye = practically none, two hands = half, long gun in
+  stance (sights at the eye = practically none, two hands = little, long gun in
   one hand = more). A green marker shows where the barrel points (on by
   default, `marker off` or the in-headset menu to use only the weapon's
   sights); `laser on` adds a visible beam. **Two hands**: put your left hand
@@ -80,7 +83,11 @@ virtual cinema screen.
   vibration); open the grip to let go (the gun eases back to your right hand
   as you move it), or move the hand away: the gun goes back to your right hand
   as your left hand leaves the barrel (after leaving with the grip closed,
-  open and close it again to grab). While both hands hold it, turning or
+  open and close it again to grab). With the grip closed the hold is wider: you
+  can aim by moving only your left hand (full up to 20 cm from where you took
+  the gun, let go at 35 cm). A controller that loses tracking behind the other
+  does not move the barrel: it follows your gun hand until tracking returns.
+  While both hands hold it, turning or
   rolling your right wrist and sliding the left hand along the barrel do not
   move the barrel. With a pistol the left hand wraps the
   gun hand (direction unchanged). With *Controller hold* gunstock the gun always
@@ -325,10 +332,10 @@ virtual cinema screen.
    finds more than one copy it asks which one). If it cannot find it, or to
    pick a copy, pass the folder:
    `install.bat "D:\Games\Spec Ops The Line"`.
-3. In Steam, *Spec Ops: The Line > Properties > Launch options*, add
-   `-windowed ResX=2400 ResY=2500`. Once the headset is on, the mod switches
-   the game to the resolution SteamVR recommends for your headset: to change
-   sharpness, use the SteamVR resolution slider.
+3. Nothing to set in Steam: the mod always starts the game in a window, at
+   `ResX=2400 ResY=2500` unless your launch options give another size. Once the
+   headset is on, it switches the game to the resolution SteamVR recommends for
+   your headset: to change sharpness, use the SteamVR resolution slider.
 4. Put the headset on (connect it to Virtual Desktop or Link, or start
    SteamVR) and start the game. Through OpenXR (VDXR, Link) SteamVR is not
    needed and the resolution follows that runtime's own setting (VD's
@@ -445,6 +452,14 @@ Both are off automatically when no device is found; `protube off` /
 `bhaptics off` in `specopsvr.ini` disable them.
 
 ## Frame rate
+
+The game runs one tick per headset frame with the same time step, so while it
+holds the refresh rate the world and the gun move evenly when you walk or turn
+(`smoothdt`). Textures load from a copy in system memory, as the game expects,
+so the texture streaming that runs while you walk never waits for the GPU
+(`texshadow`). Below the refresh rate the headset repeats frames, which shows as
+a shake when walking: use the headset's lower refresh rate or lower resolution
+if the game cannot hold it.
 
 The mod keeps the game at the headset refresh rate with dynamic resolution.
 It changes the resolution only after the GPU has stayed over or well under

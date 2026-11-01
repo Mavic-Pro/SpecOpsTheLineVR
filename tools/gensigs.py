@@ -55,6 +55,8 @@ CODE = [
     ('HearStimFill', 0x00E428A0),
     ('RetFromBotHandler', 0x00A367A3),
     ('InstantFire', 0x0093F510),
+    ('EngineTick', 0x007849F0),
+    ('FlushRenderingCommands', 0x006B2300),
 ]
 # Globals / vtables: found through an instruction that references them.
 DATA = [

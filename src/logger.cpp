@@ -7,6 +7,7 @@
 #include <mutex>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <iomanip>
@@ -121,6 +122,11 @@ void WriteHeader(const std::string& dir) {
     g_file << "Started: " << Timestamp(true) << "\n";
     g_file << "Game: " << ExeInfo() << "\n";
     g_file << "Windows: " << WindowsVersion() << "\n";
+    // Sotto Wine/Proton la versione qui sopra e' quella dichiarata, non il sistema reale.
+    typedef const char*(__cdecl * WineGetVersion_t)();
+    if (HMODULE ntdll = GetModuleHandleA("ntdll.dll"))
+        if (auto wine = reinterpret_cast<WineGetVersion_t>(GetProcAddress(ntdll, "wine_get_version")))
+            g_file << "Wine/Proton: " << wine() << "\n";
     std::ifstream ini(dir + "\\specopsvr.ini");
     if (ini) {
         g_file << "---- specopsvr.ini (active lines) ----\n";
@@ -159,6 +165,43 @@ void WriteCrashReport(EXCEPTION_POINTERS* info, DWORD tid) {
                   static_cast<unsigned long>(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod)),
                   tid);
     Line(b);
+    // UE3 mostra solo "Address = 0x0" quando il PC e' nullo (31/10, "Rendering
+    // thread exception"): lo stack walk si ferma subito. I registri e i primi
+    // indirizzi di codice sullo stack dicono chi ha fatto la chiamata.
+    if (const CONTEXT* c = info->ContextRecord) {
+        std::snprintf(b, sizeof(b),
+                      "CRASH: eip=%08lX esp=%08lX ebp=%08lX eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX; access %lu at %08lX",
+                      c->Eip, c->Esp, c->Ebp, c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi,
+                      info->ExceptionRecord->NumberParameters > 0 ? static_cast<unsigned long>(info->ExceptionRecord->ExceptionInformation[0]) : 0ul,
+                      info->ExceptionRecord->NumberParameters > 1 ? static_cast<unsigned long>(info->ExceptionRecord->ExceptionInformation[1]) : 0ul);
+        Line(b);
+        const DWORD_PTR* sp = reinterpret_cast<const DWORD_PTR*>(c->Esp);
+        std::string frames = "CRASH: code addresses on the stack:";
+        int found = 0;
+        for (int i = 0; i < 2048 && found < 16; ++i) {
+            DWORD_PTR v = 0;
+            SIZE_T got = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), sp + i, &v, sizeof(v), &got) || got != sizeof(v)) break;
+            HMODULE m = nullptr;
+            if (!v || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                          reinterpret_cast<LPCSTR>(v), &m))
+                continue;
+            // Solo pagine eseguibili: vtable e variabili globali riempirebbero le 16 righe prima degli indirizzi di ritorno.
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (!VirtualQuery(reinterpret_cast<LPCVOID>(v), &mbi, sizeof(mbi)) ||
+                !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                continue;
+            char path[MAX_PATH] = "?";
+            GetModuleFileNameA(m, path, MAX_PATH);
+            const char* name = std::strrchr(path, '\\');
+            char one[96];
+            std::snprintf(one, sizeof(one), " [+%X] %08lX %s+0x%lX", i * 4, static_cast<unsigned long>(v), name ? name + 1 : path,
+                          static_cast<unsigned long>(v - reinterpret_cast<DWORD_PTR>(m)));
+            frames += one;
+            ++found;
+        }
+        Line(frames);
+    }
     std::string dump = g_dir + "\\specopsvr_crash_" + std::to_string(GetTickCount64()) + ".dmp";
     HANDLE f = CreateFileA(dump.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
@@ -259,7 +302,7 @@ void ReportCrash(EXCEPTION_POINTERS* info) {
     static volatile LONG once = 0;
     if (InterlockedExchange(&once, 1)) return;
     char b[160];
-    std::snprintf(b, sizeof(b), "CRASH: game thread exception 0x%08lX at %p (caught by the engine's filter, hooked)",
+    std::snprintf(b, sizeof(b), "CRASH: engine-caught exception (game or rendering thread) 0x%08lX at %p (engine's filter, hooked)",
                   info->ExceptionRecord->ExceptionCode, info->ExceptionRecord->ExceptionAddress);
     Line(b);
     WriteCrashReport(info, GetCurrentThreadId());

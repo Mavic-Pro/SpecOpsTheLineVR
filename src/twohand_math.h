@@ -326,9 +326,25 @@ struct Params {
     float engageM = 0.08f;    // presa entro (palmo sinistro dall'astina)
     float releaseM = 0.15f;   // rilascio oltre
     float dwellS = 0.15f;     // presa senza grip: ferma li' per
-    float filterMinHz = 1.0f; // filtro 1-euro sulla linea tra i palmi: taglio da fermi
-    float filterBeta = 9.0f;  // Hz in piu' per m/s
-    float filterDHz = 1.0f;   // taglio della derivata
+    // Filtro 1-euro sulla linea tra i palmi (1/11, "la mira a due mani a volte imprecisa"). Prima 1 Hz, 9 Hz/(m/s),
+    // derivata a 1 Hz: una correzione di 1 grado in 0,15 s arrivava al 90% in 256 ms, in uno scatto di 10 gradi la
+    // canna restava indietro di 2,6 gradi e inseguendo a 20 gradi/s di 0,6. Ora 133 ms, 0,4 e 0,12 gradi (simulazione,
+    // astina a 35,5 cm, 90 Hz). Il prezzo da fermi: 0,02 gradi rms con 0,3 mm di rumore dei controller (0,08 con 1 mm),
+    // meno del rumore della mira con una mano (0,2 gradi).
+    float filterMinHz = 4.0f; // taglio da fermi ("twohandsmooth")
+    float filterBeta = 100.0f;  // Hz in piu' per m/s
+    float filterDHz = 5.0f;   // taglio della derivata
+    float dirMinHz = 1.0f;    // canna con una mano filtrata (disaccordo, attribuzione): resta lenta, non entra nella mira
+    float dirDHz = 1.0f;
+    // Presa col grip stretto (1/11): mirare girando solo la sinistra (20-25 gradi = 12-15 cm all'astina) la riportava
+    // alla destra e la rilasciava, e col grip chiuso non si riprendeva piu': la canna saltava di 20 gradi nel mezzo della
+    // mira. Col grip stretto la presa e' voluta: peso pieno fino a gripHoldM, 0 a gripReleaseM (angoli all'astina), e
+    // disaccordo fra le canne fino a gripApartScale x gli angoli normali. Senza grip restano engageM / releaseM.
+    float gripHoldM = 0.20f;
+    float gripReleaseM = 0.35f;
+    float gripApartScale = 3.5f;
+    float trackHoldS = 1.5f;  // controller non tracciato: relazione fra i palmi tenuta al massimo per tanto
+    float trackBlendS = 0.2f; // al ritorno del tracciamento: passaggio dalla relazione tenuta a quella vera
     float stockM = 0.06f;     // calcio: controller sinistro entro (dalla posa salvata)
     float stockDeg = 25.0f;
     float blendMinS = 0.15f;  // passaggio da una a due mani: almeno
@@ -353,6 +369,9 @@ struct Input {
     float palmR[3] = {};        // palmo della mano dell'arma
     bool leftValid = false;
     float palmL[3] = {};        // palmo della mano di supporto
+    // Posizioni tracciate davvero (non stimate col solo giroscopio): con le mani allineate davanti al visore un
+    // controller copre l'altro. false = i palmi non si usano, la relazione resta quella di prima (trackHoldS).
+    bool leftTracked = true, rightTracked = true;
     bool grip = false;          // grip sinistro stretto
     int veto = 0;               // Veto
     bool gunstock = false;      // "holdmode gunstock"
@@ -426,8 +445,21 @@ public:
     float apart = 0.0f, endM = 0.0f, alongTwo = 0.0f;
     bool needRegrip = false;   // rilascio per distanza col grip stretto: per riprendere si lascia e si stringe di nuovo
     float leftGoal[3] = {0.0f, 0.0f, 0.0f};  // scarto rimasto voluto (cala col moto); c lo segue al piu' a maxDegPerS
+    // Tracciamento perso (1/11): sinistro rispetto al palmo destro, nel telaio raw della destra.
+    float relHold[3] = {0.0f, 0.0f, 0.0f};
+    bool haveRel = false;
+    float lostFor = 0.0f, backFor = 1e9f;
+    bool everTracked = false;
+    float blendFrom[3] = {0.0f, 0.0f, 0.0f};
+    bool wasOk = true;
+    float lastRel[3] = {0.0f, 0.0f, 0.0f};   // relazione usata all'ultimo tick
+    float lastLeftRaw[3][4] = {};            // ultima posa valida del controller sinistro
 
     void Reset() {
+        haveRel = false;
+        lostFor = 0.0f;
+        backFor = 1e9f;
+        wasOk = true;
         engaged = byGrip = gripBlock = false;
         dwell = 0.0f;
         for (int i = 0; i < 3; ++i) c[i] = cStart[i] = lastTarget[i] = fadeFrom[i] = 0.0f;
@@ -557,7 +589,23 @@ public:
     float DepartDeg() const { return std::sqrt(dep[0] * dep[0] + dep[1] * dep[1]) * 57.2957795f; }
     float TurnDeg() const { return std::sqrt(turn[0] * turn[0] + turn[1] * turn[1]) * 57.2957795f; }
 
-    Output Step(const Input& in) {
+    Output Step(const Input& inArg) {
+        // Controller sinistro senza posa (fuori dal tracciamento, alcuni runtime dopo qualche istante coperto): dentro la
+        // presa, per trackHoldS, come il tracciamento perso: il palmo resta dov'era rispetto alla mano dell'arma. Prima la
+        // presa cadeva subito e la canna tornava alla destra in mezzo a una mira.
+        Input inHeld;
+        const bool heldPose = !inArg.leftValid && engaged && everTracked && haveRel && lostFor < p.trackHoldS;
+        if (heldPose) {
+            inHeld = inArg;
+            inHeld.leftValid = true;
+            inHeld.leftTracked = false;
+            std::memcpy(inHeld.leftRaw, lastLeftRaw, sizeof(inHeld.leftRaw));
+            for (int i = 0; i < 3; ++i)
+                inHeld.palmL[i] = inArg.palmR[i] + inArg.rightRaw[i][0] * relHold[0] + inArg.rightRaw[i][1] * relHold[1] + inArg.rightRaw[i][2] * relHold[2];
+        } else if (inArg.leftValid) {
+            std::memcpy(lastLeftRaw, inArg.leftRaw, sizeof(lastLeftRaw));
+        }
+        const Input& in = heldPose ? inHeld : inArg;
         Output o;
         for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 4; ++j) o.gun[i][j] = in.gun[i][j];
@@ -571,6 +619,55 @@ public:
         havePrev = true;
         // Linea tra i palmi: grezza per la prova di presa, filtrata per la mira.
         float d[3] = {in.palmL[0] - in.palmR[0], in.palmL[1] - in.palmR[1], in.palmL[2] - in.palmR[2]};
+        // Un controller non tracciato (coperto dall'altro): la sua posizione stimata deriva e torna con un salto. Nella
+        // presa la relazione fra i palmi resta quella di prima, girata con la mano dell'arma, e al ritorno passa a
+        // quella vera in trackBlendS. Solo se il runtime ha detto almeno una volta "tracciato" e per poco: un runtime
+        // che non lo dice mai non deve bloccare la mira.
+        if (in.leftValid) {
+            const bool ok = in.leftTracked && in.rightTracked;
+            if (ok) everTracked = true;
+            const bool hold = !ok && engaged && everTracked && haveRel && lostFor < p.trackHoldS;
+            if (hold) {
+                lostFor += dt;
+                backFor = 0.0f;
+                for (int i = 0; i < 3; ++i) d[i] = in.rightRaw[i][0] * relHold[0] + in.rightRaw[i][1] * relHold[1] + in.rightRaw[i][2] * relHold[2];
+                for (int i = 0; i < 3; ++i) blendFrom[i] = relHold[i];
+            } else {
+                // Tornato dopo la fine della tenuta: dalla posizione stimata (anche 10 cm lontana, 16 gradi di canna) a
+                // quella vera in trackBlendS, non di colpo.
+                if (ok && !wasOk && engaged && haveRel && backFor >= p.trackBlendS) {
+                    for (int i = 0; i < 3; ++i) blendFrom[i] = lastRel[i];
+                    backFor = 0.0f;
+                }
+                if (backFor < p.trackBlendS && engaged) {
+                    backFor += dt;
+                    const float k = SmoothStep01(backFor / (p.trackBlendS > 1e-3f ? p.trackBlendS : 1e-3f));
+                    for (int i = 0; i < 3; ++i) {
+                        const float was = in.rightRaw[i][0] * blendFrom[0] + in.rightRaw[i][1] * blendFrom[1] + in.rightRaw[i][2] * blendFrom[2];
+                        d[i] = was + (d[i] - was) * k;
+                    }
+                } else if (ok) {
+                    // Tracciamento tornato da trackBlendS: solo ora si azzera il conto, altrimenti un tracciamento che va e
+                    // viene (1 tick su 10) terrebbe la relazione vecchia oltre trackHoldS. La relazione vale solo dentro la
+                    // presa: quella di una mano che sta arrivando da 20 cm girerebbe la canna (vedi engage).
+                    lostFor = 0.0f;
+                    backFor = 1e9f;
+                    if (engaged) {
+                        for (int i = 0; i < 3; ++i) relHold[i] = in.rightRaw[0][i] * d[0] + in.rightRaw[1][i] * d[1] + in.rightRaw[2][i] * d[2];
+                        haveRel = true;
+                    } else {
+                        haveRel = false;
+                    }
+                }
+            }
+            wasOk = ok;
+            for (int i = 0; i < 3; ++i) lastRel[i] = in.rightRaw[0][i] * d[0] + in.rightRaw[1][i] * d[1] + in.rightRaw[2][i] * d[2];
+        } else {
+            haveRel = false;
+            lostFor = 0.0f;
+            backFor = 1e9f;
+            wasOk = true;
+        }
         float df[3] = {d[0], d[1], d[2]};
         if (in.leftValid) {
             for (int k = 0; k < 3; ++k) {
@@ -588,9 +685,9 @@ public:
         // 0,28-0,46 gradi rms alla canna a due mani).
         float f1s[3];
         for (int k = 0; k < 3; ++k) {
-            f1f[k].minCutoff = p.filterMinHz;
+            f1f[k].minCutoff = p.dirMinHz;
             f1f[k].beta = p.dirBeta;
-            f1f[k].dCutoff = p.filterDHz;
+            f1f[k].dCutoff = p.dirDHz;
             f1s[k] = f1f[k].Step(f1[k], dt);
         }
         if (!Normalize3(f1s))
@@ -661,6 +758,9 @@ public:
             fadeOut = false;
             ResetDeparture();
             needRegrip = false;
+            haveRel = false;  // si ricattura al prossimo tick tracciato dentro la presa
+            lostFor = 0.0f;
+            backFor = 1e9f;
             // Linea filtrata ripartita dal palmo di adesso: una mano arrivata
             // di slancio (grip alla prima prova) trascinava il filtro da 20-25
             // cm prima, e il suo assestarsi contava come allontanamento
@@ -684,6 +784,9 @@ public:
         bool solved = false;
         const float gf = g.fwd > 0.10f ? g.fwd : 0.10f;
         const float aIn = std::atan2(p.engageM, gf), aOut = std::atan2(p.releaseM > p.engageM + 1e-3f ? p.releaseM : p.engageM + 1e-3f, gf);
+        // Col grip stretto la presa e' voluta (vedi Params): angoli piu' larghi, per l'allontanamento e per il disaccordo.
+        const float holdIn = byGrip ? (std::max)(aIn, std::atan2(p.gripHoldM, gf)) : aIn;
+        const float holdOut = byGrip ? (std::max)(aOut, std::atan2(p.gripReleaseM, gf)) : aOut;
         auto departure = [&]() {
             const float dep0[2] = {dep[0], dep[1]};
             const bool had = haveDep;
@@ -703,11 +806,11 @@ public:
                 pend[1] *= k;
             }
             const float dRad = std::sqrt(dep[0] * dep[0] + dep[1] * dep[1]);
-            wDep = 1.0f - SmoothStep01((dRad - aIn) / (aOut - aIn));
+            wDep = 1.0f - SmoothStep01((dRad - holdIn) / (holdOut - holdIn));
             float x[3];
             Cross3(f1s, f2, x);
             apart = std::atan2(Norm3(x), Dot3(f1s, f2));
-            const float s = p.apartScale > 1.0f ? p.apartScale : 1.0f;
+            const float s = byGrip ? (p.gripApartScale > 1.0f ? p.gripApartScale : 1.0f) : (p.apartScale > 1.0f ? p.apartScale : 1.0f);
             wApart = 1.0f - SmoothStep01((apart - s * aIn) / (s * (aOut - aIn)));
             // Palmo lungo la canna a due mani (linea filtrata): oltre la fine
             // dell'astina da twohandgrip a twohandrelease il peso va a 0.

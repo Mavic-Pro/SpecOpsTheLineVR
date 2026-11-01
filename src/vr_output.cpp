@@ -58,7 +58,7 @@ ID3D11Texture2D* g_eyeTexture[2] = {};
 // rendering: ~7,5 ms per tick su 13,9 disponibili a 72 Hz, piu' il Present
 // del monitor. Tre superfici per occhio: una in lettura GPU, una pronta,
 // una in copia nel thread di uscita.
-constexpr int kSlots = 3;
+constexpr int kSlots = 4;  // 29/10: 3 -> 4, uno slot resta in uso finche' la sua copia D3D11 non e' finita
 enum SlotState { kFree, kGpu, kLocked };
 IDirect3DSurface9* g_sharedSurface = nullptr;  // ritaglio dell'occhio (GPU, D3D9)
 IDirect3DSurface9* g_sysmem[2][kSlots] = {};
@@ -89,7 +89,7 @@ uint32_t g_slotSeq[2][kSlots] = {};
 // Attese sulle fence scadute (copia D3D9 StretchRect 8 ms, copia D3D11 10 ms):
 // lo slot viene consegnato lo stesso; se capita, un frame puo' mescolare due
 // tick (L2). Contate nella riga VR-OUTPUT.
-std::atomic<unsigned> g_fenceTimeout9{0}, g_fenceTimeout11{0};
+std::atomic<unsigned> g_fenceTimeout9{0};
 vr::HmdMatrix34_t g_renderPose[2] = {};
 bool g_slotGpu[2][kSlots] = {};     // slot nella texture condivisa (niente LockRect)
 // Percorso GPU (device D3D9Ex): texture render target condivise con D3D11,
@@ -130,6 +130,23 @@ bool g_cropSession = false;
 bool g_frameReady = false;       // coppia completa pronta
 bool g_workerBusy = false;       // il thread di uscita sta leggendo superfici bloccate
 std::vector<int> g_doneSlots[2];  // superfici lette, da sbloccare sul thread di rendering
+// Copie D3D11 dalle superfici condivise ancora in coda sulla GPU (29/10, tester
+// 7800X3D + 5090, "jitter when moving"): prima il thread di uscita aspettava
+// ogni copia fino a 10 ms in attesa attiva. Ad alta risoluzione la GPU sta gia'
+// disegnando il tick seguente e la copia passa dopo: l'attesa scadeva a OGNI
+// frame (log: copy=10.2 ms, fence timeouts d3d11 = numero di invii, 72 Hz =
+// 13.9 ms), il ritmo del visore saltava e camminando la vista tremava. Ora la
+// copia si accoda e si va avanti; lo slot torna al thread di rendering solo a
+// copia finita (query per slot, controllata senza bloccare a ogni giro).
+struct PendingCopy {
+    int eye;
+    int slot;
+    ID3D11Query* query;
+    double since;
+};
+std::vector<PendingCopy> g_pendingCopies;  // con g_mutex
+ID3D11Query* g_copyQuery[2][kSlots] = {};  // solo thread di uscita
+std::atomic<unsigned> g_copyLate{0};      // copie oltre 100 ms (slot liberato comunque)
 std::thread g_worker;
 std::atomic<bool> g_workerStop{false};
 
@@ -166,6 +183,9 @@ std::atomic<float> g_eyeAxes[2][9];
 std::atomic<bool> g_eyeCanted[2];
 std::atomic<float> g_hmdHz{0.0f};
 std::atomic<float> g_sameTickWaitMs{0.0f};
+std::atomic<double> g_frameGridMs{0.0};  // ultimo ritorno bloccato di WaitGetPoses (griglia del visore)
+std::atomic<double> g_framePeriodMs{0.0};  // periodo misurato della griglia
+std::atomic<bool> g_gateSkip{false};       // il prossimo tick salta una casella (coda di un frame da svuotare)
 int g_renderPercent[2] = {100, 100};
 // Immagine disegnata con la proiezione decentrata (tutto il back buffer e'
 // l'occhio): niente ritaglio. Per occhio, dal frame tag.
@@ -355,6 +375,7 @@ void QuiesceWorker() {
     g_frameReady = false;
     g_doneSlots[0].clear();
     g_doneSlots[1].clear();
+    g_pendingCopies.clear();  // slot rimessi a zero qui sopra: le copie in coda non contano piu'
 }
 
 // Solo risorse D3D9 in pool DEFAULT/SYSTEMMEM: sicuro da qualunque thread
@@ -856,6 +877,24 @@ void ApplyFades(vr::IVRCompositor* compositor) {
 // visore, prende la coppia piu' recente, la copia nelle texture D3D11 e la
 // invia. Anche le chiamate al compositor non legate al frame (finestra
 // specchio, cattura) stanno qui, cosi' il contesto D3D11 ha un solo thread.
+// Con g_mutex preso, sul thread di uscita: gli slot le cui copie sono finite
+// tornano al thread di rendering (oltre 100 ms si liberano comunque, contati).
+void PollPendingCopiesLocked() {
+    const double now = QpcMs();
+    for (size_t i = 0; i < g_pendingCopies.size();) {
+        PendingCopy& c = g_pendingCopies[i];
+        const bool done = g_d3d11Ctx->GetData(c.query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        if (done || now - c.since > 100.0) {
+            if (!done) ++g_copyLate;
+            g_doneSlots[c.eye].push_back(c.slot);
+            g_pendingCopies[i] = g_pendingCopies.back();
+            g_pendingCopies.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
 void WorkerLoop() {
     vr::log::Line("VR-OUTPUT: output thread started.");
     int submits = 0, posedSubmits = 0, mismatchedPairs = 0;
@@ -879,9 +918,13 @@ void WorkerLoop() {
     while (!g_workerStop) {
         {
             std::unique_lock<std::mutex> lock(g_mutex);
-            if (!g_cv.wait_for(lock, std::chrono::milliseconds(100),
-                               [] { return g_frameReady || g_workerStop.load(); }))
-                continue;
+            const bool woke = g_cv.wait_for(lock, std::chrono::milliseconds(g_pendingCopies.empty() ? 100 : 2),
+                                            [] { return g_frameReady || g_workerStop.load(); });
+            if (g_d3d11Ctx && !g_pendingCopies.empty()) {
+                PollPendingCopiesLocked();
+                g_cv.notify_all();
+            }
+            if (!woke) continue;
         }
         if (g_workerStop) break;
         vr::session::Shared vrLock;
@@ -921,9 +964,28 @@ void WorkerLoop() {
             framePhotonsAbs = fp > 0.0f ? QpcMs() + 1000.0 * fp : 0.0;
             waitHmd = poses[vr::k_unTrackedDeviceIndex_Hmd];
         };
+        // Solo un'attesa vera dice dov'e' la griglia del visore (in ritardo torna subito). Periodo misurato: a meta'
+        // frequenza (SSW, ASW) o con un runtime che rallenta la griglia non e' quella nominale. Conta solo se a limitare e'
+        // il compositor (attesa lunga rispetto al passo): col gioco lento (caricamenti, tick lunghi) l'intervallo e' il suo,
+        // e tenere i tick a quel periodo non lo farebbe piu' scendere (1/11: dopo un caricamento il gioco restava a 11 fps
+        // per sempre). Allora si torna al nominale.
+        auto noteGrid = [](vr::EVRCompositorError err, double before, double after) {
+            if (after - before <= 1.0 || err != vr::VRCompositorError_None) return;
+            const double prev = g_frameGridMs.load();
+            const double step = after - prev;
+            const float hzNom = g_hmdHz.load();
+            if (prev > 0.0 && step > 2.0 && step < 120.0 && hzNom > 30.0f) {
+                const double sample = after - before >= 0.5 * step ? step : 1000.0 / hzNom;
+                const double per = g_framePeriodMs.load();
+                g_framePeriodMs = per <= 0.0 ? sample : per + ((std::min)((std::max)(sample, per * 0.5), per * 1.5) - per) * 0.1;
+            }
+            g_frameGridMs = after;
+        };
         if (vr::control::g_outputTest < 2 && !waitLate) {
             vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount] = {};
+            const double before = QpcMs();
             const vr::EVRCompositorError we = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+            noteGrid(we, before, QpcMs());
             afterWait(we, poses);
         }
         waitMs += QpcMs() - tw;
@@ -1067,27 +1129,35 @@ void WorkerLoop() {
         }
         // Le CopyResource dalle superfici condivise sono solo accodate: lo slot
         // torna al thread di rendering (che ci riscrive con StretchRect) solo a
-        // copia finita, altrimenti un frame poteva mescolare due tick.
-        if (pk[0].gpuSrc || pk[1].gpuSrc) {  // anche la copia nello schermo virtuale
-            static ID3D11Query* copyDone = nullptr;
-            if (!copyDone) {
+        // copia finita, altrimenti un frame poteva mescolare due tick. 29/10:
+        // niente piu' attesa qui (vedi PendingCopy), il Submit segue subito; la
+        // GPU esegue copia e lettura del compositor nell'ordine del contesto.
+        std::vector<PendingCopy> queued;
+        for (int e = 0; e < 2; ++e) {
+            if (!pk[e].gpuSrc || pk[e].slot < 0 || pk[e].slot >= kSlots) continue;
+            ID3D11Query*& q = g_copyQuery[e][pk[e].slot];
+            if (!q) {
                 D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
-                g_d3d11->CreateQuery(&qd, &copyDone);
+                if (FAILED(g_d3d11->CreateQuery(&qd, &q))) q = nullptr;
             }
-            if (copyDone) {
-                g_d3d11Ctx->End(copyDone);
-                double tq = QpcMs();
-                BOOL doneQ = FALSE;
-                while (g_d3d11Ctx->GetData(copyDone, &doneQ, sizeof(doneQ), 0) != S_OK && QpcMs() - tq < 10.0)
-                    YieldProcessor();
-                if (g_d3d11Ctx->GetData(copyDone, &doneQ, sizeof(doneQ), 0) != S_OK) ++g_fenceTimeout11;  // L2: contati
+            if (q) {
+                g_d3d11Ctx->End(q);
+                queued.push_back({e, pk[e].slot, q, QpcMs()});
             }
         }
-        copyMs += QpcMs() - tc;
+        if (!queued.empty()) g_d3d11Ctx->Flush();
+        const double tcEnd = QpcMs();
+        copyMs += tcEnd - tc;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            for (int e = 0; e < 2; ++e)
-                if (pk[e].slot >= 0) g_doneSlots[e].push_back(pk[e].slot);
+            for (int e = 0; e < 2; ++e) {
+                if (pk[e].slot < 0) continue;
+                bool pending = false;
+                for (const PendingCopy& c : queued) pending = pending || (c.eye == e && c.slot == pk[e].slot);
+                if (!pending) g_doneSlots[e].push_back(pk[e].slot);  // UpdateSubresource o query mancante: gia' letta
+            }
+            g_pendingCopies.insert(g_pendingCopies.end(), queued.begin(), queued.end());
+            PollPendingCopiesLocked();
             // g_workerBusy resta vero fino a dopo il Submit: le texture degli
             // occhi non vanno liberate (EnsureResources) mentre il compositor
             // le legge.
@@ -1173,7 +1243,9 @@ void WorkerLoop() {
             double tw2 = QpcMs();
             vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount] = {};
             const vr::EVRCompositorError we = compositor->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
-            waitMs += QpcMs() - tw2;
+            const double twEnd = QpcMs();
+            waitMs += twEnd - tw2;
+            noteGrid(we, tw2, twEnd);
             afterWait(we, poses);
         }
         // Runtime finto (collaudi): tick e posa del frame per la riga JITTER.
@@ -1249,6 +1321,11 @@ void WorkerLoop() {
         }
         endBusy();
         ++submits;
+        if (vr::control::g_tickProfLeft.load(std::memory_order_relaxed) > 0) {
+            char pb[200];
+            std::snprintf(pb, sizeof(pb), "OUTP: n=%d tick=%u take=%.3f copydone=%.3f waitret=%.3f submitret=%.3f", submits, pk[0].tick, tc, tcEnd, ts, QpcMs());
+            vr::log::Line(pb);
+        }
         // Ritardo reale testa -> fotoni di questo frame: dal campionamento della
         // posa all'invio, piu' il tempo dall'invio ai fotoni secondo il runtime
         // (fino al prossimo vsync + vsync->fotoni; con Link comprende la
@@ -1338,10 +1415,10 @@ void WorkerLoop() {
             std::snprintf(b, sizeof(b),
                           "VR-OUTPUT: submit %d L=%d R=%d [D3D11, dedicated thread] %.1f submits/s; per submit ms: "
                           "copy=%.2f headset wait=%.2f Submit=%.2f; with render pose %d; mismatched pairs skipped %d; stale pairs "
-                          "dropped %d; fence timeouts d3d9=%u d3d11=%u; L/R from different ticks %d (largest %u ticks)",
+                          "dropped %d; fence timeouts d3d9=%u, d3d11 copies over 100 ms %u; L/R from different ticks %d (largest %u ticks)",
                           submits, static_cast<int>(errL), static_cast<int>(errR), 1000.0 * n / (now - windowStart),
                           copyMs / n, waitMs / n, submitMs / n, posedSubmits, mismatchedPairs, g_pairsDropped,
-                          g_fenceTimeout9.load(), g_fenceTimeout11.load(), skewPairs, skewMax);
+                          g_fenceTimeout9.load(), g_copyLate.load(), skewPairs, skewMax);
             vr::log::Line(b);
             // Visore a meta' frequenza (SSW di Virtual Desktop, ASW di Link):
             // 36 invii/s su 72 Hz con la GPU libera = riproiezione continua,
@@ -1406,6 +1483,76 @@ float HmdRefreshHz() { return g_hmdHz; }
 float PhotonLatencyMs() { return g_photonLatencyMs; }
 
 void SetSameTickWait(float ms) { g_sameTickWaitMs = ms; }
+
+// Un tick per frame del visore (1/11). Il gioco era tenuto al ritmo del visore solo dall'attesa del thread di
+// rendering, che pero' manca quando la copia GPU dello stesso tick sfora il budget: partiva subito un tick in piu'
+// (4-7 ms invece di 11), una coppia veniva buttata e la fase del tick rispetto al vsync saltava di 4-7 ms: camminando
+// il mondo saltava di 1-2 cm per un frame. Qui il tick parte sulla griglia del visore (ritorni di WaitGetPoses),
+// un tick per casella; in ritardo non aspetta. Solo con orologio del gioco attivo e visore che riceve frame.
+double FramePeriodMs() {
+    const float hz = g_hmdHz.load();
+    if (hz < 30.0f) return 0.0;
+    const double nominal = 1000.0 / hz;
+    const double ref = g_frameGridMs.load();
+    const double per = g_framePeriodMs.load();
+    if (ref <= 0.0 || per <= 0.0 || QpcMs() - ref > 250.0) return nominal;
+    // Multiplo esatto della frequenza nominale se ci sta vicino: passo identico a ogni tick.
+    const double n = std::floor(per / nominal + 0.5);
+    if (n >= 1.0 && std::fabs(per - n * nominal) < 0.1 * nominal) return n * nominal;
+    return per;
+}
+
+// Attesa precisa senza tenere occupato un core: timer ad alta risoluzione per quasi tutta l'attesa (Windows 10 1803+,
+// non dipende dal timer di sistema), l'ultimo tratto attivo. Mai Sleep: a finestra coperta o ridotta Windows 11 non
+// garantisce il timer a 1 ms. Senza quel timer (Windows piu' vecchi) tutta attiva, come SwitchToThread per il resto.
+void WaitUntilMs(double until) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    constexpr double kSpinMs = 1.0;
+    // Uno per thread: la usano il thread di gioco e quello di rendering.
+    static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    double left = until - QpcMs();
+    if (timer && left > kSpinMs + 0.5) {
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>((left - kSpinMs) * 10000.0);
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, static_cast<DWORD>(left) + 5);
+    }
+    for (;;) {
+        left = until - QpcMs();
+        if (left <= 0.0) break;
+        if (left > 0.3) SwitchToThread();
+        else YieldProcessor();
+    }
+}
+
+void GateGameTick() {
+    static double slot = 0.0;
+    if (!vr::control::g_smoothDt) {
+        slot = 0.0;
+        return;
+    }
+    const float hz = g_hmdHz.load();
+    const double ref = g_frameGridMs.load();
+    const double now = QpcMs();
+    if (hz < 30.0f || ref <= 0.0 || now - ref > 250.0) {
+        slot = 0.0;
+        return;
+    }
+    const double T = FramePeriodMs();
+    double next;
+    if (slot <= 0.0) {
+        next = ref + std::floor((now - ref) / T) * T;  // ultima casella passata: si riparte da qui, senza attese
+    } else {
+        // Casella dopo quella del tick precedente, riagganciata alla griglia.
+        const double want = slot + T;
+        next = ref + std::floor((want - ref) / T + 0.5) * T;
+        if (now > next + T) next = ref + std::floor((now - ref) / T) * T;  // caselle perse
+    }
+    if (g_gateSkip.exchange(false)) next += T;
+    if (now < next && next - now < 2.5 * T) WaitUntilMs(next);
+    slot = next;
+}
 
 void SetRenderScreenPercent(int eye, int percent) {
     if (eye >= 0 && eye <= 1) g_renderPercent[eye] = percent < 10 ? 100 : (percent > 100 ? 100 : percent);
@@ -1500,9 +1647,97 @@ void DeliverGpuSlot(int e, int g) {
     g_gpuSlot[e] = -1;
 }
 
-int g_sameTickOk = 0, g_sameTickMissed = 0;
+int g_sameTickOk = 0, g_sameTickMissed = 0, g_sameTickHeld = 0;
+
+// Campionatore del thread di rendering (collaudi, "rtsample <s>"): ogni ~0,5 ms ferma il thread, legge EIP e i
+// primi valori dello stack che sembrano indirizzi di codice e lo riparte. Niente allocazioni col thread fermo.
+std::atomic<DWORD> g_renderThreadId{0};
+std::atomic<bool> g_samplerBusy{false};
+
+void RenderSamplerThread(float seconds) {
+    struct Sample {
+        double t;
+        DWORD eip;
+        DWORD st[8];
+    };
+    const size_t cap = static_cast<size_t>(seconds * 2500.0f) + 16;
+    std::vector<Sample> buf(cap);
+    size_t n = 0;
+    const DWORD tid = g_renderThreadId.load();
+    HANDLE th = tid ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid) : nullptr;
+    if (!th) {
+        vr::log::Line("RTSAMPLE: no render thread yet.");
+        g_samplerBusy = false;
+        return;
+    }
+    MEMORY_BASIC_INFORMATION mbi = {};
+    uintptr_t lo[16] = {}, hi[16] = {};
+    int nMods = 0;
+    for (const char* name : {"SpecOpsTheLine.exe", "d3d9.dll", "nvd3dum.dll", "aticfx32.dll", "atiumdag.dll", "amdxc32.dll", "kernel32.dll", "KernelBase.dll", "ntdll.dll", "d3d9on12.dll"}) {
+        HMODULE m = GetModuleHandleA(name);
+        if (!m || nMods >= 16) continue;
+        if (VirtualQuery(m, &mbi, sizeof(mbi))) {
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(m);
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<char*>(m) + dos->e_lfanew);
+            lo[nMods] = reinterpret_cast<uintptr_t>(m);
+            hi[nMods] = lo[nMods] + nt->OptionalHeader.SizeOfImage;
+            ++nMods;
+        }
+    }
+    const double end = QpcMs() + seconds * 1000.0;
+    while (QpcMs() < end && n < cap) {
+        Sample& s = buf[n];
+        if (SuspendThread(th) == static_cast<DWORD>(-1)) break;
+        CONTEXT c = {};
+        c.ContextFlags = CONTEXT_CONTROL;
+        const bool ok = GetThreadContext(th, &c) != 0;
+        if (ok) {
+            s.t = QpcMs();
+            s.eip = c.Eip;
+            int f = 0;
+            std::memset(s.st, 0, sizeof(s.st));
+            const DWORD* sp = reinterpret_cast<const DWORD*>(c.Esp);
+            for (int i = 0; i < 1500 && f < 8; ++i) {
+                DWORD v = 0;
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), sp + i, &v, 4, &got) || got != 4) break;
+                for (int m = 0; m < nMods; ++m) {
+                    if (v >= lo[m] && v < hi[m]) {
+                        s.st[f++] = v;
+                        break;
+                    }
+                }
+            }
+        }
+        ResumeThread(th);
+        if (ok) ++n;
+        // ~0,5 ms senza dormire troppo
+        const double until = QpcMs() + 0.4;
+        while (QpcMs() < until) Sleep(0);
+    }
+    CloseHandle(th);
+    char b[220];
+    for (size_t i = 0; i < n; ++i) {
+        const Sample& s = buf[i];
+        std::snprintf(b, sizeof(b), "RTS: t=%.3f eip=%08lX s=%08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX", s.t, s.eip, s.st[0], s.st[1], s.st[2], s.st[3], s.st[4], s.st[5], s.st[6], s.st[7]);
+        vr::log::Line(b);
+    }
+    for (int m = 0; m < nMods; ++m) {
+        char path[MAX_PATH] = "?";
+        GetModuleFileNameA(reinterpret_cast<HMODULE>(lo[m]), path, MAX_PATH);
+        std::snprintf(b, sizeof(b), "RTS module %08lX-%08lX %s", static_cast<unsigned long>(lo[m]), static_cast<unsigned long>(hi[m]), path);
+        vr::log::Line(b);
+    }
+    g_samplerBusy = false;
+}
+
+void StartRenderSampler(float seconds) {
+    if (g_samplerBusy.exchange(true)) return;
+    std::thread(RenderSamplerThread, seconds).detach();
+}
 
 void OnPresent(IDirect3DDevice9* device, int eye) {
+    g_renderThreadId = GetCurrentThreadId();
     vr::rt::NameThread(vr::rt::ThreadRole::Present);  // riga dell'attesa del mutex OpenXR (review 2 WI-1)
     if (vr::control::g_exiting) return;
     if (OutputDisabled() || !vr::control::g_vrOutput) return;
@@ -1778,6 +2013,8 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     // (g_sameTickWaitMs > 0, deciso da hooks.cpp); la coppia va consegnata
     // intera o per niente: con un occhio solo si unirebbero due tick diversi.
     float waitBudget = g_sameTickWaitMs;
+    const double rtpStart = eye == 1 ? QpcMs() : 0.0;
+    int rtpSame = 0;  // collaudo (tickprof): 1 consegnata nello stesso tick, -1 budget sforato
     // Solo se i due slot sono dello stesso tick (L3: l'occhio sinistro del
     // tick prima con il destro di questo univa due tick).
     // L3 (21/10): il vincolo "stessi tick" era sbagliato in pratica (i tick
@@ -1788,27 +2025,75 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
     if (eye == 1 && waitBudget > 0.0f && g_gpuSlot[0] >= 0 && g_gpuSlot[1] >= 0 && g_slotGpu[0][g_gpuSlot[0]] &&
         g_slotGpu[1][g_gpuSlot[1]] && g_slotTick[0][g_gpuSlot[0]] != g_slotTick[1][g_gpuSlot[1]])
         ++tickMismatch;
+    // 1/11: coppia del tick prima appena completata (ultima consegna in ritardo): al thread di uscita subito, prima
+    // della prova qui sotto. Prima restava senza segnale e la coppia di questo tick la sostituiva: un frame buttato
+    // e, col passo del mondo fisso, un salto. Il thread di uscita la prende in tempo per il suo vsync.
+    if (eye == 1) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_ready[0].slot >= 0 && g_ready[1].slot >= 0 && !g_frameReady) {
+            g_frameReady = true;
+            g_cv.notify_all();
+        }
+    }
     if (eye == 1 && waitBudget > 0.0f && g_gpuSlot[0] >= 0 && g_gpuSlot[1] >= 0 && g_slotGpu[0][g_gpuSlot[0]] &&
         g_slotGpu[1][g_gpuSlot[1]]) {
         double tq = QpcMs();
         bool done = false;
-        while (true) {
-            done = g_shQuery[0][g_gpuSlot[0]]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK &&
-                   g_shQuery[1][g_gpuSlot[1]]->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_OK;
+        // Attesa della GPU senza tenere occupato un core: il primo passaggio scarica i comandi, poi si dorme fino al 70% del
+        // tempo solito (timer ad alta risoluzione) e solo il resto si controlla di continuo, senza chiamate di flush al driver.
+        static double gpuWaitEma = 0.0;
+        for (uint32_t pass = 0;; ++pass) {
+            const DWORD getFlags = (pass & 63u) == 0u ? D3DGETDATA_FLUSH : 0;
+            done = g_shQuery[0][g_gpuSlot[0]]->GetData(nullptr, 0, getFlags) == S_OK &&
+                   g_shQuery[1][g_gpuSlot[1]]->GetData(nullptr, 0, getFlags) == S_OK;
             if (done || QpcMs() - tq > waitBudget) break;
-            YieldProcessor();
+            if (pass == 0) WaitUntilMs(tq + (std::min)(0.7 * gpuWaitEma, static_cast<double>(waitBudget)));
+            else SwitchToThread();
         }
         if (done) {
-            DeliverGpuSlot(0, g_gpuSlot[0]);
-            DeliverGpuSlot(1, g_gpuSlot[1]);
-            ++g_sameTickOk;
+            const double took = QpcMs() - tq;
+            gpuWaitEma = gpuWaitEma <= 0.0 ? took : gpuWaitEma + (took - gpuWaitEma) * 0.1;
+            // Una coppia completa non ancora presa non si sostituisce: si aspetta che la prenda, entro il budget;
+            // altrimenti quella di questo tick resta per il tick dopo.
+            bool oldPending = false;
+            {
+                std::unique_lock<std::mutex> lock(g_mutex);
+                if (g_frameReady) {
+                    const double left = waitBudget - (QpcMs() - tq);
+                    if (left > 0.0) g_cv.wait_for(lock, std::chrono::duration<double, std::milli>(left), [] { return !g_frameReady; });
+                    oldPending = g_frameReady;
+                }
+            }
+            // Una coda di un frame (dopo un intoppo del compositor) resterebbe per sempre: +1 frame di latenza. Prima
+            // il tick salta una casella della griglia: la coda si svuota da sola e il visore non perde niente. Se dopo
+            // 0,5 s c'e' ancora, si butta la coppia vecchia, una volta sola.
+            static int heldStreak = 0;
+            if (oldPending) {
+                ++heldStreak;
+                if (heldStreak == 3 || heldStreak == 20) g_gateSkip = true;
+                if (heldStreak >= 45) {
+                    oldPending = false;
+                    vr::log::Line("VR-OUTPUT: one frame queued for 45 ticks: oldest pair dropped to get the latency back.");
+                }
+            }
+            if (!oldPending) {
+                heldStreak = 0;
+                DeliverGpuSlot(0, g_gpuSlot[0]);
+                DeliverGpuSlot(1, g_gpuSlot[1]);
+                ++g_sameTickOk;
+                rtpSame = 1;
+            } else {
+                ++g_sameTickHeld;
+                rtpSame = -2;
+            }
         } else {
             ++g_sameTickMissed;
+            rtpSame = -1;
         }
-        if ((g_sameTickOk + g_sameTickMissed) % 600 == 1)
+        if ((g_sameTickOk + g_sameTickMissed + g_sameTickHeld) % 600 == 1)
             vr::log::Line("VR-OUTPUT: same-tick submit " + std::to_string(g_sameTickOk) + " ok, " +
-                          std::to_string(g_sameTickMissed) + " left for the next tick, " + std::to_string(tickMismatch) +
-                          " pairs with different slot ticks.");
+                          std::to_string(g_sameTickMissed) + " left for the next tick (GPU), " + std::to_string(g_sameTickHeld) +
+                          " behind a queued pair, " + std::to_string(tickMismatch) + " pairs with different slot ticks.");
     }
     // Stereo: la coppia e' completa dopo l'occhio destro (mono: subito).
     if (eye == 0) return;
@@ -1817,14 +2102,28 @@ void OnPresent(IDirect3DDevice9* device, int eye) {
         bool both = g_ready[0].slot >= 0 && (g_ready[1].slot >= 0 || g_ready[0].cinema);
         if (both) g_frameReady = true;
         g_cv.notify_all();
+        const double rtpReady = QpcMs();
+        const uint32_t rtpTick = g_ready[0].tick;
         // Ritmo del gioco = ritmo del visore: si aspetta (al massimo 25 ms)
         // che il thread di uscita prenda la coppia appena consegnata, mentre
         // la GPU disegna gia' il frame seguente. Con outputtest 2 (nessuna
         // attesa del visore) il gioco corre libero.
         if (both && vr::control::g_outputTest < 2) {
             double tw = QpcMs();
-            g_cv.wait_for(lock, std::chrono::milliseconds(25), [] { return !g_frameReady; });
+            // 1/11: 3 periodi del compositor, almeno 25 ms e al massimo 60. Con 25 ms fissi uno stallo di 30 ms faceva
+            // correre il gioco a vuoto: coppia buttata e mondo che salta alla ripartenza. Tenerlo fermo con lo stallo fa
+            // solo ripetere un frame; poi il mondo riparte da dove era.
+            const double per = FramePeriodMs();
+            const double waitMax = (std::min)(60.0, (std::max)(25.0, 3.0 * per));
+            g_cv.wait_for(lock, std::chrono::duration<double, std::milli>(waitMax), [] { return !g_frameReady; });
             g_waitMs += QpcMs() - tw;
+        }
+        if (vr::control::g_tickProfLeft.load(std::memory_order_relaxed) > 0) {
+            char pb[200];
+            std::snprintf(pb, sizeof(pb), "RTP: seq=%u tick=%u t=%.3f gpuwait=%.2f same=%d both=%d workerwait=%.2f copy=%.2f", g_presentSeq, rtpTick, rtpStart,
+                          rtpReady - rtpStart, rtpSame, both ? 1 : 0, QpcMs() - rtpReady, g_copyMsAccum);
+            lock.unlock();
+            vr::log::Line(pb);
         }
     }
 }

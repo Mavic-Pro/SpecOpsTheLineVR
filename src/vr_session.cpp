@@ -303,8 +303,9 @@ bool PollEvents() {
             // solo di dare le azioni finche' dura, qui si logga e basta.
             {
                 char b[120];
+                // Sotto Proton il pid e' quello Linux, del gioco stesso: non si puo' dire "un'altra app".
                 snprintf(b, sizeof(b), "OpenVR: input focus %s (pid %u, old pid %u).",
-                         ev.eventType == vr::VREvent_InputFocusCaptured ? "captured by another app" : "released",
+                         ev.eventType == vr::VREvent_InputFocusCaptured ? "captured" : "released",
                          ev.data.process.pid, ev.data.process.oldPid);
                 vr::log::Line(b);
             }

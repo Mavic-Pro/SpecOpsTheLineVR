@@ -2129,12 +2129,20 @@ bool SafeCopy(void* to, const void* from, size_t n) {
     }
 }
 
+// Puntatore del gioco non verificato, sul thread di rendering: protetto (31/10).
+bool SafeDeviceInfo(uint32_t device, DIDEVICEINSTANCEW* di) {
+    __try {
+        return SUCCEEDED(reinterpret_cast<IDirectInputDevice8W*>(static_cast<uintptr_t>(device))->GetDeviceInfo(di));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 std::string DirectInputName(uint32_t device) {
     if (!device) return "none";
     DIDEVICEINSTANCEW di = {};
     di.dwSize = sizeof(di);
-    auto* d = reinterpret_cast<IDirectInputDevice8W*>(static_cast<uintptr_t>(device));
-    if (FAILED(d->GetDeviceInfo(&di))) return "unknown";
+    if (!SafeDeviceInfo(device, &di)) return "unknown";
     char name[260] = {};
     WideCharToMultiByte(CP_UTF8, 0, di.tszProductName, -1, name, sizeof(name) - 1, nullptr, nullptr);
     return name;

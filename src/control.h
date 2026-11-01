@@ -61,6 +61,7 @@ extern std::atomic<bool> g_cinemaActive;
 extern std::atomic<bool> g_cinemaForce;  // diagnostica: schermo virtuale anche in gameplay
 extern std::atomic<float> g_cinemaWidthM, g_cinemaDistM;
 extern std::atomic<int> g_outputTest;
+extern std::atomic<float> g_rtDelayMs;
 // Scala dell'immagine per occhio inviata al visore (1 = piena risoluzione):
 // meno pixel da leggere dalla GPU, piu' fps, meno nitidezza.
 extern std::atomic<float> g_outputScale;
@@ -73,6 +74,11 @@ extern std::atomic<bool> g_submitPoseAutoOn;
 // OpenXR con "submitpose on": gradi in piu' per lato del campo visivo disegnato
 // e dichiarato ("xroverscan <gradi>", 1,5; WI-1, review: chiave di taratura).
 extern std::atomic<float> g_xrOverscanDeg;
+// OpenXR: mutex rilasciato durante xrEndFrame e la copia degli occhi ("xrendunlock", predefinito on).
+extern std::atomic<bool> g_xrEndUnlocked;
+// Collaudo: "xrendstall <ms> <ogni N frame>", runtime lento dentro la fine del frame.
+extern std::atomic<int> g_xrEndStallMs;
+extern std::atomic<int> g_xrEndStallEvery;
 // Sperimentale: invia solo coppie di occhi presentate una dopo l'altra ("paircheck on").
 extern std::atomic<bool> g_pairCheck;
 // Pose di testa e controller predette per l'istante in cui il frame arriva
@@ -266,6 +272,12 @@ extern std::atomic<bool> g_camOwnYaw;
 // passo avanti mentre il corpo gira); "bodyalignwall on|off" = il corpo non torna sotto la testa con un muro o
 // un riparo basso davanti agli occhi (arretramento attivo o previsto lungo lo yaw della testa).
 extern std::atomic<bool> g_armsLead;
+// Orologio del gioco al passo del visore (1/11, vr::pure::GameClock, "smoothdt"); righe TICKP ("tickprof N").
+extern std::atomic<bool> g_hitBlood;  // sangue sullo schermo ai colpi (hooks.cpp, UpdateHitBlood)
+extern std::atomic<bool> g_smoothDt;
+extern std::atomic<bool> g_texShadow;
+extern std::atomic<bool> g_texDynamic;
+extern std::atomic<int> g_tickProfLeft;
 extern std::atomic<bool> g_bodyAlignWallStop;
 // Mano sinistra agganciata all'arma nella posa del gioco (dita chiuse
 // sull'arma) quando la tiene la presa a due mani (WI-4b: stessa prova della

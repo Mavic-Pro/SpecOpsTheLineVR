@@ -208,7 +208,7 @@ if ((Test-Path $other) -and -not (Test-Path (Join-Path $dst 'd3d9.dll'))) {
 # Controller bindings written by the mod (SteamVR Input).
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $dst 'specopsvr_input')
 Write-Host "SpecOpsTheLineVR removed from $dst (specopsvr.ini and the logs were kept)."
-Write-Host 'Remember to remove "-windowed ResX=2400 ResY=2500" from the Steam launch options.'
+Write-Host 'If you added "-windowed ResX=2400 ResY=2500" to the Steam launch options, remove it.'
 
 """
 
@@ -297,10 +297,9 @@ INSTALL
      GOG/Epic/other installs, usual game folders, then every drive); if it
      is not found, or to pick a copy, pass its folder:
      install.bat "D:\\Games\\Spec Ops The Line"
-  2. In Steam, game Properties > Launch options, add:
-       -windowed ResX=2400 ResY=2500
-     (the mod then uses the resolution the VR runtime recommends: change
-     sharpness in Virtual Desktop / the Oculus app / the SteamVR slider).
+  2. Nothing to set in Steam: the mod starts the game in a window by itself
+     and then uses the resolution the VR runtime recommends (change sharpness
+     in Virtual Desktop / the Oculus app / the SteamVR slider).
   3. Connect the headset (Virtual Desktop, Link or SteamVR) and start the game.
 
 UNINSTALL

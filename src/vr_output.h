@@ -43,10 +43,15 @@ bool EyeCant(int eye, float* fwd, float* right, float* up);
 
 // Frequenza del visore (Hz, 0 se ignota).
 float HmdRefreshHz();
+void StartRenderSampler(float seconds);  // collaudi: "rtsample <s>"
 
 // Attesa massima (ms) sul thread di rendering per inviare la coppia nello
 // stesso tick in cui e' stata disegnata; 0 = invio al tick seguente.
 void SetSameTickWait(float ms);
+// Un tick per frame del visore: da chiamare all'inizio di UGameEngine::Tick.
+void GateGameTick();
+// Periodo vero del compositor (ms): nominale o suo multiplo, misurato; 0 = sconosciuto.
+double FramePeriodMs();
 
 // Thread di rendering: percentuale della scena (ScreenPercentage) con cui e'
 // stata disegnata l'immagine dell'occhio; il ritaglio si restringe attorno al

@@ -4820,14 +4820,14 @@ static void TestTwoHandFollowsLeft() {
         ThGuardPoint(g, r, 0.30f, pl);
         const float dt = 1.0f / 72.0f;
         th::Output o;
-        for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+        for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, false, dt, g));
         CHECK(o.engaged && o.corrDeg < 0.05f);
         const float base[3] = {pl[0], pl[1], pl[2]};
         const int ramp = 14;  // 0,2 s
         for (int k = 1; k <= ramp + 29; ++k) {
             const float u = k < ramp ? static_cast<float>(k) / ramp : 1.0f;
             pl[1] = base[1] + up * u;
-            o = s.Step(ThInput(r, pl, true, dt, g));
+            o = s.Step(ThInput(r, pl, false, dt, g));
         }
         // L'astina del telaio finale passa per il palmo?
         const float dist = o.distOut;
@@ -4988,16 +4988,16 @@ static void TestTwoHandHysteresis() {
         for (int k = 0; k < 100; ++k) any = any || s.Step(ThInput(r, pl, true, dt, g)).engaged;
         CHECK(!any);
     }
-    {  // tenuta a 14 cm, rilascio a 16 cm
+    {  // senza grip: tenuta a 14 cm, rilascio a 16 cm (col grip: TestTwoHandGripWide)
         th::Solver s;
         at(0.0f, 0.35f, pl);
-        s.Step(ThInput(r, pl, true, dt, g));
+        for (int k = 0; k < 20; ++k) s.Step(ThInput(r, pl, false, dt, g));
         at(0.14f, 0.35f, pl);
         bool held = true;
-        for (int k = 0; k < 20; ++k) held = held && s.Step(ThInput(r, pl, true, dt, g)).engaged;
+        for (int k = 0; k < 20; ++k) held = held && s.Step(ThInput(r, pl, false, dt, g)).engaged;
         CHECK(held);
         at(0.16f, 0.35f, pl);
-        th::Output o = s.Step(ThInput(r, pl, true, dt, g));
+        th::Output o = s.Step(ThInput(r, pl, false, dt, g));
         CHECK(!o.engaged && o.event == 2);
     }
     {  // fuori dal segmento lungo la canna
@@ -5125,7 +5125,8 @@ static void TestTwoHandFilter() {
         const double rin = std::sqrt(sumIn / n), rout = std::sqrt(sumOut / n);
         std::printf("two-hand filter at %.0f Hz: input noise %.3f deg rms -> barrel %.3f deg rms\n", hz, rin, rout);
         CHECK(rin > 0.4 && rin < 0.6);
-        CHECK(rout <= 0.15);
+        // Rumore enorme (2 mm per asse, i controller veri fermi 0,3-0,5 mm): dal filtro meno pesante del 1/11.
+        CHECK(rout <= 0.35);
     }
 }
 
@@ -5236,8 +5237,8 @@ static void TestTwoHandVetoes() {
     }
 }
 
-// T12: controller sinistro perso per un tick: rilascio (scarto tenuto) e
-// stato azzerato; al ritorno la presa solo con le regole (grip o sosta).
+// T12: controller sinistro senza posa: per un tick (e fino a trackHoldS) la presa resta e la canna non si muove; oltre,
+// rilascio (scarto tenuto) e stato azzerato; al ritorno la presa solo con le regole (grip o sosta).
 static void TestTwoHandTrackingLoss() {
     th::Guard g = ThDefaultGuard();
     const float pos[3] = {0.0f, 1.2f, 0.0f};
@@ -5253,7 +5254,13 @@ static void TestTwoHandTrackingLoss() {
     th::Input lost = ThInput(r, pl, false, 1.0f / 72.0f, g);
     lost.leftValid = false;
     o = s.Step(lost);
-    CHECK(!o.engaged && o.event == 2 && ThBarrelDeg(o.gun, before) < 1e-3f);
+    CHECK(o.engaged && o.event != 2 && ThBarrelDeg(o.gun, before) < 0.05f);
+    for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, false, 1.0f / 72.0f, g));  // torna: niente e' successo
+    CHECK(o.engaged);
+    int ticks = 0;
+    while ((o = s.Step(lost)).engaged && ticks < 400) ++ticks;
+    CHECK(ticks >= 100 && ticks <= 112);  // ~1,5 s a 72 Hz
+    CHECK(o.event == 2 && ThBarrelDeg(o.gun, before) < 0.05f);
     o = s.Step(ThInput(r, pl, false, 1.0f / 72.0f, g));
     CHECK(!o.engaged);  // non subito: sosta di 150 ms
     int n = 1;
@@ -6024,13 +6031,13 @@ static void TestTwoHandNewReleases() {
         ThGuardPoint(g, r, g.fwd, pl);
         th::Solver s;
         th::Output o;
-        for (int k = 0; k < 40; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+        for (int k = 0; k < 40; ++k) o = s.Step(ThInput(r, pl, false, dt, g));
         const char* why = "";
         float apartAt = -1.0f;
         for (int k = 1; k <= 144; ++k) {
             ThRig r2 = ThRightRig(-5.0f, 60.0f * (k < 72 ? k / 72.0f : 1.0f), 0.0f, pos);
             const th::Output prev = o;
-            o = s.Step(ThInput(r2, pl, true, dt, g));
+            o = s.Step(ThInput(r2, pl, false, dt, g));
             if (o.event == 2) {
                 why = o.why;
                 apartAt = prev.apartDeg;
@@ -6138,6 +6145,483 @@ static void TestTwoHandMigration() {
 }
 
 // Chiavi nuove nel menu Advanced (passi) e nell'ini distribuito.
+// 1/11: col grip stretto la presa regge anche girando solo la sinistra: 15 cm all'astina (23 gradi) restano sul palmo,
+// senza grip la stessa mano l'avrebbe gia' rilasciata. Oltre gripReleaseM si lascia comunque.
+static void TestTwoHandGripWide() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    for (const bool grip : {true, false}) {
+        ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+        th::Solver s;
+        float pl[3];
+        ThGuardPoint(g, r, g.fwd, pl);
+        th::Output o;
+        for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, grip, dt, g));
+        CHECK(o.engaged && o.byGrip == grip);
+        const float x0 = pl[0], z0 = pl[2];
+        float f0[3], r0[3], u0[3];
+        th::GunAxes(r.gun, f0, r0, u0);
+        // La sinistra va di lato di 15 cm a 30 cm/s; la destra non gira.
+        bool released = false;
+        for (int k = 1; k <= 45; ++k) {
+            const float m = 0.30f * dt * k;
+            pl[0] = x0 + r0[0] * m;
+            pl[2] = z0 + r0[2] * m;
+            o = s.Step(ThInput(r, pl, grip, dt, g));
+            released = released || !o.engaged;
+        }
+        if (grip) {
+            CHECK(!released);
+            CHECK(o.weight > 0.999f);
+            // La canna passa ancora per il palmo sinistro.
+            CHECK(o.distOut < 0.02f);
+        } else {
+            CHECK(released);
+        }
+    }
+    // Col grip, oltre gripReleaseM (35 cm all'astina) la mano se ne e' andata: rilascio.
+    ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    th::Solver s;
+    float pl[3];
+    ThGuardPoint(g, r, g.fwd, pl);
+    th::Output o;
+    for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+    float f0[3], r0[3], u0[3];
+    th::GunAxes(r.gun, f0, r0, u0);
+    const float x0 = pl[0], z0 = pl[2];
+    bool released = false;
+    for (int k = 1; k <= 120 && !released; ++k) {
+        const float m = 0.60f * dt * k;
+        pl[0] = x0 + r0[0] * m;
+        pl[2] = z0 + r0[2] * m;
+        o = s.Step(ThInput(r, pl, true, dt, g));
+        released = !o.engaged;
+    }
+    CHECK(released);
+}
+
+// 1/11: un controller non tracciato (coperto dall'altro): la sua posizione stimata salta di 10 cm e la canna non si
+// muove; se la destra gira, la canna gira con lei; al ritorno passa a quella vera senza scatti; dopo trackHoldS la
+// posizione si riprende comunque; un runtime che non dice mai "tracciato" non blocca la mira.
+// La relazione della tenuta nasce dentro la presa: quella di una mano che sta arrivando non gira la canna (revisione 1/11).
+static void TestTwoHandHoldOnlyInsideGrip() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    float pl[3];
+    ThGuardPoint(g, r, g.fwd, pl);
+    const float away[3] = {pl[0] + 0.05f, pl[1] - 0.20f, pl[2] - 0.15f};
+    float gunOk[3][4], gunLost[3][4];
+    for (int lost = 0; lost < 2; ++lost) {
+        th::Solver s;
+        th::Output o;
+        // La mano e' lontana, tracciata; poi arriva sulla canna e chiude il grip.
+        for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, away, false, dt, g));
+        for (int k = 0; k <= 30; ++k) {
+            const float t = static_cast<float>(k) / 30.0f;
+            float at[3];
+            for (int i = 0; i < 3; ++i) at[i] = away[i] + (pl[i] - away[i]) * t;
+            th::Input in = ThInput(r, at, false, dt, g);
+            in.leftTracked = !(lost && k >= 10);  // persa 20 tick prima di arrivare
+            o = s.Step(in);
+        }
+        for (int k = 0; k < 60; ++k) {
+            th::Input in = ThInput(r, pl, true, dt, g);
+            in.leftTracked = !lost;
+            o = s.Step(in);
+        }
+        CHECK(o.engaged);
+        std::memcpy(lost ? gunLost : gunOk, o.gun, sizeof(gunOk));
+    }
+    CHECK(ThBarrelDeg(gunLost, gunOk) < 0.5f);
+}
+
+// Tracciamento che va e viene (1 tick su 10): la tenuta resta limitata, poi conta la posizione vera.
+static void TestTwoHandFlappingTracking() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    float pl[3];
+    ThGuardPoint(g, r, g.fwd, pl);
+    th::Solver s;
+    th::Output o;
+    for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+    CHECK(o.engaged);
+    float held[3][4];
+    std::memcpy(held, o.gun, sizeof(held));
+    const float moved[3] = {pl[0] + 0.05f, pl[1], pl[2]};
+    float early = 0.0f;
+    for (int k = 0; k < 300; ++k) {
+        th::Input in = ThInput(r, moved, true, dt, g);
+        in.leftTracked = k % 10 == 9;
+        o = s.Step(in);
+        if (k == 60) early = ThBarrelDeg(o.gun, held);
+    }
+    CHECK(early < 0.5f);                          // dentro la tenuta: fermo
+    CHECK(ThBarrelDeg(o.gun, held) > 1.0f);       // oltre: non resta su una relazione vecchia
+}
+
+// Controller sinistro senza posa dentro la presa: la canna resta, poi per trackHoldS la presa cade come prima.
+static void TestTwoHandHardLoss() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    float pl[3];
+    ThGuardPoint(g, r, g.fwd, pl);
+    th::Solver s;
+    th::Output o;
+    for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+    CHECK(o.engaged);
+    float held[3][4];
+    std::memcpy(held, o.gun, sizeof(held));
+    th::Input lost = ThInput(r, pl, true, dt, g);
+    lost.leftValid = false;
+    std::memset(lost.palmL, 0, sizeof(lost.palmL));
+    std::memset(lost.leftRaw, 0, sizeof(lost.leftRaw));
+    for (int k = 0; k < 90; ++k) {
+        o = s.Step(lost);
+        CHECK(o.engaged);
+    }
+    CHECK(ThBarrelDeg(o.gun, held) < 0.05f);
+    // La destra gira: la canna la segue, come col tracciamento perso.
+    ThRig r2 = ThRightRig(0.0f, 15.0f, 0.0f, pos);
+    th::Input lost2 = ThInput(r2, pl, true, dt, g);
+    lost2.leftValid = false;
+    std::memset(lost2.palmL, 0, sizeof(lost2.palmL));
+    for (int k = 0; k < 20; ++k) o = s.Step(lost2);
+    CHECK(o.engaged);
+    CHECK(ThBarrelDeg(o.gun, r2.gun) < 0.5f);
+    // Oltre trackHoldS la presa cade.
+    for (int k = 0; k < 120; ++k) o = s.Step(lost2);
+    CHECK(!o.engaged);
+}
+
+// Tracciamento che torna dopo la fine della tenuta: dalla stima alla posizione vera senza scatto.
+static void TestTwoHandReturnAfterExpiredHold() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    float pl[3];
+    ThGuardPoint(g, r, g.fwd, pl);
+    th::Solver s;
+    th::Output o;
+    for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+    CHECK(o.engaged);
+    // Stima alla deriva: 5 cm di lato, per 3 s (la tenuta finisce a 1,5 s).
+    const float drift[3] = {pl[0] + 0.05f, pl[1], pl[2]};
+    for (int k = 0; k < 270; ++k) {
+        th::Input in = ThInput(r, drift, true, dt, g);
+        in.leftTracked = false;
+        o = s.Step(in);
+    }
+    CHECK(o.engaged);
+    float prev[3][4];
+    std::memcpy(prev, o.gun, sizeof(prev));
+    float worst = 0.0f;
+    for (int k = 0; k < 60; ++k) {
+        o = s.Step(ThInput(r, pl, true, dt, g));
+        const float st = ThBarrelDeg(o.gun, prev);
+        worst = st > worst ? st : worst;
+        std::memcpy(prev, o.gun, sizeof(prev));
+    }
+    CHECK(worst < 1.2f);
+    CHECK(ThBarrelDeg(o.gun, r.gun) < 0.5f);
+}
+
+static void TestTwoHandTrackingHold() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    ThRig r = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    th::Solver s;
+    float pl[3];
+    ThGuardPoint(g, r, g.fwd, pl);
+    th::Output o;
+    for (int k = 0; k < 30; ++k) o = s.Step(ThInput(r, pl, true, dt, g));
+    CHECK(o.engaged);
+    float held[3][4];
+    std::memcpy(held, o.gun, sizeof(held));
+    float bad[3] = {pl[0] + 0.10f, pl[1] - 0.05f, pl[2]};
+    for (int k = 0; k < 40; ++k) {
+        th::Input in = ThInput(r, bad, true, dt, g);
+        in.leftTracked = false;
+        o = s.Step(in);
+    }
+    CHECK(o.engaged);
+    CHECK(ThBarrelDeg(o.gun, held) < 0.05f);
+    // La destra gira di 20 gradi: la canna la segue, la relazione resta.
+    ThRig r2 = ThRightRig(0.0f, 20.0f, 0.0f, pos);
+    for (int k = 0; k < 20; ++k) {
+        th::Input in = ThInput(r2, bad, true, dt, g);
+        in.leftTracked = false;
+        o = s.Step(in);
+    }
+    CHECK(ThBarrelDeg(o.gun, r2.gun) < ThBarrelDeg(held, r.gun) + 0.3f);
+    // Ritorno: niente scatti oltre il passo del passaggio (0,2 s).
+    ThRig r3 = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+    float prev[3][4];
+    for (int k = 0; k < 10; ++k) {
+        th::Input in = ThInput(r3, bad, true, dt, g);
+        in.leftTracked = false;
+        o = s.Step(in);
+    }
+    std::memcpy(prev, o.gun, sizeof(prev));
+    float worst = 0.0f;
+    for (int k = 0; k < 45; ++k) {
+        o = s.Step(ThInput(r3, pl, true, dt, g));
+        const float st = ThBarrelDeg(o.gun, prev);
+        worst = st > worst ? st : worst;
+        std::memcpy(prev, o.gun, sizeof(prev));
+    }
+    CHECK(worst < 1.5f);
+    CHECK(ThBarrelDeg(o.gun, held) < 0.1f);
+    // Oltre trackHoldS (1,5 s) la posizione stimata torna a contare.
+    {
+        th::Solver s2;
+        ThRig ra = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+        for (int k = 0; k < 30; ++k) o = s2.Step(ThInput(ra, pl, true, dt, g));
+        float far[3] = {pl[0] + 0.05f, pl[1], pl[2]};
+        for (int k = 0; k < 200; ++k) {
+            th::Input in = ThInput(ra, far, true, dt, g);
+            in.leftTracked = false;
+            o = s2.Step(in);
+        }
+        CHECK(ThBarrelDeg(o.gun, held) > 1.0f);
+    }
+    // Runtime che non dice mai "tracciato": la mano guida lo stesso.
+    {
+        th::Solver s3;
+        ThRig ra = ThRightRig(0.0f, 0.0f, 0.0f, pos);
+        th::Output o3;
+        for (int k = 0; k < 30; ++k) {
+            th::Input in = ThInput(ra, pl, true, dt, g);
+            in.leftTracked = false;
+            in.rightTracked = false;
+            o3 = s3.Step(in);
+        }
+        CHECK(o3.engaged);
+        float far[3] = {pl[0] + 0.05f, pl[1], pl[2]};
+        for (int k = 0; k < 60; ++k) {
+            th::Input in = ThInput(ra, far, true, dt, g);
+            in.leftTracked = false;
+            in.rightTracked = false;
+            o3 = s3.Step(in);
+        }
+        CHECK(ThBarrelDeg(o3.gun, held) > 1.0f);
+    }
+}
+
+// 1/11: filtro della linea tra i palmi: una piccola correzione arriva subito, gli scatti non restano indietro.
+static void TestTwoHandFastCorrection() {
+    const float pos[3] = {0.0f, 1.2f, 0.0f};
+    th::Guard g = ThDefaultGuard();
+    const float dt = 1.0f / 90.0f;
+    ThRig r = ThRightRig(-5.0f, 0.0f, 0.0f, pos);
+    th::Solver s;
+    float pl0[3];
+    ThGuardPoint(g, r, 0.35f, pl0);
+    th::Output o;
+    for (int k = 0; k < 90; ++k) o = s.Step(ThInput(r, pl0, true, dt, g));
+    float f0[3], r0[3], u0[3];
+    th::GunAxes(r.gun, f0, r0, u0);
+    float start[3][4];
+    std::memcpy(start, o.gun, sizeof(start));
+    // 1 grado in 0,15 s (legge di minimo jerk) con la sola sinistra.
+    const float a = 0.35f * std::tan(1.0f * 0.01745329252f);
+    int when = -1;
+    for (int k = 1; k < 90; ++k) {
+        const float u = (std::min)(1.0f, k * dt / 0.15f);
+        const float m = a * (10 * u * u * u - 15 * u * u * u * u + 6 * u * u * u * u * u);
+        float pl[3] = {pl0[0] + r0[0] * m, pl0[1] + r0[1] * m, pl0[2] + r0[2] * m};
+        o = s.Step(ThInput(r, pl, true, dt, g));
+        if (when < 0 && ThBarrelDeg(o.gun, start) >= 0.9f) when = k;
+    }
+    std::printf("two-hand correction of 1 deg in 0.15 s: 90%% after %.0f ms\n", when * dt * 1000.0f);
+    CHECK(when > 0 && when * dt < 0.18f);
+}
+
+// Dopo un caricamento o un salvataggio i tick lunghi non diventano il passo del mondo sui tick normali (revisione 1/11).
+static void TestGameClockAfterStall() {
+    using vr::pure::GameClock;
+    const float T = 1.0f / 90.0f;
+    for (const float second : {0.120f, 0.030f, 0.0005f}) {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 30; ++i) c.Step(T, T);
+        CHECK(Near(c.Step(0.6f, T), 0.6f));
+        CHECK(Near(c.Step(second, T), second, 1e-5f));  // quello vero
+        double real = 0.0, game = 0.0;
+        float worst = 0.0f, least = 1.0f;
+        for (int i = 0; i < 300; ++i) {
+            const float dt = c.Step(T, T);
+            real += T;
+            game += dt;
+            worst = (std::max)(worst, dt);
+            least = (std::min)(least, dt);
+        }
+        CHECK(worst < 1.05f * T);
+        CHECK(least > 0.95f * T);
+        CHECK(std::fabs(real - game) < 0.5 * T);
+    }
+    // Fine di un caricamento (tick lunghi che si accorciano), poi normali: mai avanti al tempo vero oltre la fascia,
+    // niente rallentatore dopo.
+    {
+        GameClock c;
+        c.Step(0.6f, T);
+        double real = 0.0, game = 0.0;
+        for (const float ms : {120.0f, 100.0f, 90.0f, 60.0f, 40.0f}) {
+            real += ms * 0.001;
+            game += c.Step(ms * 0.001f, T);
+            CHECK(game - real < 2.0 * T);
+        }
+        float least = 1.0f, most = 0.0f;
+        for (int i = 0; i < 300; ++i) {
+            const float dt = c.Step(T, T);
+            real += T;
+            game += dt;
+            CHECK(game - real < 2.0 * T);
+            least = (std::min)(least, dt);
+            most = (std::max)(most, dt);
+        }
+        CHECK(std::fabs(real - game) < 2.0 * T);
+        CHECK(std::fabs(c.est - T) < 0.04 * T);
+        CHECK(least > 0.5f * T);
+        CHECK(most < 1.1f * T);
+    }
+    // Il ritardo dopo un frame perso non resta sul bordo della fascia: torna al centro.
+    {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 300; ++i) c.Step(T, T);
+        c.Step(2.0f * T, T);
+        const double after = c.lag;
+        float worst = 0.0f;
+        for (int i = 0; i < 2000; ++i) worst = (std::max)(worst, c.Step(T, T));
+        CHECK(std::fabs(c.lag) < 0.1 * std::fabs(after));
+        CHECK(worst < 1.01f * T);
+    }
+    // Periodo vero appena diverso da quello dichiarato (0,05%): il ritardo si ferma lontano dal bordo.
+    {
+        GameClock c;
+        c.Step(T, T);
+        const float raw = T * 1.0005f;
+        for (int i = 0; i < 20000; ++i) c.Step(raw, T);
+        CHECK(std::fabs(c.lag) < 0.75 * 1.5 * T);
+    }
+    // Gioco davvero lento dopo il caricamento (30 fps): la media e' subito la sua.
+    {
+        GameClock c;
+        c.Step(0.6f, T);
+        const float raw = 1.0f / 30.0f;
+        c.Step(raw, T);
+        c.Step(raw, T);
+        CHECK(c.valid);
+        double real = 0.0, game = 0.0;
+        float worst = 0.0f;
+        for (int i = 0; i < 300; ++i) {
+            const float dt = c.Step(raw, T);
+            real += raw;
+            game += dt;
+            worst = (std::max)(worst, dt);
+        }
+        CHECK(worst < 1.05f * raw);
+        CHECK(std::fabs(real - game) < raw);
+    }
+    // Tick corti prima di una pausa: non contano per il cambio di regime dopo.
+    {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 60; ++i) c.Step(T, T);
+        c.Step(0.002f, T);
+        c.Step(0.002f, T);
+        c.Step(0.6f, T);
+        c.Step(T, T);
+        c.Step(T, T);
+        c.Step(0.002f, T);  // un tick corto da solo
+        CHECK(c.est > 0.9 * T);
+        c.Step(T, T);
+        c.Reset();
+        CHECK(!c.valid && c.warm == 0 && c.shortRun == 0 && c.longRun == 0);
+    }
+    // Tick sempre diversi: dopo 8 il piu' corto, mai quello lungo.
+    {
+        GameClock c;
+        c.Step(0.6f, T);
+        for (int i = 0; i < 9; ++i) c.Step((i % 2 ? 0.2f : 0.01f) + 0.005f * static_cast<float>(i), T);
+        CHECK(c.valid);
+        CHECK(c.est < 0.02);
+    }
+}
+
+static void TestGameClock() {
+    using vr::pure::GameClock;
+    const float T = 1.0f / 90.0f;
+    // Tick regolari: passo uguale al periodo del visore.
+    {
+        GameClock c;
+        c.Step(T, T);
+        c.Step(T, T);
+        for (int i = 0; i < 300; ++i) CHECK(Near(c.Step(T + (i % 2 ? 0.0003f : -0.0003f), T), T));
+    }
+    // Ritardi recuperati (17,5 + 4,2 ms, 25 + 3 + 5 ms): il passo non cambia, nessun salto del mondo.
+    {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 300; ++i) c.Step(T, T);
+        for (const float ms : {17.5f, 4.2f, 11.1f, 25.1f, 3.1f, 5.1f, 11.1f, 11.1f}) {
+            const float dt = c.Step(ms * 0.001f, T);
+            CHECK(std::fabs(dt - T) < 0.0005f);
+        }
+    }
+    // Frame perso (22 ms): il mondo non salta e il ritardo si recupera piano.
+    {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 300; ++i) c.Step(T, T);
+        float worst = 0.0f;
+        for (int k = 0; k < 3; ++k) worst = (std::max)(worst, c.Step(2.0f * T, T));
+        for (int i = 0; i < 200; ++i) worst = (std::max)(worst, c.Step(T, T));
+        CHECK(worst < 1.35f * T);
+        CHECK(std::fabs(c.lag) < 2.0 * T);  // dentro la fascia morta (recupero solo oltre)
+    }
+    // Tempo lungo periodo: il gioco non va al rallentatore sotto la frequenza del visore.
+    for (const float rate : {60.0f, 45.0f, 80.0f, 120.0f}) {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 90; ++i) c.Step(T, T);
+        double real = 0.0, game = 0.0;
+        for (int i = 0; i < 900; ++i) {
+            const float raw = 1.0f / rate;
+            real += raw;
+            game += c.Step(raw, T);
+        }
+        CHECK(std::fabs(real - game) < 0.25);
+        CHECK(std::fabs(c.est - 1.0 / rate) < 0.0015);
+    }
+    // Caricamento: passa com'e' e riparte.
+    {
+        GameClock c;
+        c.Step(T, T);
+        for (int i = 0; i < 30; ++i) c.Step(T, T);
+        CHECK(Near(c.Step(2.5f, T), 2.5f));
+        CHECK(!c.valid);
+        CHECK(Near(c.Step(T, T), T));
+    }
+    // Senza visore: segue la media.
+    {
+        GameClock c;
+        c.Step(0.016f, 0.0f);
+        float dt = 0.0f;
+        for (int i = 0; i < 200; ++i) dt = c.Step(0.016f, 0.0f);
+        CHECK(std::fabs(dt - 0.016f) < 0.0005f);
+    }
+}
+
 static void TestTwoHandKeys() {
     CHECK(MenuStepFor("twohandgrip", 8.0f).step == 1.0f);
     CHECK(MenuStepFor("twohandrelease", 15.0f).step == 1.0f);
@@ -6713,6 +7197,15 @@ int main() {
     TestTwoHandRollAlong();
     TestTwoHandSlide();
     TestTwoHandJitter();
+    TestTwoHandGripWide();
+    TestTwoHandTrackingHold();
+    TestTwoHandFastCorrection();
+    TestGameClock();
+    TestGameClockAfterStall();
+    TestTwoHandHoldOnlyInsideGrip();
+    TestTwoHandHardLoss();
+    TestTwoHandReturnAfterExpiredHold();
+    TestTwoHandFlappingTracking();
     TestTwoHandRegrabAlong();
     TestTwoHandSteerLag();
     TestTwoHandNewReleases();

@@ -32,7 +32,9 @@
 #include <mutex>
 #include <cstdint>
 #include <cmath>
+#include <list>
 #include <map>
+#include <unordered_map>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -447,6 +449,7 @@ HRESULT WINAPI Hooked_BeginScene(IDirect3DDevice9* self) {
 // rilegge le impostazioni (es. cambiando le opzioni grafiche).
 const uintptr_t& kGSystemSettings = vr::addr::g[vr::addr::GSystemSettings];
 const uintptr_t& kGSystemSettingsVTable = vr::addr::g[vr::addr::GSystemSettingsVTable];
+constexpr uintptr_t kSettingScreenPercentage = 0x360;  // FSystemSettings::ScreenPercentage (float), trovato per confronto dal gioco vivo
 constexpr int kSettingMotionBlur = 4 + 0x30;
 constexpr int kSettingDepthOfField = 4 + 0x38;
 // AmbientOcclusion +0x3C (stessa tabella, 28/10). In VR fa ghosting (tester
@@ -630,6 +633,9 @@ std::atomic<int> g_screenPercent{100};
 // Ultimo cambio di ScreenPercentage (ProfMs) e tick lungo da misurare dopo
 // (riga DYNRES con il costo di "scale set", WI-1).
 std::atomic<double> g_dynResChangeMs{0.0};
+int g_pendingScreenPercent = 0;  // da applicare a inizio tick (solo thread di gioco); 0 = niente
+bool g_engineTickHooked = false;  // chi applica la richiesta: senza, "scale set" come prima
+const uintptr_t& kFlushRenderingCommandsAddr = vr::addr::g[vr::addr::FlushRenderingCommands];
 std::atomic<int> g_dynResCostPending{0};  // tick da misurare: quello del cambio e il seguente
 // p90 della GPU per tick stereo visto dal controllore (riga GPU), WI-1.
 std::atomic<float> g_dynResP90{0.0f};
@@ -1223,6 +1229,7 @@ HRESULT PresentBody(IDirect3DDevice9* self, F&& callOriginal) {
     if (vr::control::TakeScreenshotRequest(&shotPath)) {
         vr::screenshot::SaveBackBuffer(self, shotPath);
     }
+    if (eye >= 0 && vr::screenshot::ThumbsActive()) vr::screenshot::ThumbFrame(self, eye, g_screenPercent);
     double tOut = ProfMs();
     vr::output::OnPresent(self, eye);
     const double outMs = ProfMs() - tOut;
@@ -1955,7 +1962,15 @@ HRESULT WINAPI Hooked_DrawPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UIN
 }
 HRESULT WINAPI Hooked_DrawIndexedPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bv, UINT mi, UINT nv, UINT si, UINT pc) {
     LogHudDraw(d, "DIP", pc, nullptr, 0);
-    if (g_gqNeedStart && vr::control::g_gpuTimer) GpuFrameStart(d);
+    if (g_gqNeedStart && vr::control::g_gpuTimer) {
+        // "rtdelay <ms>" (collaudo): thread di rendering lento, per occhio, all'inizio del frame: su questo PC finisce
+        // sempre molto prima del tick seguente e tanti problemi di un PC medio non si vedono.
+        if (const float delay = vr::control::g_rtDelayMs.load(std::memory_order_relaxed); delay > 0.0f) {
+            const double t0 = ProfMs();
+            while (ProfMs() - t0 < delay) YieldProcessor();
+        }
+        GpuFrameStart(d);
+    }
     if (vr::control::g_dynResTestFrames > 0) {
         // Larghezza massima del viewport sui render target grandi come il back buffer.
         D3DVIEWPORT9 vp;
@@ -1979,8 +1994,48 @@ struct CanvasMatrixState {
     float orig[16], adj[16];
     float full[16];  // effetti a tutta vista: nello spazio dell'occhio, ristretta come la scena
     bool fullEye = false;  // "full" gia' calcolata da AdjustCanvasMatrix (proiezione decentrata)
+    float blood[16];       // pannelli del sangue: come "full", con la banda 16:9 della UI stirata a tutta altezza
+    bool bloodValid = false;
 };
 CanvasMatrixState g_canvasState;
+
+// Sangue sullo schermo (1/11, "il sangue davanti agli occhi da' fastidio"). YFourthWallHealthFeedback apre la scena
+// uiscene_bloodHud_fast: 8 pannelli (Stage1 > Image1) lungo i bordi, che diventano opachi con i colpi. Non sono quad
+// a tutto schermo, quindi passavano per la matrice dell'HUD (hud 0.3) e finivano in un riquadro a spigoli vivi vicino
+// al centro della vista, nella banda 16:9 della UI (1296x729 su un occhio 1296x1440). I loro rettangoli (UIObject.
+// RenderBounds) si leggono dal thread di gioco e questi disegni vanno ai bordi veri della vista, per ogni occhio.
+constexpr int kMaxBloodRects = 16;
+std::atomic<float> g_bloodRect[kMaxBloodRects][4];
+std::atomic<int> g_bloodRectCount{0};
+std::atomic<float> g_bloodUiHeight{0.0f};
+std::atomic<uint32_t> g_bloodPanelDraws{0};
+
+// Riquadro dei vertici di un disegno del Canvas (x, y in testa a ogni vertice).
+void CanvasDrawBox(UINT nv, const void* v, UINT stride, float* minX, float* minY, float* maxX, float* maxY) {
+    *minX = *minY = 1e9f;
+    *maxX = *maxY = -1e9f;
+    const char* p = static_cast<const char*>(v);
+    for (UINT i = 0; i < nv; ++i) {
+        const float* xy = reinterpret_cast<const float*>(p + i * stride);
+        *minX = (std::min)(*minX, xy[0]);
+        *maxX = (std::max)(*maxX, xy[0]);
+        *minY = (std::min)(*minY, xy[1]);
+        *maxY = (std::max)(*maxY, xy[1]);
+    }
+}
+
+bool IsBloodPanelDraw(UINT nv, const void* v, UINT stride) {
+    const int n = g_bloodRectCount.load(std::memory_order_relaxed);
+    if (n <= 0 || !v || stride < 8 || nv < 3 || nv > 64) return false;
+    float minX, minY, maxX, maxY;
+    CanvasDrawBox(nv, v, stride, &minX, &minY, &maxX, &maxY);
+    for (int i = 0; i < n; ++i) {
+        if (std::fabs(minX - g_bloodRect[i][0].load(std::memory_order_relaxed)) < 3.0f && std::fabs(minY - g_bloodRect[i][1].load(std::memory_order_relaxed)) < 3.0f &&
+            std::fabs(maxX - g_bloodRect[i][2].load(std::memory_order_relaxed)) < 3.0f && std::fabs(maxY - g_bloodRect[i][3].load(std::memory_order_relaxed)) < 3.0f)
+            return true;
+    }
+    return false;
+}
 
 // Disegno del Canvas che copre quasi tutto lo schermo (sangue ai bordi quando
 // si e' feriti, lampi, dissolvenze): con la matrice originale, a tutta vista.
@@ -1988,20 +2043,20 @@ CanvasMatrixState g_canvasState;
 // occhi (playtest 19/10).
 bool IsFullScreenCanvasDraw(UINT nv, const void* v, UINT stride) {
     if (!g_canvasState.adjusted || !v || stride < 8 || nv < 3 || nv > 4096 || !g_backBufferW || !g_backBufferH) return false;
-    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
-    const char* p = static_cast<const char*>(v);
-    for (UINT i = 0; i < nv; ++i) {
-        const float* xy = reinterpret_cast<const float*>(p + i * stride);
-        minX = (std::min)(minX, xy[0]);
-        maxX = (std::max)(maxX, xy[0]);
-        minY = (std::min)(minY, xy[1]);
-        maxY = (std::max)(maxY, xy[1]);
-    }
+    float minX, minY, maxX, maxY;
+    CanvasDrawBox(nv, v, stride, &minX, &minY, &maxX, &maxY);
     return maxX - minX > 0.85f * g_backBufferW && maxY - minY > 0.85f * g_backBufferH;
 }
 
 template <typename Draw>
 HRESULT DrawCanvasMaybeFullScreen(IDirect3DDevice9* d, UINT nv, const void* v, UINT stride, Draw draw) {
+    if (g_canvasState.adjusted && g_canvasState.bloodValid && IsBloodPanelDraw(nv, v, stride)) {
+        ++g_bloodPanelDraws;
+        g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.blood, 4);
+        HRESULT hr = draw();
+        g_SetVertexShaderConstantF_Original(d, g_canvasState.reg, g_canvasState.adj, 4);
+        return hr;
+    }
     if (!IsFullScreenCanvasDraw(nv, v, stride)) return draw();
     // Matrice originale ma ristretta come la scena: con la risoluzione dinamica
     // al 70% la scena occupa il 70% centrale, e il sangue ai bordi disegnato a
@@ -2119,6 +2174,19 @@ bool AdjustCanvasMatrix(UINT start, const float* data, UINT count, float* out, f
                 fullOut[4 * i + 1] *= pk;
             }
             *fullOk = true;
+            // Pannelli del sangue: y_ndc = 1 - 2 py / altezza back buffer -> 1 - 2 py / altezza della UI.
+            const float uiH = g_bloodUiHeight.load(std::memory_order_relaxed);
+            const float k = uiH > 16.0f && g_backBufferH ? float(g_backBufferH) / uiH : 1.0f;
+            const float c = 1.0f - k;
+            std::memcpy(g_canvasState.blood, data, sizeof(float) * 16);
+            for (int i = 0; i < 4; ++i) {
+                float* m = g_canvasState.blood;
+                m[4 * i + 1] = m[4 * i + 1] * k + c * m[4 * i + 3];
+                m[4 * i + 0] = m[4 * i + 0] * th * pj.m00 + (parInf * pj.m00 + pj.m20) * m[4 * i + 3];
+                m[4 * i + 1] = m[4 * i + 1] * tv * pj.m11 + (parY * pj.m11 + pj.m21) * m[4 * i + 3];
+                m[4 * i + 0] *= pk;
+                m[4 * i + 1] *= pk;
+            }
         }
         for (int i = 0; i < 4; ++i) {
             out[4 * i + 0] = out[4 * i + 0] * th * pj.m00 + (par * pj.m00 + pj.m20) * out[4 * i + 3];
@@ -2154,6 +2222,7 @@ HRESULT WINAPI Hooked_SetVertexShaderConstantF(
         std::memcpy(g_canvasState.orig, pConstantData, sizeof(g_canvasState.orig));
         std::memcpy(g_canvasState.adj, hud, sizeof(g_canvasState.adj));
         g_canvasState.fullEye = fullEyeOk;
+        g_canvasState.bloodValid = fullEyeOk;  // calcolata con quella a tutta vista; col cannocchiale non c'e', mai una vecchia
         if (fullEyeOk) {
             std::memcpy(g_canvasState.full, fullEye, sizeof(g_canvasState.full));
         } else {
@@ -3544,8 +3613,10 @@ uint32_t* ViewStateSlot(char* cam) {
 }
 
 // Stato da usare per l'occhio destro (0 = condiviso, come il gioco).
+uint32_t g_rightEyeViewState = 0;
 uint32_t RightEyeViewState(uint32_t engineState) {
-    static uint32_t owner = 0, mine = 0;
+    static uint32_t owner = 0;
+    uint32_t& mine = g_rightEyeViewState;
     static bool failed = false;
     if (!vr::control::g_perEyeViewState || failed) return 0;
     if (engineState != owner) {
@@ -3656,6 +3727,29 @@ void UpdateAutoResolution(char* cam) {
     if (vr::control::g_cinemaActive) g_relayoutFrames = 20;
 }
 
+// Cambio di ScreenPercentage (1/11). "scale set" scarica il rendering, scrive il valore, salva l'ini e scrive il dump
+// nel log: 12-13 ms in mezzo al tick (la scarica aspetta tutto il frame in corso), un frame perso a ogni scatto, e il
+// valore finiva nelle impostazioni del gioco (avvio al 65%, 21/10). Senza scarica non si puo': il thread di rendering
+// rilegge il valore a fine frame (NeedsUpscale, UnScaleScreenCoords, in FSceneRenderer::Render e 0x00F2F850), e un frame
+// disegnato con la percentuale vecchia veniva fuori ingrandito o in un riquadro (uno per ogni scatto e ogni occhio: visto
+// con "thumbs" + "rtdelay 3", il PC di sviluppo finisce il frame prima e non lo mostra). Quindi si scarica a inizio tick, prima del
+// cancello: quell'attesa e' tempo morto, il frame finito va comunque al visore, e il prossimo nasce gia' col valore nuovo.
+void ApplyPendingScreenPercent() {
+    const int pct = g_pendingScreenPercent;
+    if (!pct) return;
+    g_pendingScreenPercent = 0;
+    const double t0 = ProfMs();
+    reinterpret_cast<void(__cdecl*)()>(kFlushRenderingCommandsAddr)();  // FlushRenderingCommands (0x006B2300)
+    const double waited = ProfMs() - t0;
+    *reinterpret_cast<float*>(kGSystemSettings + kSettingScreenPercentage) = static_cast<float>(pct);
+    g_screenPercent = pct;
+    g_dynResChangeMs = ProfMs();
+    g_dynResCostPending = 2;
+    char b[100];
+    std::snprintf(b, sizeof(b), "DYNRES: scene now %d%%, render thread finished in %.1f ms", pct, waited);
+    vr::log::Line(b);
+}
+
 void UpdateDynamicResolution(char* cam, bool mono) {
     // Controllore con isteresi e memoria dei livelli falliti (WI-1, vedi
     // vr::pure::DynResController): prima 80% <-> 85% ogni 0,7-1,4 s.
@@ -3711,27 +3805,140 @@ void UpdateDynamicResolution(char* cam, bool mono) {
         g_dynResP90 = ctl.lastP90;
     }
     {
-        // Invio nello stesso tick: solo con la GPU sotto meta' del frame del
-        // visore; si aspetta al massimo un quarto di frame.
+        // Invio nello stesso tick: solo con la GPU sotto il 60% del frame del visore; si aspetta al massimo il
+        // 60% del frame (1/11: con un quarto di frame, 2,8 ms a 90 Hz, la copia sforava di poco nella scena di
+        // collaudo e ogni volta partiva un tick in piu'; il thread di rendering qui non ha altro da fare).
+        // Periodo misurato del compositor: a meta' frequenza c'e' piu' tempo di quello nominale.
         float gpu = g_gpuTickMsEma, frame = hz > 30.0f ? 1000.0f / hz : 0.0f;
-        bool ok = vr::control::g_lowLatency && frame > 0.0f && gpu > 0.0f && gpu < 0.5f * frame;
-        vr::output::SetSameTickWait(ok ? 0.25f * frame : 0.0f);
+        if (fakeBudget <= 0.0f && frame > 0.0f) {
+            const float measured = static_cast<float>(vr::output::FramePeriodMs());
+            if (measured > 0.0f) frame = measured;
+        }
+        bool ok = vr::control::g_lowLatency && frame > 0.0f && gpu > 0.0f && gpu < 0.6f * frame;
+        vr::output::SetSameTickWait(ok ? 0.6f * frame : 0.0f);
     }
-    if (want == cur || !HasCameraSignature(cam)) return;
-    const double t0 = ProfMs();
-    vr::script::ExecConsole(cam - 0x77C, "scale set ScreenPercentage " + std::to_string(want));
-    const double cost = ProfMs() - t0;
-    g_screenPercent = want;
-    g_dynResChangeMs = ProfMs();
-    g_dynResCostPending = 2;
+    if (want == cur || !HasCameraSignature(cam) || g_pendingScreenPercent) return;
+    // Applicato a inizio del prossimo tick (ApplyPendingScreenPercent). Senza quell'indirizzo o senza quell'hook come
+    // prima: "scale set" qui, 12-13 ms sul thread di gioco e un frame perso a ogni scatto.
+    {
+        uint32_t vtable = 0;
+        if (kFlushRenderingCommandsAddr && g_engineTickHooked && TrySafeReadUint32(reinterpret_cast<void*>(kGSystemSettings), &vtable) && vtable == kGSystemSettingsVTable) {
+            g_pendingScreenPercent = want;
+            // Verso lo schermo virtuale (menu, scena: back buffer intero) subito: il prossimo disegno e' gia' quello. Costa
+            // l'attesa del rendering, una volta sola e dentro una dissolvenza.
+            if (mono) ApplyPendingScreenPercent();
+        } else {
+            vr::script::ExecConsole(cam - 0x77C, "scale set ScreenPercentage " + std::to_string(want));
+            g_screenPercent = want;
+            g_dynResChangeMs = ProfMs();
+            g_dynResCostPending = 2;
+        }
+    }
     const vr::pure::DynResController::Fail& f = ctl.fail[vr::pure::DynResController::Slot(cur)];
     ctl.Reset(want, ProfMs() * 0.001);
     char b[260];
     std::snprintf(b, sizeof(b),
                   "DYNRES: scene %d%% -> %d%% (GPU p90 %.1f ms per tick over 2 s, EMA %.1f, headset frame %.1f ms; %d%% failed %d "
-                  "times; \"scale set\" took %.1f ms)",
-                  cur, want, ctl.lastP90, g_gpuTickMsEma.load(), hz > 0 ? 1000.0f / hz : 0.0f, cur, want < cur ? f.count : 0, cost);
+                  "times)",
+                  cur, want, ctl.lastP90, g_gpuTickMsEma.load(), hz > 0 ? 1000.0f / hz : 0.0f, cur, want < cur ? f.count : 0);
     vr::log::Line(b);
+}
+
+std::string TexLockStatsLine();
+
+// Tempo della mod prima del disegno, per sezione (1/11): la riga HITCH diceva solo "mod before draw 22 ms".
+enum TickSection { kSecHead, kSecScript, kSecCrouch, kSecFacing, kSecBody, kSecShots, kSecSquad, kSecWrist, kSecScan, kSecWatchdog, kSecRest, kSecCount };
+const char* const kSecNames[kSecCount] = {"head", "script", "crouch", "facing", "body", "shots", "squad", "wrist", "scan", "watchdog", "rest"};
+struct TickSections {
+    double ms[kSecCount] = {};
+    double last;
+    explicit TickSections(double t0) : last(t0) {}
+    void Mark(int i) {
+        const double n = ProfMs();
+        ms[i] += n - last;
+        last = n;
+    }
+};
+
+// Tempi del tick corrente (solo thread di gioco): riga HITCH e collaudo "tickprof N".
+struct TickTimes {
+    double enter = 0.0, drawEnter = 0.0, eyes = 0.0, drawExit = 0.0, prevExit = 0.0;
+    float raw = 0.0f, used = 0.0f;
+    uint32_t id = 0;
+};
+TickTimes g_tick;
+double g_clockLagMs = 0.0;  // ritardo dell'orologio del gioco (EngineTickThunk), per la riga TICKP
+
+// "hitblood off": YHUD.m_hideHitFeedbackScene (+0x480, bit 8), il flag con cui il gioco stesso nasconde il sangue nelle
+// scene: niente pannelli, resta la desaturazione a salute bassa. Con "on" si leggono i rettangoli dei pannelli
+// (ogni 30 tick: cambiano solo con la risoluzione) per IsBloodPanelDraw.
+void UpdateHitBlood(char* cam) {
+    if (!HasCameraSignature(cam)) return;
+    char* pc = cam - 0x77C;
+    static bool weHid = false;
+    const bool hide = !vr::control::g_hitBlood;
+    uint32_t hud = 0, flags = 0;
+    if ((hide || weHid) && TrySafeReadUint32(pc + 0x3EC, &hud) && hud && TrySafeReadUint32(reinterpret_cast<char*>(hud) + 0x480, &flags)) {
+        const uint32_t want = hide ? (flags | 8u) : (flags & ~8u);
+        if (want != flags) SafeCopy(reinterpret_cast<char*>(hud) + 0x480, &want, 4);
+        weHid = hide;
+    }
+    // Ogni 30 tick; ogni tick finche' non c'e' la scena o l'altezza della UI: se la scena si apre al primo colpo i suoi
+    // primi disegni passerebbero per la matrice dell'HUD, il riquadro al centro della vista.
+    static int n = 0;
+    if (hide || (++n % 30 != 1 && g_bloodRectCount.load(std::memory_order_relaxed) > 0 && g_bloodUiHeight.load(std::memory_order_relaxed) > 0.0f)) return;
+    // YPlayerController.m_hitDirectionIndicator (+0xE6C): TArray di interfacce (oggetto, vtable).
+    uint32_t arr = 0, num = 0;
+    if (!TrySafeReadUint32(pc + 0xE6C, &arr) || !TrySafeReadUint32(pc + 0xE70, &num) || !arr || num > 8) {
+        g_bloodRectCount = 0;
+        return;
+    }
+    uint32_t scene = 0;
+    for (uint32_t i = 0; i < num && !scene; ++i) {
+        uint32_t obj = 0;
+        if (!TrySafeReadUint32(reinterpret_cast<void*>(arr + 8 * i), &obj) || !obj) continue;
+        if (vr::script::ClassName(reinterpret_cast<void*>(obj)) != "YFourthWallHealthFeedback") continue;
+        TrySafeReadUint32(reinterpret_cast<char*>(obj) + 0xA8, &scene);  // m_openedFeedbackScene
+    }
+    if (!scene) {
+        g_bloodRectCount = 0;
+        return;
+    }
+    // Foglie (UIImage) sotto la scena: UIScreenObject.Children +0x84, bHidden +0x80, UIObject.RenderBounds +0x298.
+    int count = 0;
+    float uiH = 0.0f;
+    struct Walk {
+        static void Go(uint32_t o, int depth, int* count, float* uiH) {
+            uint32_t data = 0, num = 0;
+            if (depth > 6 || !TrySafeReadUint32(reinterpret_cast<char*>(o) + 0x84, &data) || !TrySafeReadUint32(reinterpret_cast<char*>(o) + 0x88, &num) || num > 64) return;
+            for (uint32_t i = 0; i < num; ++i) {
+                uint32_t ch = 0, childNum = 0, hidden = 0;
+                if (!data || !TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &ch) || !ch) continue;
+                if (!TrySafeReadUint32(reinterpret_cast<char*>(ch) + 0x88, &childNum)) continue;
+                // Il pannello "Stage1" nascosto resta valido: lo mostra il gioco ai colpi. La sola immagine di prova
+                // (figlia diretta della scena, nascosta) non conta.
+                TrySafeReadUint32(reinterpret_cast<char*>(ch) + 0x80, &hidden);
+                float b[4];
+                if (depth == 0 && !(hidden & 1) && SafeCopy(b, reinterpret_cast<char*>(ch) + 0x298, 16) && b[3] > *uiH) *uiH = b[3];
+                if (childNum) {
+                    Go(ch, depth + 1, count, uiH);
+                } else if (depth > 0 && *count < kMaxBloodRects && SafeCopy(b, reinterpret_cast<char*>(ch) + 0x298, 16)) {
+                    for (int k = 0; k < 4; ++k) g_bloodRect[*count][k].store(b[k], std::memory_order_relaxed);
+                    ++*count;
+                }
+            }
+        }
+    };
+    Walk::Go(scene, 0, &count, &uiH);
+    if (uiH > 0.0f) g_bloodUiHeight = uiH;  // pannello nascosto: resta l'ultima, i primi colpi la usano subito
+    g_bloodRectCount = count;
+    static int logged = -1;
+    if (count != logged) {
+        logged = count;
+        char b[160];
+        std::snprintf(b, sizeof(b), "BLOOD: %d panels of the hit feedback scene, UI height %.0f: drawn at the edges of the view.", count, uiH);
+        vr::log::Line(b);
+    }
 }
 
 class ViewportDrawThunk {
@@ -3739,6 +3946,8 @@ public:
     void Detour(int bShouldPresent) {
         void* self = this;
         const double tickStart = ProfMs();
+        g_tick.drawEnter = tickStart;
+        TickSections sec(tickStart);
         // Attesa del mutex OpenXR di questo thread nel tracciamento della testa
         // (per differenza del totale del thread, review 2 WI-1).
         const bool xrWait = vr::rt::Active() == vr::rt::Backend::OpenXR;
@@ -3758,30 +3967,43 @@ public:
         }
         // Riga HITCH per sorgente (WI-1): testa (attesa del mutex OpenXR compresa).
         const double headMs = ProfMs() - tickStart;
+        sec.Mark(kSecHead);
         const double headWaitMs = xrWait ? vr::xr::ThreadLockWaitMs() - headWaitBefore : 0.0;
-        const double dynResChangeBefore = g_dynResChangeMs.load();
+        // Cambio di ScreenPercentage a inizio di questo tick (riga HITCH).
+        static double dynResSeen = 0.0;
+        const bool dynResChanged = g_dynResChangeMs.load() != dynResSeen;
+        dynResSeen = g_dynResChangeMs.load();
         char* cam = static_cast<char*>(g_cameraPtr.load());
         vr::script::Tick(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                          HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        sec.Mark(kSecScript);
         UpdatePhysicalCrouch(HasCameraSignature(cam) ? cam - 0x77C : nullptr,
                              HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateCrouchView(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // WI-3, dopo l'accucciata vera
+        sec.Mark(kSecCrouch);
         UpdatePawnFacing(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         UpdateCoverLean(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RunHitTest(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        sec.Mark(kSecFacing);
         // WI-3: la gestione del corpo vale sempre in prima persona (Walker opaco,
         // testa nascosta, ancora del collo, KeepGoodBones e dita); "fpbody arms"
         // cambia solo cosa si disegna. Prima "fpbody off" la spegneva tutta:
         // Walker semitrasparente, testa visibile, arma all'anca camminando.
         UpdateFirstPersonBody(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        sec.Mark(kSecBody);
         UpdateProjectileLog();
         RedirectNewProjectiles(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         RedirectThrownGrenade(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        sec.Mark(kSecShots);
         UpdateSquadCommandAim(cam, HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
+        sec.Mark(kSecSquad);
         PublishWristData(cam);
+        sec.Mark(kSecWrist);
         InteractionScan(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);  // fase 0 (interactlog)
         InteractionAffordance();                                                             // fase 1 (prossimita')
+        sec.Mark(kSecScan);
         vr::props::Watchdog();
+        sec.Mark(kSecWatchdog);
         if (vr::control::g_visCheck) VisibilityCheck(HasCameraSignature(cam) ? PlayerPawnIfViewTarget(cam) : nullptr);
         // Mirino del gioco: al centro dello schermo segue la testa e non l'arma;
         // con la mira dalla canna lo sostituisce il mirino verde.
@@ -3801,6 +4023,7 @@ public:
                 weHid = hide;
             }
         }
+        UpdateHitBlood(cam);
         {
             // Danno subito (giubbotto bHaptics / ProTube): salute di Walker in calo.
             static void* lastPawn = nullptr;
@@ -4111,6 +4334,8 @@ public:
         uint32_t vsEngine = vsSlot ? *vsSlot : 0;
         uint32_t vsRight = vsSlot ? RightEyeViewState(vsEngine) : 0;
         const double drawStart = ProfMs();
+        sec.Mark(kSecRest);
+        g_tick.eyes = drawStart;
         double drawEye[2] = {0.0, 0.0};
         for (int eye = 0; eye < 2; ++eye) {
             loc[0] = base[0];
@@ -4132,9 +4357,21 @@ public:
                 tag.scope = g_scopeActive;
                 PushFrameTag(tag);
             }
-            if (eye == 1 && vsRight) *vsSlot = vsRight;
+            if (eye == 1 && vsRight) {
+                vsEngine = *vsSlot;  // il motore puo' averlo ricreato durante il Draw sinistro: si rimette quello di adesso
+                *vsSlot = vsRight;
+            }
             g_ViewportDraw_Original(self, bShouldPresent);
-            if (eye == 1 && vsRight) *vsSlot = vsEngine;
+            if (eye == 1 && vsRight) {
+                if (*vsSlot == vsRight) {
+                    *vsSlot = vsEngine;
+                } else {
+                    // Ricreato durante questo Draw: ha distrutto il nostro e il suo vecchio non e' piu' di nessuno. Resta il
+                    // nuovo; al prossimo tick RightEyeViewState ne alloca uno per l'occhio destro.
+                    g_rightEyeViewState = 0;
+                    CallDestroyViewState(vsEngine);
+                }
+            }
             drawEye[eye] = ProfMs() - t0;
             g_profDraw[eye] += drawEye[eye];
         }
@@ -4167,9 +4404,9 @@ public:
                 // scena dell'elicottero): mod prima del disegno, disegno dei due
                 // occhi, fuori dal disegno (logica del gioco, Present, attesa).
                 static ULONGLONG lastHitchLog = 0;
-                if (dt > 20.0 && GetTickCount64() - lastHitchLog > 2000) {
+                if (dt > 20.0 && GetTickCount64() - lastHitchLog > 1000) {
                     lastHitchLog = GetTickCount64();
-                    char hb[420];
+                    char hb[640];
                     // Per sorgente (WI-1): nella parte della mod la testa e il
                     // cambio di ScreenPercentage; fuori dal disegno l'uscita VR e
                     // il Present del monitor (il resto e' il gioco). Attesa del
@@ -4183,9 +4420,20 @@ public:
                                   "monitor Present %.1f | OpenXR lock wait on the game thread this tick %.2f ms (in head "
                                   "tracking %.2f)",
                                   dt, drawStart - tickStart, drawEye[0], drawEye[1], dt - (now - tickStart), headMs,
-                                  g_dynResChangeMs.load() != dynResChangeBefore ? "yes" : "no", g_lastOutputMs.load(),
+                                  dynResChanged ? "yes" : "no", g_lastOutputMs.load(),
                                   g_lastPresentMs2.load(), tickWaitMs, headWaitMs);
-                    vr::log::Line(hb);
+                    // Dove sta il tempo: sezioni della mod oltre 1 ms; fuori dal disegno, il gioco (mondo) e
+                    // il resto del ciclo (qui il gioco aspetta anche il thread di rendering).
+                    std::string detail = hb;
+                    char one[64];
+                    for (int i = 0; i < kSecCount; ++i) {
+                        if (sec.ms[i] < 1.0) continue;
+                        std::snprintf(one, sizeof(one), " %s=%.1f", kSecNames[i], sec.ms[i]);
+                        detail += one;
+                    }
+                    std::snprintf(one, sizeof(one), " | world %.1f, loop %.1f", tickStart - g_tick.enter, g_tick.enter - g_tick.prevExit);
+                    detail += one;
+                    vr::log::Line(detail);
                 }
             }
             last = now;
@@ -4209,6 +4457,14 @@ public:
                 vr::log::Line(b);
                 std::snprintf(b, sizeof(b), "HITCHES: ticks over 20 ms=%d, longest %.1f ms", longTicks, maxTick);
                 vr::log::Line(b);
+                if (const uint32_t bd = g_bloodPanelDraws.exchange(0)) {
+                    std::snprintf(b, sizeof(b), "BLOOD: %u panel draws at the edges of the view in the last 300 ticks", bd);
+                    vr::log::Line(b);
+                }
+                {
+                    const std::string texLine = TexLockStatsLine();
+                    if (!texLine.empty()) vr::log::Line(texLine);
+                }
                 longTicks = 0;
                 maxTick = 0.0;
                 LogStats();
@@ -4225,12 +4481,68 @@ public:
             loc[2] = base[2];
         }
         g_stereoDraws.fetch_add(1, std::memory_order_relaxed);
+        g_tick.drawExit = ProfMs();
         vr::control::g_lastStereoDrawMs = GetTickCount64();
         // Di nuovo dopo il disegno: la scelta del gioco (centro dello schermo)
         // gira durante il frame e al rilascio del tasto deve valere la nostra.
         UpdateSquadCommandAim(cam, PlayerPawnIfViewTarget(cam));
     }
 };
+
+// --- Orologio del gioco: UGameEngine::Tick(float DeltaSeconds) ------------
+//
+// 0x007849F0 (Ghidra, 1/11): chiamata una volta per frame da FEngineLoop::Tick con il tempo vero
+// trascorso; dentro ci sono GWorld->Tick(DeltaSeconds) e il Draw del viewport. Vedi vr::pure::GameClock.
+const uintptr_t& kEngineTickAddr = vr::addr::g[vr::addr::EngineTick];
+typedef void(__thiscall* EngineTick_t)(void* self, float dt);
+EngineTick_t g_EngineTick_Original = nullptr;
+
+class EngineTickThunk {
+public:
+    void Detour(float dt) {
+        ApplyPendingScreenPercent();
+        vr::output::GateGameTick();
+        g_tick.enter = ProfMs();
+        g_tick.raw = dt;
+        float use = dt;
+        static vr::pure::GameClock clock;
+        if (vr::control::g_smoothDt) {
+            use = clock.Step(dt, static_cast<float>(vr::output::FramePeriodMs() * 0.001));
+            g_clockLagMs = clock.lag * 1000.0;
+        } else {
+            clock.Reset();
+        }
+        g_tick.used = use;
+        ++g_tick.id;
+        g_EngineTick_Original(this, use);
+        const double exit = ProfMs();
+        int left = vr::control::g_tickProfLeft.load(std::memory_order_relaxed);
+        if (left > 0) {
+            vr::control::g_tickProfLeft.store(left - 1, std::memory_order_relaxed);
+            float pz[3] = {0, 0, 0};
+            char* camP = static_cast<char*>(g_cameraPtr.load());
+            void* pawnP = HasCameraSignature(camP) ? PlayerPawnIfViewTarget(camP) : nullptr;
+            if (pawnP) SafeCopy(pz, static_cast<char*>(pawnP) + 0x54, 12);
+            char b[420];
+            std::snprintf(b, sizeof(b),
+                          "TICKP: tick=%u enter=%.3f raw=%.2f use=%.3f lag=%.1f loop=%.2f world=%.2f mod=%.2f eyes=%.2f post=%.2f out=%.2f pawn=(%.3f,%.3f,%.3f)",
+                          g_stereoDraws.load(std::memory_order_relaxed), g_tick.enter, g_tick.raw * 1000.0f, use * 1000.0f, g_clockLagMs,
+                          g_tick.enter - g_tick.prevExit, g_tick.drawEnter - g_tick.enter, g_tick.eyes - g_tick.drawEnter,
+                          g_tick.drawExit - g_tick.eyes, exit - g_tick.drawExit, g_lastOutputMs.load(), pz[0], pz[1], pz[2]);
+            vr::log::Line(b);
+        }
+        g_tick.prevExit = exit;
+    }
+};
+
+void* EngineTickThunkAddress() {
+    union {
+        void (EngineTickThunk::*mfp)(float);
+        void* fp;
+    } converter;
+    converter.mfp = &EngineTickThunk::Detour;
+    return converter.fp;
+}
 
 // --- FOV: APlayerController::GetFOVAngle() -------------------------------
 //
@@ -4369,6 +4681,41 @@ inline bool MaybeApplyCameraOverride(void* dst, size_t n) {
         int32_t yaw = pcOk ? pcRot[1] : *camYaw;
         int32_t pitch = pcOk ? pcRot[0] : *camPitch;
         if (pitch > 32768) pitch -= 65536;
+        {
+            // Diagnostica (29/10, tester "jumping around when moving"): rotazione del
+            // PlayerController fatta dal GIOCO fra due copie della camera (cambio di
+            // yaw meno quello scritto dalla mod con AddControllerYaw). Col runtime
+            // finto, testa e stick destro fermi, camminando di lato: +85/+86 unita'
+            // (0,47 gradi) ogni 7-8 tick e +257/+248, cioe' la vista ruotava da sola.
+            static int32_t lastYaw = 0, lastOwn = 0;
+            static bool have = false;
+            static double windowStart = 0.0, gameSum = 0.0, gameMax = 0.0;
+            static int gameTicks = 0, ticks = 0;
+            const int32_t own = vr::control::g_ownYawUnits.load();
+            if (pcOk && have) {
+                const int32_t d = static_cast<int16_t>(static_cast<uint16_t>(yaw - lastYaw - (own - lastOwn)));
+                ++ticks;
+                if (d != 0 && std::abs(d) < 8192) {
+                    ++gameTicks;
+                    gameSum += std::abs(d) * (360.0 / 65536.0);
+                    gameMax = (std::max)(gameMax, std::abs(d) * (360.0 / 65536.0));
+                }
+            }
+            lastYaw = yaw;
+            lastOwn = own;
+            have = pcOk;
+            const double nowW = ProfMs();
+            if (windowStart == 0.0) windowStart = nowW;
+            if (nowW - windowStart > 5000.0) {
+                if (gameTicks && !vr::control::g_stickTurning.load())
+                    vr::log::Line("PCROT: the game rotated the controller (view) in " + std::to_string(gameTicks) + " of " +
+                                  std::to_string(ticks) + " camera copies over 5 s (2-3 per tick; stick turning is the game's): total " + std::to_string(gameSum) + " deg, largest " +
+                                  std::to_string(gameMax) + " deg");
+                windowStart = nowW;
+                gameSum = gameMax = 0.0;
+                gameTicks = ticks = 0;
+            }
+        }
         g_bodyYaw = yaw;
         g_bodyYawAtCamera = yaw;  // follow-up 27/10: corpo con cui il gioco ha fatto la sua camera
         g_bodyPitch = vr::control::g_stickPitch ? pitch : 0;
@@ -4855,7 +5202,7 @@ void TwoHandReset() {
 // nello spazio del tracciamento (posizione compresa); ref: origine per i cm del
 // corpo (riga TWOHAND). Ritorna true se il telaio dell'arma cambia (outGun).
 bool TwoHandStep(const float gun[3][4], const float rightRaw[3][4], bool leftValid, const float leftRaw[3][4], const float ref[3],
-                 float outGun[3][4]) {
+                 float outGun[3][4], bool leftTracked = true, bool rightTracked = true) {
     namespace th = vr::twohand;
     const double nowMs = ProfMs();
     static double lastMs = 0.0;
@@ -4879,6 +5226,8 @@ bool TwoHandStep(const float gun[3][4], const float rightRaw[3][4], bool leftVal
     std::memcpy(in.rightRaw, rightRaw, sizeof(in.rightRaw));
     vr::pure::PalmOf(rightRaw, gp.left, gp.gripFix, in.palmR);
     in.leftValid = leftValid;
+    in.leftTracked = leftTracked;
+    in.rightTracked = rightTracked;
     if (leftValid) {
         std::memcpy(in.leftRaw, leftRaw, sizeof(in.leftRaw));
         vr::pure::PalmOf(leftRaw, supLeft, gp.gripFix, in.palmL);
@@ -7062,7 +7411,9 @@ void UpdateHeadTracking() {
             // Presa a due mani (WI-4b): puo' girare il telaio dell'arma attorno al palmo destro.
             {
                 float tg[3][4];
-                if (TwoHandStep(g_gunFrame, c.m, leftOk, lm.m, posRef, tg)) ApplyGunFrame(tg);
+                const bool lTracked = !leftOk || handPoses[li].eTrackingResult == vr::TrackingResult_Running_OK;
+                const bool rTracked = handPoses[ri].eTrackingResult == vr::TrackingResult_Running_OK;
+                if (TwoHandStep(g_gunFrame, c.m, leftOk, lm.m, posRef, tg, lTracked, rTracked)) ApplyGunFrame(tg);
             }
             TurretGripStep(g_gunFrame, c.m, leftOk, lm.m);  // torretta, presa NORMAL: manubrio (WI-4c)
             // Posizione del polso dell'arma (telaio ruotato attorno al palmo,
@@ -8105,11 +8456,47 @@ void HandTarget(int side, const float* center, int32_t bodyYaw, const float* off
 }
 
 // Posa della mano nel mondo -> controlli IK (spazio dell'attore).
+// Gradini di Z del Pawn su terreno in pendenza (31/10, tester; misura slopetest.py): il
+// bersaglio delle mani e' scritto al Draw N in spazio attore e le ossa lo usano al tick dopo,
+// col Pawn gia' salito o sceso, mentre la vista ha l'altezza filtrata. Canna rispetto alla
+// vista: giu' del gradino per un frame, poi torna. Prima dell'aggiornamento delle ossa il
+// bersaglio si sposta di (passo previsto della vista - passo del Pawn).
+struct ArmsZLead {
+    bool valid = false;
+    float pawnZ = 0.0f, scale = 1.0f, applied = 0.0f;
+};
+ArmsZLead g_armsZ[2];
+bool g_viewZValid = false;
+float g_viewZRaw = 0.0f, g_viewZSmooth = 0.0f, g_viewZA = 1.0f;  // ingresso, uscita e fattore del filtro dell'ultimo tick
+
+void ApplyArmsZLead(void* pawn) {
+    float z = 0.0f;
+    if (!g_viewZValid || !SafeCopy(&z, static_cast<char*>(pawn) + kOffActorLocation + 8, 4)) return;
+    for (int side = 0; side < 2; ++side) {
+        ArmsZLead& s = g_armsZ[side];
+        char* limb = static_cast<char*>(g_rig.ctrl[side]);
+        // Ancora vivo: fra il Draw che l'ha controllato e queste ossa c'e' un tick del mondo (cambio di livello, GC).
+        if (!limb || !s.valid || !StillAlive(limb, g_rig.ctrlCls[side])) continue;
+        const float dp = z - s.pawnZ;
+        float c = g_viewZA * (g_viewZRaw + dp - g_viewZSmooth) - dp;
+        if (std::fabs(c) > 16.0f) c = 0.0f;  // non e' un gradino (salto, teletrasporto)
+        c /= s.scale;
+        const float d = c - s.applied;
+        if (d == 0.0f) continue;
+        float eff = 0.0f, joint = 0.0f;
+        if (!SafeCopy(&eff, limb + kOffLimbEffector + 8, 4) || !SafeCopy(&joint, limb + kOffLimbJoint + 8, 4)) continue;
+        eff += d;
+        joint += d;
+        if (SafeCopy(limb + kOffLimbEffector + 8, &eff, 4) && SafeCopy(limb + kOffLimbJoint + 8, &joint, 4)) s.applied = c;
+    }
+}
+
 void WriteHand(int side, const float* pos, const float axes[3][3], const float* actorLoc, const float* af,
                const float* ar, const float* au, float scale, bool debug) {
     void* limb = g_rig.ctrl[side];
     void* rotc = g_rig.ctrl[2 + side];
     if (!limb) return;
+    g_armsZ[side].valid = false;
     if (side == 0 && ArmsSwapped() && g_relaxFrames > 0) {
         // Mano dell'arma a riposo (animazione) mentre si misura la relazione.
         static const float zero3[3] = {0, 0, 0};
@@ -8140,6 +8527,7 @@ void WriteHand(int side, const float* pos, const float axes[3][3], const float* 
         ReleaseArms();
         return;
     }
+    g_armsZ[side] = {au[2] > 0.99f, actorLoc[2], scale, 0.0f};  // effettore appena riscritto; solo con l'attore in piano
     if (debug) {
         char b3[240];
         snprintf(b3, sizeof(b3), "ARMS %s: wanted hand axes X=(%.2f %.2f %.2f) Y=(%.2f %.2f %.2f) Z=(%.2f %.2f %.2f)",
@@ -11315,18 +11703,30 @@ public:
                 base[2] = smoothZ;  // stesso centro dell'occhio sinistro di questo tick
             } else {
                 static double lastT = 0.0;
+                static uint32_t lastTickId = 0;
                 double now = ProfMs() * 0.001;
                 float tau = vr::control::g_eyeHeightSmooth;
                 // Su un mezzo niente smorzamento: l'elicottero sale e scende
                 // veloce e la vista restava indietro, sopra o sotto la cabina.
                 if (pawnV && !viewFirm) tau = 0.0f;
+                g_viewZRaw = base[2];
+                // 1/11: col tempo del gioco, non dell'orologio vero. Il Pawn sale di un passo fisso a tick
+                // (0,52 unita'): con un tick slittato di 4 ms (15,7 poi 6,5 ms) il filtro dava 0,74 e 0,31 e
+                // l'arma, che segue il Pawn, saltava di 0,6 unita' rispetto alla vista. Un passo per tick.
+                const bool gameTime = vr::control::g_smoothDt && g_tick.used > 0.0f;
+                const float stepS = gameTime ? (g_tick.id != lastTickId ? g_tick.used : 0.0f) : static_cast<float>(now - lastT);
                 if (lastT == 0.0 || tau <= 0.0f || std::fabs(base[2] - smoothZ) > 80.0f || now - lastT > 0.5) {
                     smoothZ = base[2];
+                    g_viewZA = 1.0f;
                 } else {
-                    float a = 1.0f - std::exp(-static_cast<float>(now - lastT) / tau);
+                    float a = 1.0f - std::exp(-stepS / tau);
                     smoothZ += (base[2] - smoothZ) * a;
+                    if (stepS > 0.0f) g_viewZA = a;
                 }
+                g_viewZSmooth = smoothZ;
+                g_viewZValid = true;
                 lastT = now;
+                lastTickId = g_tick.id;
                 base[2] = smoothZ;
             }
             // Smorzata solo l'altezza del gioco (gradini, accucciata del Pawn):
@@ -12811,13 +13211,37 @@ struct Interaction {
 };
 std::vector<Interaction> g_interactions;
 
+// 1/11: il giro intero di GObjects (~190.000 oggetti, nome della classe di ognuno) stava in un solo tick
+// ogni 2 s: 14 ms sul PC di sviluppo, 20-30 ms su un 7800X3D + 5090 (righe HITCH "mod before draw"), cioe' un
+// frame perso ogni 2 s su qualunque PC. Ora a fette di 0,25 ms per tick (un giro in ~0,4 s), con il tipo
+// deciso una volta per classe; la lista resta quella del giro prima finche' il nuovo non e' finito.
 void InteractionScan(void* pawn) {
-    if (!pawn) return;
     static ULONGLONG nextScan = 0;
-    if (GetTickCount64() < nextScan) return;
-    nextScan = GetTickCount64() + 2000;
+    static uint32_t cursor = 0;
+    static bool scanning = false;
+    static std::vector<Interaction> building;
+    static std::unordered_map<uint32_t, uint8_t> kindOfClass;  // 0 niente, 1 trigger, 2 raccolta
+    if (!pawn) return;  // scena con un'altra vista: il giro riprende da dov'era
+    // Un giro non attraversa un cambio di livello (il vecchio giro in un tick non poteva): oggetti e indirizzi delle
+    // classi non varrebbero piu', e la lista pubblicata avrebbe interazioni del livello prima (impulsi a vuoto).
+    static void* scanPawn = nullptr;
+    if (pawn != scanPawn) {
+        scanPawn = pawn;
+        scanning = false;
+        building.clear();
+        g_interactions.clear();
+        vr::control::g_interactZone[0] = false;
+        vr::control::g_interactZone[1] = false;
+        nextScan = 0;
+    }
+    if (!scanning) {
+        if (GetTickCount64() < nextScan) return;
+        scanning = true;
+        cursor = 0;
+        building.clear();
+        kindOfClass.clear();  // gli indirizzi delle classi cambiano tra i livelli
+    }
     ScanTimer scanTimer;  // L12
-    g_interactions.clear();
     uint32_t data = 0, num = 0;
     if (!TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr), &data) ||
         !TrySafeReadUint32(reinterpret_cast<void*>(kGObjectsAddr + 4), &num) || !data || num > 2000000)
@@ -12825,17 +13249,36 @@ void InteractionScan(void* pawn) {
     float pl[3] = {0, 0, 0};
     SafeCopy(pl, static_cast<char*>(pawn) + 0x54, 12);
     bool log = vr::control::g_interactLog;
-    for (uint32_t i = 0; i < num; ++i) {
+    const double sliceStart = ProfMs();
+    bool full = false;
+    uint32_t i = cursor;
+    for (; i < num && !full; ++i) {
+        if ((i & 0x7F) == 0 && ProfMs() - sliceStart > 0.25) break;
         uint32_t o = 0;
         if (!TrySafeReadUint32(reinterpret_cast<void*>(data + 4 * i), &o) || !o) continue;
         void* obj = reinterpret_cast<void*>(o);
-        std::string cls = vr::script::ClassName(obj);
-        // Trigger delle interazioni e oggetti da raccogliere (fase 4: armi e
-        // munizioni a terra, classi con "Pickup"): stessa zona di presa.
-        bool trig = cls.find("Interaction") != std::string::npos && cls.rfind("YTrigger_", 0) == 0;
-        bool pickup = cls.find("Pickup") != std::string::npos && cls.rfind("Y", 0) == 0;
-        if (!trig && !pickup) continue;
-        if (cls == "Class") continue;
+        const uint32_t classObj = ObjClass(obj);
+        if (!classObj) continue;
+        uint8_t kind = 0;
+        std::string cls;
+        {
+            auto known = kindOfClass.find(classObj);
+            if (known != kindOfClass.end()) {
+                kind = known->second;
+            } else {
+                cls = vr::script::ClassName(obj);
+                // Trigger delle interazioni e oggetti da raccogliere (fase 4: armi e
+                // munizioni a terra, classi con "Pickup"): stessa zona di presa.
+                if (cls != "Class") {
+                    if (cls.find("Interaction") != std::string::npos && cls.rfind("YTrigger_", 0) == 0) kind = 1;
+                    else if (cls.find("Pickup") != std::string::npos && cls.rfind("Y", 0) == 0) kind = 2;
+                }
+                kindOfClass.emplace(classObj, kind);
+            }
+        }
+        if (!kind) continue;
+        const bool pickup = kind == 2;
+        if (cls.empty()) cls = vr::script::ClassName(obj);
         // Armi lasciate dai nemici (voce 6): restano nella lista; quelle che la
         // mano sinistra prende da sola le salta InteractionAffordance, per
         // quella mano e solo quando la presa della mano funziona davvero
@@ -12846,7 +13289,7 @@ void InteractionScan(void* pawn) {
         if (name.rfind("Default__", 0) == 0) continue;  // oggetti predefiniti delle classi
         Interaction it;
         it.obj = obj;
-        it.cls = ObjClass(obj);
+        it.cls = classObj;
         it.name = cls;
         it.pickup = pickup;
         if (!SafeCopy(it.loc, static_cast<char*>(obj) + 0x54, 12)) continue;
@@ -12881,9 +13324,14 @@ void InteractionScan(void* pawn) {
                           name.c_str(), it.loc[0], it.loc[1], it.loc[2], d, it.grab[0], it.grab[1], it.grab[2]);
             vr::log::Line(b);
         }
-        g_interactions.push_back(it);
-        if (g_interactions.size() >= 64) break;
+        building.push_back(it);
+        if (building.size() >= 64) full = true;
     }
+    cursor = i;
+    if (i < num && !full) return;  // si continua al tick dopo
+    g_interactions.swap(building);
+    scanning = false;
+    nextScan = GetTickCount64() + 2000;
     if (log && g_interactions.empty()) vr::log::Line("INTERACT: no YTrigger_*Interaction actors in this level.");
 }
 
@@ -13671,7 +14119,7 @@ void __fastcall Hooked_CalcWeaponFire(void* self, void* /*edx*/, FVec3 start, FV
                     DirBasis(bd, r2, u2);
                     // Postura (R-W1, regolabile: "spread on <scala> <ads> <due mani>
                     // <una mano>"): tacche all'occhio 0.1 (mirini veri = quasi
-                    // laser, prova nel visore 21/10), due mani 0.5, arma lunga
+                    // laser, prova nel visore 21/10), due mani 0.2 (1/11), arma lunga
                     // con una mano sola 1.5.
                     float k = scale;
                     if (vr::control::g_adsActive) k *= vr::control::g_spreadAds;
@@ -14376,6 +14824,7 @@ public:
             // Riga GUNLOG "lead": correzione di yaw dell'ultimo aggiornamento delle ossa (senza scatto valido resta
             // l'anticipo scritto da UpdateArms).
             if (snapOk) g_armsLeadUsed = fixUnits;
+            ApplyArmsZLead(g_fpPawn);
         }
         g_UpdateSkelPose_Original(this, dt, tickFaceFx);
         if (f3k >= 0) g_skelPoseDiag.post[f3k] = CompL2WYawDeg(this);
@@ -14652,6 +15101,15 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
         vr::log::Line("Hook on USkeletalMeshComponent::UpdateSkelPose installed.");
     }
 
+    void* etTarget = reinterpret_cast<void*>(kEngineTickAddr);
+    if (etTarget && MH_CreateHook(etTarget, EngineTickThunkAddress(), reinterpret_cast<void**>(&g_EngineTick_Original)) == MH_OK &&
+        MH_EnableHook(etTarget) == MH_OK) {
+        g_engineTickHooked = true;
+        vr::log::Line("Hook on UGameEngine::Tick installed (the world advances at the headset's pace).");
+    } else {
+        vr::log::Line("Hook on UGameEngine::Tick NOT installed: the world keeps the engine's own time steps.");
+    }
+
     // Filtro dei crash del motore (FUN_00827770, Ghidra: minidump proprio +
     // ReportFault, ritorna 1): le eccezioni sul thread di gioco finivano li'
     // e la mod non ne sapeva nulla (L24, R-R2). Prima si scrive la riga CRASH
@@ -14790,16 +15248,30 @@ void LogDynFallback(const char* what, UINT w, UINT h, UINT levels, D3DFORMAT fmt
                   what, w, h, static_cast<int>(fmt), levels, static_cast<unsigned>(first), n);
     vr::log::Line(b);
 }
+void AttachTexShadow(IDirect3DTexture9* tex);
+double g_createTexMs = 0.0, g_createTexMax = 0.0;
+unsigned g_createTexCount = 0;
+struct CreateTexTimer {
+    double t0 = ProfMs();
+    ~CreateTexTimer() {
+        const double d = ProfMs() - t0;
+        g_createTexMs += d;
+        if (d > g_createTexMax) g_createTexMax = d;
+        ++g_createTexCount;
+    }
+};
 HRESULT WINAPI Hooked_CreateTexture(IDirect3DDevice9* d, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt,
                                     D3DPOOL pool, IDirect3DTexture9** out, HANDLE* shared) {
     if (pool != D3DPOOL_MANAGED) return g_CreateTexture_Original(d, w, h, levels, usage, fmt, pool, out, shared);
-    HRESULT hr = g_CreateTexture_Original(d, w, h, levels, ExUsage(usage), fmt, D3DPOOL_DEFAULT, out, shared);
+    CreateTexTimer createTimer;
+    HRESULT hr = g_CreateTexture_Original(d, w, h, levels, vr::control::g_texDynamic ? ExUsage(usage) : usage, fmt, D3DPOOL_DEFAULT, out, shared);
     if (FAILED(hr)) {
         const HRESULT first = hr;
         hr = g_CreateTexture_Original(d, w, h, levels, usage, fmt, D3DPOOL_DEFAULT, out, shared);
         if (SUCCEEDED(hr) && ExUsage(usage) != usage) LogDynFallback("texture", w, h, levels, fmt, first);
     }
     CountManaged(hr, "texture");
+    if (SUCCEEDED(hr) && out && *out) AttachTexShadow(*out);
     return hr;
 }
 
@@ -14861,7 +15333,383 @@ bool GpuShareFailTestRequested() {
     return GetFileAttributesA(flag.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+// "MANAGED" fatto dalla mod (1/11; tester 7800X3D + 5090, jitter camminando; 4 tick su 300 oltre 20-50 ms).
+// D3D9Ex non ha il pool MANAGED, dove LockRect tocca solo la copia in memoria di sistema: le texture convertite in
+// DEFAULT + DYNAMIC vanno bloccate davvero, e NVIDIA aspetta il suo thread e la GPU dentro LockRect (campioni dello
+// stack del thread di rendering, 005E9886 -> d3d9 -> nvd3dum in attesa). Lo streaming delle texture, che lavora
+// quando ci si muove, copia i mip condivisi da una texture all'altra (~150 lock in lettura e ~150 in scrittura al
+// secondo camminando, a raffiche): il thread di rendering si fermava 3-6 ms (al massimo ~14 ms) qui, il thread di gioco con lui,
+// e piu' la GPU e' carica (alta risoluzione) piu' dura l'attesa. Ora ogni livello ha la sua copia in memoria di
+// sistema, come MANAGED: LockRect non tocca il driver e UnlockRect accoda UpdateSurface verso la texture vera.
+// Le copie vivono con la texture (dati privati D3DSPD_IUNKNOWN); oltre kShadowLimit si libera la piu' vecchia e il
+// solo svantaggio e' un lock in lettura vero, quello di prima.
+const GUID kTexShadowGuid = {0x6b1f3c52, 0x8a0d, 0x4e77, {0x9d, 0x21, 0x4c, 0x5a, 0x7e, 0x10, 0xc3, 0x9f}};
+constexpr int kShadowMaxLevels = 16;
+constexpr uint64_t kShadowLimitBytes = 700ull * 1024 * 1024;
+std::atomic<int64_t> g_shadowBytes{0};
+std::atomic<uint32_t> g_shadowCount{0};
+std::atomic<uint32_t> g_shadowEvicted{0};
+
+class TexShadow;
+std::mutex g_shadowListMutex;
+std::list<TexShadow*> g_shadowList;  // dalla meno usata di recente
+
+class TexShadow final : public IUnknown {
+public:
+    enum LockKind : uint8_t { kNone, kReal, kShadowRead, kShadowWrite };
+    IDirect3DTexture9* sys = nullptr;  // stessa catena di mip in memoria di sistema (anche i mip DXT sotto 4x4)
+    uint32_t bytes = 0;
+    bool noShadow = false;             // non creata (formato o dimensioni): lock veri, come prima
+    bool partial = false;              // scritta a pezzi (font di Scaleform): il resto dei livelli sta solo qui, mai liberata
+    bool valid[kShadowMaxLevels] = {};    // la copia ha il livello intero
+    bool written[kShadowMaxLevels] = {};  // la texture vera ha contenuti in quel livello
+    LockKind lock[kShadowMaxLevels] = {};
+    bool hasRect[kShadowMaxLevels] = {};
+    RECT rect[kShadowMaxLevels] = {};
+    std::list<TexShadow*>::iterator where;
+    TexShadow() {
+        std::lock_guard<std::mutex> lock(g_shadowListMutex);
+        where = g_shadowList.insert(g_shadowList.end(), this);
+    }
+    ~TexShadow() {
+        {
+            std::lock_guard<std::mutex> lock(g_shadowListMutex);
+            g_shadowList.erase(where);
+        }
+        Free();
+    }
+    void Touch() {
+        std::lock_guard<std::mutex> lock(g_shadowListMutex);
+        g_shadowList.splice(g_shadowList.end(), g_shadowList, where);
+    }
+    bool AnyLocked() const {
+        for (int i = 0; i < kShadowMaxLevels; ++i)
+            if (lock[i] != kNone) return true;
+        return false;
+    }
+    // Stacca la copia: la rilascia il chiamante, fuori dal mutex della lista (una Release puo' prendere il lock del device,
+    // che chi rilascia una texture convertita tiene mentre ~TexShadow aspetta quel mutex).
+    IDirect3DTexture9* Detach() {
+        IDirect3DTexture9* t = sys;
+        if (!t) return nullptr;
+        g_shadowBytes -= bytes;
+        g_shadowCount -= 1;
+        sys = nullptr;
+        bytes = 0;
+        for (bool& v : valid) v = false;
+        return t;
+    }
+    void Free() {
+        if (IDirect3DTexture9* t = Detach()) t->Release();
+    }
+    HRESULT WINAPI QueryInterface(REFIID riid, void** out) override {
+        if (riid == __uuidof(IUnknown)) {
+            *out = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG WINAPI AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&ref_)); }
+    ULONG WINAPI Release() override {
+        const LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return static_cast<ULONG>(r);
+    }
+
+private:
+    volatile LONG ref_ = 1;
+};
+
+typedef HRESULT(WINAPI* TexLockRect_t)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT(WINAPI* TexUnlockRect_t)(IDirect3DTexture9*, UINT);
+TexLockRect_t g_TexLockRect_Original = nullptr;
+TexUnlockRect_t g_TexUnlockRect_Original = nullptr;
+
+TexShadow* ShadowOf(IDirect3DTexture9* tex) {
+    IUnknown* u = nullptr;
+    DWORD size = sizeof(u);
+    if (FAILED(tex->GetPrivateData(kTexShadowGuid, &u, &size)) || !u) return nullptr;
+    return static_cast<TexShadow*>(u);  // riferimento in piu': lo rilascia il chiamante
+}
+
+// Byte per blocco 4x4 dei formati compressi (0 = non compresso).
+uint32_t BlockBytes(D3DFORMAT f) {
+    switch (static_cast<DWORD>(f)) {
+    case D3DFMT_DXT1:
+    case MAKEFOURCC('A', 'T', 'I', '1'): return 8;
+    case D3DFMT_DXT2:
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
+    case D3DFMT_DXT5:
+    case MAKEFOURCC('A', 'T', 'I', '2'): return 16;
+    default: return 0;
+    }
+}
+
+uint32_t PixelBytes(D3DFORMAT f) {
+    switch (f) {
+    case D3DFMT_A16B16G16R16:
+    case D3DFMT_A16B16G16R16F:
+    case D3DFMT_G32R32F: return 8;
+    case D3DFMT_A32B32G32R32F: return 16;
+    case D3DFMT_L8:
+    case D3DFMT_A8: return 1;
+    case D3DFMT_R5G6B5:
+    case D3DFMT_R16F:
+    case D3DFMT_L16:
+    case D3DFMT_A8L8: return 2;
+    default: return 4;
+    }
+}
+
+uint32_t LevelBytes(const D3DSURFACE_DESC& d) {
+    const uint32_t w = d.Width ? d.Width : 1, h = d.Height ? d.Height : 1;
+    if (const uint32_t block = BlockBytes(d.Format)) return ((w + 3) / 4) * ((h + 3) / 4) * block;
+    return w * h * PixelBytes(d.Format);
+}
+
+// Righe e byte per riga di un blocco (formati compressi: a 4 righe per volta), per la copia di riserva.
+void LockExtent(const D3DSURFACE_DESC& d, const RECT* r, uint32_t* rows, uint32_t* rowBytes) {
+    const uint32_t w = r ? static_cast<uint32_t>(r->right - r->left) : d.Width;
+    const uint32_t h = r ? static_cast<uint32_t>(r->bottom - r->top) : d.Height;
+    if (const uint32_t block = BlockBytes(d.Format)) {
+        *rows = (h + 3) / 4;
+        *rowBytes = ((w + 3) / 4) * block;
+    } else {
+        *rows = h;
+        *rowBytes = w * PixelBytes(d.Format);
+    }
+}
+
+double VirtualFreeMb() {
+    MEMORYSTATUSEX m = {};
+    m.dwLength = sizeof(m);
+    return GlobalMemoryStatusEx(&m) ? static_cast<double>(m.ullAvailVirtual) / (1024.0 * 1024.0) : -1.0;
+}
+
+// Le copie stanno nello spazio di indirizzi del processo a 32 bit. Con meno di 350 MB liberi (controllo ogni 128 sblocchi)
+// se ne liberano 64 MB e non se ne creano di nuove: un lock vero costa qualche ms, una memoria esaurita fa uscire il gioco.
+constexpr double kShadowLowAddressMb = 350.0;
+constexpr int64_t kShadowLowStepBytes = 64ll * 1024 * 1024;
+bool g_addressLow = false;
+
+// Oltre il limite si liberano le copie meno usate di recente (solo il thread di rendering le blocca e le libera).
+void EvictShadows(int64_t atLeastBytes) {
+    std::vector<IDirect3DTexture9*> freedTextures;
+    {
+        std::lock_guard<std::mutex> lock(g_shadowListMutex);
+        int64_t freed = 0;
+        for (auto it = g_shadowList.begin(); it != g_shadowList.end(); ++it) {
+            if (static_cast<uint64_t>((std::max)(g_shadowBytes.load(), int64_t(0))) <= kShadowLimitBytes && freed >= atLeastBytes) break;
+            TexShadow* sh = *it;
+            if (!sh->sys || sh->partial || sh->AnyLocked()) continue;
+            freed += sh->bytes;
+            freedTextures.push_back(sh->Detach());
+            ++g_shadowEvicted;
+        }
+    }
+    for (IDirect3DTexture9* t : freedTextures) t->Release();
+}
+
+struct TexLockStats2 {
+    unsigned shadowRead = 0, shadowWrite = 0, realRead = 0, realWrite = 0, updates = 0, updateFails = 0;
+    double updateMs = 0.0, updateMax = 0.0, lockMs = 0.0;
+};
+TexLockStats2 g_texShadowStats;
+
+bool CreateShadowTexture(IDirect3DTexture9* tex, TexShadow* sh) {
+    D3DSURFACE_DESC d = {};
+    IDirect3DDevice9* dev = nullptr;
+    if (FAILED(tex->GetLevelDesc(0, &d)) || FAILED(tex->GetDevice(&dev)) || !dev) return false;
+    const DWORD levels = tex->GetLevelCount();
+    IDirect3DTexture9* st = nullptr;
+    const HRESULT hr = g_CreateTexture_Original(dev, d.Width, d.Height, levels, 0, d.Format, D3DPOOL_SYSTEMMEM, &st, nullptr);
+    dev->Release();
+    if (FAILED(hr) || !st) {
+        static int logged = 0;
+        if (logged++ < 5) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "GPUSHARE: no system-memory copy for a %ux%u fmt %d texture (hr=0x%08lX): real locks for it.", d.Width, d.Height, static_cast<int>(d.Format),
+                          static_cast<unsigned long>(hr));
+            vr::log::Line(b);
+        }
+        return false;
+    }
+    uint32_t total = 0;
+    for (DWORD i = 0; i < levels; ++i) {
+        D3DSURFACE_DESC ld = {};
+        if (SUCCEEDED(tex->GetLevelDesc(i, &ld))) total += LevelBytes(ld);
+    }
+    sh->sys = st;
+    sh->bytes = total;
+    g_shadowBytes += total;
+    g_shadowCount += 1;
+    return true;
+}
+
+HRESULT WINAPI Hooked_TexLockRect(IDirect3DTexture9* tex, UINT level, D3DLOCKED_RECT* out, const RECT* rect, DWORD flags) {
+    const double t0 = ProfMs();
+    TexShadow* sh = level < kShadowMaxLevels ? ShadowOf(tex) : nullptr;
+    HRESULT hr = E_FAIL;
+    bool done = false;
+    if (sh && vr::control::g_texShadow && !sh->noShadow) {
+        const bool read = (flags & D3DLOCK_READONLY) != 0;
+        // Lettura: solo se la copia ha il livello. Scrittura: la copia va bene su un livello mai scritto (lo streaming lo
+        // riempie tutto) o a rettangoli (font di Scaleform); se il livello ha contenuti che la copia non ha piu', e' liberata, chi
+        // ne aggiorna una parte perderebbe il resto: lock vero, come MANAGED che conserva i dati.
+        if (read ? sh->valid[level] : (rect || sh->valid[level] || !sh->written[level])) {
+            if (!sh->sys && !g_addressLow && !CreateShadowTexture(tex, sh)) sh->noShadow = true;
+            if (sh->sys) {
+                hr = g_TexLockRect_Original(sh->sys, level, out, rect, flags & (D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK));
+                if (SUCCEEDED(hr)) {
+                    sh->lock[level] = read ? TexShadow::kShadowRead : TexShadow::kShadowWrite;
+                    sh->hasRect[level] = rect != nullptr;
+                    if (rect) sh->rect[level] = *rect;
+                    if (rect && !read) sh->partial = true;
+                    done = true;
+                    sh->Touch();
+                    if (read) ++g_texShadowStats.shadowRead;
+                    else ++g_texShadowStats.shadowWrite;
+                }
+            }
+        }
+    }
+    if (!done) {
+        hr = g_TexLockRect_Original(tex, level, out, rect, flags);
+        if (sh && SUCCEEDED(hr)) {
+            sh->lock[level] = TexShadow::kReal;
+            if (!(flags & D3DLOCK_READONLY)) {  // la copia, se c'e', non e' piu' aggiornata
+                sh->valid[level] = false;
+                sh->written[level] = true;
+            }
+        }
+        if (flags & D3DLOCK_READONLY) ++g_texShadowStats.realRead;
+        else ++g_texShadowStats.realWrite;
+    }
+    if (sh) sh->Release();
+    g_texShadowStats.lockMs += ProfMs() - t0;
+    return hr;
+}
+
+void CheckShadowAddressSpace() {
+    const double mb = VirtualFreeMb();
+    const bool low = mb >= 0.0 && mb < kShadowLowAddressMb;
+    if (low != g_addressLow) {
+        g_addressLow = low;
+        char b[120];
+        std::snprintf(b, sizeof(b), "GPUSHARE: address space free %.0f MB: texture copies %s.", mb, low ? "being freed, no new ones" : "allowed again");
+        vr::log::Line(b);
+    }
+    if (low) EvictShadows(kShadowLowStepBytes);
+}
+
+HRESULT WINAPI Hooked_TexUnlockRect(IDirect3DTexture9* tex, UINT level) {
+    static uint32_t unlocks = 0;  // tutti: con lo spazio basso i lock sono veri, e lo stato deve poter tornare
+    if ((unlocks++ & 127u) == 0u) CheckShadowAddressSpace();
+    TexShadow* sh = level < kShadowMaxLevels ? ShadowOf(tex) : nullptr;
+    if (!sh || sh->lock[level] == TexShadow::kNone || sh->lock[level] == TexShadow::kReal) {
+        if (sh) {
+            sh->lock[level] = TexShadow::kNone;
+            sh->Release();
+        }
+        return g_TexUnlockRect_Original(tex, level);
+    }
+    const TexShadow::LockKind kind = sh->lock[level];
+    sh->lock[level] = TexShadow::kNone;
+    HRESULT hr = g_TexUnlockRect_Original(sh->sys, level);
+    if (kind == TexShadow::kShadowWrite && SUCCEEDED(hr)) {
+        const double t0 = ProfMs();
+        IDirect3DSurface9* src = nullptr;
+        IDirect3DSurface9* dst = nullptr;
+        IDirect3DDevice9* dev = nullptr;
+        HRESULT up = E_FAIL;
+        const RECT* r = sh->hasRect[level] ? &sh->rect[level] : nullptr;
+        if (SUCCEEDED(sh->sys->GetSurfaceLevel(level, &src)) && src && SUCCEEDED(tex->GetSurfaceLevel(level, &dst)) && dst && SUCCEEDED(tex->GetDevice(&dev)) && dev) {
+            POINT pt = {r ? r->left : 0, r ? r->top : 0};
+            up = dev->UpdateSurface(src, r, dst, r ? &pt : nullptr);
+        }
+        if (FAILED(up)) {
+            // Copia di riserva: il lock vero di prima.
+            ++g_texShadowStats.updateFails;
+            D3DSURFACE_DESC d = {};
+            tex->GetLevelDesc(level, &d);
+            static int logged = 0;
+            if (logged++ < 5) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "GPUSHARE: UpdateSurface failed hr=0x%08lX (%ux%u fmt %d level %u): copying with a real lock.", static_cast<unsigned long>(up), d.Width,
+                              d.Height, static_cast<int>(d.Format), level);
+                vr::log::Line(b);
+            }
+            D3DLOCKED_RECT from = {}, to = {};
+            bool copied = false;
+            if (SUCCEEDED(g_TexLockRect_Original(sh->sys, level, &from, r, D3DLOCK_READONLY))) {
+                if (SUCCEEDED(g_TexLockRect_Original(tex, level, &to, r, 0))) {
+                    uint32_t rows = 0, rowBytes = 0;
+                    LockExtent(d, r, &rows, &rowBytes);
+                    rowBytes = (std::min)(rowBytes, static_cast<uint32_t>((std::min)(from.Pitch, to.Pitch)));
+                    for (uint32_t y = 0; y < rows; ++y)
+                        std::memcpy(static_cast<char*>(to.pBits) + y * to.Pitch, static_cast<const char*>(from.pBits) + y * from.Pitch, rowBytes);
+                    g_TexUnlockRect_Original(tex, level);
+                    copied = true;
+                }
+                g_TexUnlockRect_Original(sh->sys, level);
+            }
+            if (!copied && logged <= 5) vr::log::Line("GPUSHARE: the real lock failed too: this texture level was not updated.");
+        }
+        if (src) src->Release();
+        if (dst) dst->Release();
+        if (dev) dev->Release();
+        sh->valid[level] = !sh->hasRect[level] || sh->valid[level];
+        sh->written[level] = true;
+        const double d = ProfMs() - t0;
+        ++g_texShadowStats.updates;
+        g_texShadowStats.updateMs += d;
+        if (d > g_texShadowStats.updateMax) g_texShadowStats.updateMax = d;
+    }
+    sh->Release();
+    if (static_cast<uint64_t>((std::max)(g_shadowBytes.load(), int64_t(0))) > kShadowLimitBytes) EvictShadows(0);
+    return hr;
+}
+
+std::string TexLockStatsLine() {
+    const TexLockStats2 s = g_texShadowStats;
+    g_texShadowStats = TexLockStats2();
+    if (!s.shadowRead && !s.shadowWrite && !s.realRead && !s.realWrite) return std::string();
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "TEXLOCKS (300 ticks): from memory read %u write %u, real read %u write %u; lock %.1f ms total; UpdateSurface %u, %.1f ms total, largest %.1f, failed %u; copies %.0f MB in %u textures, freed %u; address space free %.0f MB; CreateTexture %u, %.1f ms total, largest %.1f",
+                  s.shadowRead, s.shadowWrite, s.realRead, s.realWrite, s.lockMs, s.updates, s.updateMs, s.updateMax, s.updateFails,
+                  static_cast<double>(g_shadowBytes.load()) / (1024.0 * 1024.0), g_shadowCount.load(), g_shadowEvicted.load(), VirtualFreeMb(), g_createTexCount, g_createTexMs,
+                  g_createTexMax);
+    g_createTexCount = 0;
+    g_createTexMs = g_createTexMax = 0.0;
+    return b;
+}
+
+// Texture appena convertita: niente copie finche' non si blocca un livello.
+void AttachTexShadow(IDirect3DTexture9* tex) {
+    auto* sh = new TexShadow();
+    tex->SetPrivateData(kTexShadowGuid, static_cast<IUnknown*>(sh), sizeof(IUnknown*), D3DSPD_IUNKNOWN);
+    sh->Release();  // ora la tiene la texture
+}
+
 void InstallExResourceHooks(IDirect3DDevice9* device) {
+    {
+        IDirect3DTexture9* probe = nullptr;
+        if (SUCCEEDED(device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &probe, nullptr)) && probe) {
+            void* lockFn = VTableEntry(probe, 19);
+            void* unlockFn = VTableEntry(probe, 20);
+            // Prima lo sblocco: da solo non fa niente, mentre il lock senza lo sblocco lascerebbe le texture vuote.
+            const bool ok = MH_CreateHook(unlockFn, reinterpret_cast<void*>(&Hooked_TexUnlockRect), reinterpret_cast<void**>(&g_TexUnlockRect_Original)) == MH_OK &&
+                            MH_EnableHook(unlockFn) == MH_OK &&
+                            MH_CreateHook(lockFn, reinterpret_cast<void*>(&Hooked_TexLockRect), reinterpret_cast<void**>(&g_TexLockRect_Original)) == MH_OK &&
+                            MH_EnableHook(lockFn) == MH_OK;
+            vr::log::Line(std::string("GPUSHARE: texture lock hooks ") + (ok ? "installed." : "FAILED."));
+            probe->Release();
+        }
+    }
     struct H {
         int index;
         void* detour;

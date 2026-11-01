@@ -446,7 +446,7 @@ Useful offsets (`ue3.py props`):
   hook measures the deviation between the nominal ray (`m_aimAtPosition -
   Start`) and the received ray, and applies it around the barrel axis, scaled
   by `spread` (0..2, on = 1, off = 0) and by stance: sights at the eye (ADS)
-  0.1, two hands 0.5, a long gun in one hand 1.5 (not pistols); adjustable as
+  0.1, two hands 0.2 (0.5 until 1/11), a long gun in one hand 1.5 (not pistols); adjustable as
   `spread on <scale> <ads> <two hands> <one hand>`. Pass-through: the caller loops with the same End
   and a Start advanced past penetrable actors; a call with the same End within
   100 ms keeps the advanced Start and the corrected End (restarting from the
@@ -8072,6 +8072,184 @@ build, so every result below is on that dll.
     9 noise, 10 disarm and 11 corpses. Each item's own run already checked it on
     `cpTutorialFight` (sections above).
 
+## Micro-stutters on OpenXR: the shim mutex across `xrEndFrame` (1/11)
+
+Headset session on Virtual Desktop/VDXR at 120 Hz, after the walking jitter fixes below: jitter much better, but
+micro-lag. The object search was the suspect, and the log rules it out: props tick 0.18 ms on average, no object scan
+among the guilty sections of any `HITCH` line. Of 113 `HITCH` lines, 96 spent at least half the tick in `OpenXR lock
+wait on the game thread`; 35-45% of ticks waited over 1 ms (criterion: 1%), with peaks of 20-100 ms. The output thread
+held the shim's mutex across the eye copy and `xrEndFrame`, and the game thread takes that mutex about 30 times per
+tick. The fake runtime does not go through `vr_openxr.cpp`, so no bench saw this.
+
+- `EndFrameLocked` now releases the mutex during the eye copy and `xrEndFrame`. `endInFlight` covers that span:
+  swapchains and hand spaces destroyed meanwhile go to `retiredSwaps` / `retiredSpaces` and are closed at the end of
+  the frame, `PumpEvents` skips (no `xrEndSession` across `xrEndFrame`), `DestroyAll` waits for it (2 s at most).
+- Events skipped that way set `pumpPending`, and whoever closes the frame reads them: the only other reader polls every
+  500 ms, so a runtime that sits in `xrEndFrame` could have delayed `xrEndSession` and focus changes by seconds.
+- `DestroyAll` no longer clears `frameBegun`, and `frameSession` records the session a frame began in. Before, a frame
+  left open across a session restart made the output thread lock `frameMutex` a second time on itself. This path has
+  not been exercised: closing SteamVR during the test did not end the OpenXR session.
+- `xrendunlock off` restores the old behaviour live, for A/B in the headset.
+- `xrendstall <ms> <every N frames>` simulates a slow runtime (test command).
+- New log line every 10 s: `OPENXR: end of frame ... actions, eye copy, layers, xrEndFrame`.
+
+Real SteamVR compositor, null driver, walking, 25 ms stall every 30 frames, game-thread lock wait per tick: held p99
+26 ms, max 27 ms; released p99 0.1 ms, max 0.6 ms. That bench runs at 32 fps, so it proves the wait is gone, not the
+gain in tick times. Still to check on VDXR: whether the runtime blocks `xrLocateSpace` / `xrSyncActions` internally
+during `xrEndFrame` (it would show as `head tracking` with zero lock wait), and how often `xrEndFrame` itself takes
+long (a stall there still costs a frame in the headset).
+
+## Walking jitter, screen blood, window size, two hands (1/11)
+
+Tester reports: "when moving the jittering is unchanged" and "jitter on my arms/gun when turning or moving,
+solid 90 fps" (7800X3D + 5090), jitter on slopes, blood in front of the eyes, two-handed aim sometimes off,
+"Rendering thread exception" without the launch options, Steam Link loop on Linux.
+
+### Jitter: the causes, measured
+
+Bench: fake runtime 90 Hz (`runtime fake openxr 90 45`), Desert01, head and hands still, pad walking. New
+diagnostics: `tickprof N` (one `TICKP:` line per tick: raw and used time step, loop, world, mod, eyes; `RTP:` per
+pair on the render thread; `OUTP:` per submit), `rtsample <s>` (stack samples of the render thread, `RTS:` lines),
+`TEXLOCKS:` every 300 ticks; `HITCH:` lines now name the mod's sections over 1 ms and split world / loop.
+`rtdelay <ms>` busy-waits on the render thread at the start of each eye: the development PC finishes every frame long
+before the next tick, and several problems of a mid-range PC do not show without it. `thumbs N` saves a 64x64 thumbnail of
+each eye for N frames (`specopsvr_shots\thumbs.bin`: `[eye, pct, n, 0]` int32 + BGR): the only way to see a single wrong frame.
+
+1. **A full GObjects walk every 2 s on the game thread** (`InteractionScan`: class name of ~190,000 objects in one
+   tick): 14 ms here, 20-30 ms on the tester's PC, one frame lost every 2 s on every PC. Now in slices of 0.25 ms per
+   tick (a pass takes ~0.4 s), with the object kind cached per class. A new pawn (level change) drops the pass in progress
+   and the published list.
+2. **Texture locks stalled the render thread while walking.** D3D9Ex has no MANAGED pool, where `LockRect` only
+   touches the system-memory copy; the mod converted those textures to DEFAULT + DYNAMIC, so `LockRect` really locks
+   and NVIDIA's driver waits for its thread and the GPU (stack samples: `005E9886` -> d3d9 -> `nvd3dum` waiting). UE3's
+   texture streaming copies the shared mips from the old texture to the new one when the wanted mips change: ~150
+   read and ~150 write locks per second while walking, in bursts: the render thread stopped 3-6 ms (up to ~14), the game
+   thread with it, and the higher the GPU load the longer the wait: this is why fast PCs at high resolution saw 20-56 ms
+   ticks 3 times per second. Now every converted texture has a SYSTEMMEM texture with the same mip chain (`TexShadow`,
+   `texshadow`, attached with `SetPrivateData(D3DSPD_IUNKNOWN)` so it dies with the texture): locks go to it and
+   `UnlockRect` queues `UpdateSurface`. 300 ticks of walking: locks 60 ms -> 3 ms, `UpdateSurface` 0.3 ms in total,
+   98 MB of copies in 1982 textures (limit 700 MB, least recently used freed; then a real read lock, as before; below 350 MB
+   of free address space 64 MB are freed at a time and no new copies are made; textures written by rectangles, the
+   Scaleform fonts, are never freed: the rest of their levels exists only there; a whole-level write on a level whose copy was
+   freed takes the real lock, because it might update only a part of it). Nothing else locks these textures: a run with a
+   hook on `IDirect3DSurface9::LockRect` over three levels counted 229,000 surface locks, 0 on converted textures. Free address
+   space over the campaign: 1430 down to ~800 MB, the same with and without the copies (the game's own memory).
+3. **The game was paced only by the render thread's wait for the output thread**, which did not happen when the
+   same-tick GPU copy missed its budget (T/4 = 2.8 ms at 90 Hz, the copy took 2.4-2.9 ms): an extra tick started at once
+   (4-7 ms), a pair was thrown away and the phase of the tick against the vsync jumped by 4-7 ms: walking at 2 m/s the
+   world jumped 1-2 cm for a frame. Now: budget 0.6 T; a completed older pair goes to the output thread first and is
+   never replaced by a newer one while there is budget; `GateGameTick` starts each tick on the grid of the compositor
+   (blocked returns of `WaitGetPoses`; high-resolution waitable timer plus the last millisecond spinning, never `Sleep`). A
+   queue of one frame left by a compositor stall would keep one frame more of latency for ever: the tick skips one slot of the
+   grid (after 3 and 20 held ticks), so nothing is lost; a pair is dropped only if the queue is still there after 45. The render
+   thread waits for the GPU sleeping up to 70% of the usual time, then polling (it was spinning with a driver flush on every
+   pass), and for the output thread up to 3 periods (25-60 ms, it was 25 ms flat): a 30 ms stall let the game run free, threw
+   a pair away and the world jumped when it restarted (`fake hitch 30 2`: step max 9.5 -> 2.7 units, no pair lost). The
+   period is measured only when the compositor
+   is the limit (long wait against the step: half rate with SSW/ASW, a throttling runtime). When the game is the limit it is the
+   nominal one: measuring the game's own rate locked it at 11 fps after a load (tick held to the period, period held by the
+   tick; found by the final run, `recover.py`-style check: `fpscap 8/15/30/45` then free, back to 11.11 ms at once).
+4. **The world advanced by the real time between two ticks** while the headset shows frames at regular intervals: a
+   tick delayed 6 ms and recovered at the next one (no frame lost) moved the view 3.4 then 1 units instead of 2.2 and
+   2.2. Hook on `UGameEngine::Tick(float)` (0x007849F0, signature `EngineTick`): `vr::pure::GameClock` gives the world the
+   compositor period while the mean tick stays within 4% of it, whatever the delays. Real frames lost move the clock:
+   within 1.5 periods only a minimal recentring (0.3% of speed at the edge), beyond that it catches up by 10% of the excess
+   per tick; it never runs ahead of real time by more than those 1.5 periods. After a pause the step is the real one until two
+   ticks agree (8 at most, then the shortest); 3 much shorter or 6 much longer ticks in a row restart the mean. Without these the
+   end of a load (120, 100, 90, 60, 40, 11 ms) put the world 260 ms ahead and then in slow motion for half a second. Below
+   the refresh rate the step follows the mean tick. `smoothdt off` = old behaviour.
+5. **Every step of dynamic resolution cost a frame**: `scale set ScreenPercentage` (`FSystemSettings::Exec`, 0x006DA230) calls
+   `FlushRenderingCommands` (0x006B2300), writes the value (+0x360), saves the ini and dumps the settings to the log, all in the
+   middle of the tick: 12-13 ms, a 24 ms tick, and the value ended up in the game's settings (start at 65%, 21/10). The flush
+   cannot just go: the render thread reads the value again at the end of the frame (`NeedsUpscale` 0x00E2C2E0,
+   `UnScaleScreenCoords` 0x00AE4A10, from `FSceneRenderer::Render` and 0x00F2F850), and a frame built with the old value comes
+   out zoomed or in a box. A direct write without it looked perfect on the bench and on any screenshot, because here the
+   frame is always finished before the next tick; with `rtdelay 3` + `thumbs` both eyes showed one wrong frame at every step
+   (mean difference from the neighbours 12-15 of 255, against 1.3 for the change of sharpness). Now `UpdateDynamicResolution`
+   only asks, and `ApplyPendingScreenPercent` at the start of the next engine tick, before the gate, flushes and writes: that wait
+   is dead time, the finished frame goes to the headset anyway (towards the virtual screen it happens at once: the next draw is
+   already that one). Result: 0 wrong frames at `rtdelay` 0, 3 and 5; walking with a step every 0.5 s, `rtdelay` 0 and 2: no
+   repeated frame, world rms 0.001 (a lost frame per step before); a frame is lost only when the render thread is
+   near its budget. Nothing is saved in the game's ini any more.
+6. **The view height filter used real time** while the pawn now climbs by a fixed step: 15.7 + 6.5 ms ticks gave 0.74
+   and 0.31 units against 0.52 + 0.52, and the gun (which follows the pawn) jumped 0.6 units against the view. One filter
+   step per tick with the game's time step.
+
+| Walking, 90 Hz fake runtime, Desert01 | before | after |
+|---|---|---|
+| View step per vsync (p1 / p50 / p99 / max, units) | 1.0 / 2.18 / 3.3-4.3 / 4.4-5.0 | 2.18 / 2.18 / 2.18 / 2.19 |
+| World against an even motion, rms / max (units, ~cm) | 0.25-0.33 / 1.5-2.5 | 0.000-0.001 / 0.002-0.014 |
+| Ticks over 15 ms of 450 | 6-14 | 0-1 |
+| Tick time p99 | 15.4-16.7 ms | 11.6-11.7 ms |
+| Gun against the view, height step per frame p95 / p99 / max | 0.19 / 0.55 / 1.41 | 0.02 / 0.03 / 0.04 |
+| The same, walking on dunes (p99 / max) | 0.36 / 0.45 | 0.03 / 0.03 |
+| 72 Hz (OpenVR semantics): world rms / max | 0.30-0.34 / 1.8-2.1 | 0.003-0.007 / 0.02-0.08 |
+| 120 Hz (OpenXR): world rms / max | 0.16-0.20 / 1.2-1.5 | 0.000 / 0.002 |
+| Render thread +2 ms per eye: world rms / max | 0.29 / 1.69 | 0.000 / 0.001 |
+| Render thread +4 ms per eye (over budget): repeated frames of ~480, world rms | 55, 0.72 | 22, 0.43 |
+| Compositor stall 30 ms every 2 s: step max / pairs dropped | 9.5 / 3 | 2.7 / 0 |
+
+Below the refresh rate (`fpscap 80` on 90 Hz) repeated frames remain, one every 9: the compositor only reprojects
+rotation, so walking they show. Same before and after. Dynamic resolution, a lower headset rate or the runtime's frame
+synthesis are the answers there.
+
+### Screen blood
+
+`YFourthWallHealthFeedback` opens `uiscene_bloodHud_fast`: 8 panels (`Stage1` > `Image1`) along the edges whose opacity
+rises with the hits. They are not full-screen quads, so they went through the HUD matrix (`hud 0.3`): a hard-edged box
+near the centre of the view, in the UI's 16:9 band. `UpdateHitBlood` reads their rectangles (`UIObject.RenderBounds`
++0x298, every 30 ticks) and those draws use `g_canvasState.blood`: the full-view matrix of the eye with the 16:9 band
+stretched to the full height. **Basic > Blood on screen** (`hitblood off`) sets the game's own flag
+`YHUD.m_hideHitFeedbackScene` (+0x480 bit 8) every tick: the blood and the game's red arc towards the shooter go; the
+desaturation at low health stays. Per eye (thumbnails): the panels sit at infinite distance in the eye's own projection, so
+blood on the far left is on the temporal edge of the left eye and beyond the nasal limit of the right one, as a real object.
+Test: `ucall pawn TakeDamage 25 pc x,y,z 100,0,0 YDamageType_Melee` with God off (AddLocation alone shows nothing): off
+0% blood pixels, on 3.4% at the edge, 0% in the middle third.
+
+### Window size without launch options
+
+A tester without `-windowed ResX=2400 ResY=2500` had `Rendering thread exception: Fatal error! Address = 0x0`, gone
+with the window at the recommended size. The mod already added `-windowed` to the command line
+(`Hooked_GetCommandLineW`); now also `ResX=2400 ResY=2500` when neither is there. Not reproduced here (fake runtime, no
+launch options, current and fresh game config: no crash either way); with the change the device is created at 2400x2500
+like with the launch options.
+
+### Two-handed aim
+
+- Spread: `spread on 1 0.1 0.5 1.5` -> two hands 0.2 (configversion 14). M4 in a burst, cone with the 1.5 of one hand: p50 3.3-4.3,
+  p90 7, max 8.7 deg, so about 5.8 deg at 1: 0.5 gave up to 2.9 deg, over 1 m at 20 m from the green marker, at random; 0.2 gives 1.2
+  deg, ~40 cm (sights at the eye 0.1). Spread stays on: two hands is simply worth it now.
+- Filter of the line between the palms: 1 Hz / 9 Hz per m/s / derivative 1 Hz -> 4 Hz / 100 / 5 (`twohandsmooth 4`,
+  configversion 14). Simulation at 35.5 cm: correction of 1 deg in 0.15 s, 90% after 256 -> 133 ms; 10 deg flick, lag 2.6 -> 0.4
+  deg; tracking 20 deg/s, lag 0.6 -> 0.12 deg; still with 0.3 mm of noise 0.01 -> 0.02 deg rms (1 mm: 0.034 -> 0.08). The
+  one-hand barrel in the attribution keeps 1 Hz.
+- Grip closed = wide hold: full weight up to 20 cm (at the grip), none at 35 cm, hands apart 3.5 x (44 / 80 deg). Before, aiming
+  by moving only the left hand 12-15 cm handed the gun back to the right hand and released it, and with the grip closed it did not
+  take it again: a 20 deg jump in the middle of an aim. Without the grip the old 8 / 15 cm stay.
+- Tracking lost (`eTrackingResult` not `Running_OK`; OpenXR: position valid but not `TRACKED` is now
+  `Fallback_RotationOnly`), or the left pose invalid: during a hold the relation between the palms stays the last one captured
+  inside the grip, turning with the gun hand, for at most 1.5 s, and comes back over 0.2 s, also when tracking returns after the 1.5
+  s (the estimate may have drifted 10 cm). A tracked tick now and then does not extend it. A runtime that never says "tracked"
+  does not block anything. Before, an invalid pose released the grip at once in the middle of an aim.
+- Checked in the game with two hands engaged (`twofire.py`-style: `spread off`, left hand off the line by 3-5 cm): the barrel turns 5-8.6
+  deg and the shot stays on it within 0.043 deg; with `spread on 1 0.1 0.2 1.5` the cone is mean 0.57, max 1 deg.
+
+### Steam Link on Linux (Proton)
+
+Logs: RADV, PulseAudio, `vrlink`, Windows 10.0.19045 reported by Wine. `vrserver.exe` is a Linux process, invisible
+from Wine: "runtime gone" every 14 s, a reconnection each time (`Alive()` now needs it seen once), and with it the dashboard
+and focus lines. The focus line no longer says "another app": under Proton the pid is the game's own Linux pid. The log
+header names Wine/Proton. `specopsvr_hidevrserver` next to the dll tests the case on Windows: real SteamVR compositor with
+the null driver, 0 "runtime gone" with vrserver hidden. Not tried on Linux.
+
+### Not verified without a headset
+
+Everything above ran on the fake runtime, and on the real SteamVR compositor (OpenVR and its OpenXR, null driver: 31 fps throttle, no
+head motion, no controllers). To confirm in the headset: walking and turning on Link, Steam Link and VD at 72/90/120 Hz; `TEXLOCKS`
+and `HITCH` lines at high resolution; two hands on real controllers (the filter, the wide hold, the tracking flags of each runtime);
+the blood panels per eye.
+
+
 ## Issue #4 "jitterfest": posed submit when needed (29/10)
 
 Tester report (issue #4, also on Discord; the same tester's issue #2 had "camera
@@ -12622,6 +12800,8 @@ Write commands to `specopsvr_cmd.txt` next to the game (or use
   the game's pad polls, and an unfocused window stops polling the pad (25/10,
   two game copies: "pad polls per tick" 1.00 -> 0.00 and the simulated reload
   never reached "magazine inserted").
+- Jitter bench (1/11): `tickprof N` (`TICKP:`, `RTP:`, `OUTP:` lines), `rtsample <s>` (`RTS:` stack samples of the render thread),
+  `texshadow`, `smoothdt`, `specopsvr_hidevrserver`; see "Walking jitter, screen blood, window size, two hands (1/11)".
 - `tests/unit_tests.cpp` - offline tests of `src/pure_utils.h`
   (`cmake --build build --config Release --target unit_tests`, then
   `build\Release\unit_tests.exe`).

@@ -93,6 +93,11 @@ bool Patch(uintptr_t slot, const char* name, void* replacement, void** outOrigin
 // riga di comando con GetCommandLineW in WinMain: "-windowed" vince anche
 // sull'impostazione Fullscreen salvata dal gioco; un "-fullscreen" esplicito
 // diventa "-windowed".
+// 1/11: anche la dimensione. Un tester senza le opzioni di avvio del README
+// (-windowed ResX=2400 ResY=2500) aveva "Rendering thread exception: Fatal
+// error! Address = 0x0" e con la finestra alla risoluzione consigliata no: il
+// gioco partiva alla risoluzione salvata per il monitor. Ora, se mancano,
+// ResX e ResY ci sono comunque (poi AUTORES passa a quella del visore).
 typedef LPWSTR(WINAPI* GetCommandLineW_t)();
 GetCommandLineW_t g_GetCommandLineW_Real = nullptr;
 
@@ -107,6 +112,9 @@ LPWSTR WINAPI Hooked_GetCommandLineW() {
             lower.replace(at, fs.size(), L"-windowed  ");
         }
         if (lower.find(L"-windowed") == std::wstring::npos) s += L" -windowed";
+        if (lower.find(L"resx=") == std::wstring::npos && lower.find(L"resy=") == std::wstring::npos) {
+            s += L" ResX=2400 ResY=2500";
+        }
         return s;
     }();
     return &line[0];
@@ -484,8 +492,9 @@ void UnclampWindow(HWND window, int clientWidth, int clientHeight) {
     RECT r = {0, 0, clientWidth, clientHeight};
     AdjustWindowRectEx(&r, static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)), FALSE,
                        static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)));
-    g_SetWindowPos_Real(window, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
-                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    // Nullo se la patch dell'IAT e' stata rifiutata (voce gia' riscritta da altri).
+    (g_SetWindowPos_Real ? g_SetWindowPos_Real : &SetWindowPos)(window, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+                                                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     vr::log::Line("DISPLAY: window reported as client " + std::to_string(clientWidth) + "x" +
                   std::to_string(clientHeight) + " (was " + std::to_string(client.right - client.left) + "x" +
                   std::to_string(client.bottom - client.top) + ").");
@@ -540,7 +549,7 @@ void InstallDesktopSizeSpoof() {
           reinterpret_cast<void**>(&g_SetWindowPlacement_Real));
     if (Patch(kIatGetCommandLineW, "GetCommandLineW", reinterpret_cast<void*>(&Hooked_GetCommandLineW),
               reinterpret_cast<void**>(&g_GetCommandLineW_Real), "kernel32.dll"))
-        vr::log::Line("DISPLAY: game forced to windowed mode (-windowed on its command line; exclusive fullscreen "
+        vr::log::Line("DISPLAY: game forced to windowed mode (-windowed on its command line, and ResX=2400 ResY=2500 when the launch options give no size; exclusive fullscreen "
                       "breaks the GPU path and the headset resolution).");
     vr::log::Line(std::string("DISPLAY: desktop reported to the game >= ") + std::to_string(kMinWidth) + "x" +
                   std::to_string(kMinHeight) + (a && b ? " (active)" : " (NOT active)"));

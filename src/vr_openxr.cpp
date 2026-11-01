@@ -319,7 +319,15 @@ struct HandState {
 };
 
 struct State {
-    std::recursive_mutex mutex;  // tutto lo stato sotto; mai tenuto durante xrWaitFrame
+    std::recursive_mutex mutex;  // tutto lo stato sotto; mai tenuto durante xrWaitFrame, xrEndFrame e la copia degli occhi
+    // 1/11: fine del frame in corso (dalla presa degli occhi al ritorno di xrEndFrame), senza mutex per la parte lunga.
+    // Log di una sessione su VDXR: il 35-45% dei tick del gioco aspettava il mutex oltre 1 ms, picchi di 20-100 ms.
+    // Finche' e' vero, swapchain e spazi citati dai layer non si distruggono (vanno in retired*, chiusi a fine frame) e
+    // gli eventi non si leggono (xrEndSession non deve incrociare xrEndFrame). Si scrive sotto mutex.
+    std::atomic<bool> endInFlight{false};
+    // Eventi saltati per endInFlight: l'unico lettore passa ogni 500 ms (MonitorLoop), li legge chi chiude il frame.
+    std::atomic<bool> pumpPending{false};
+    std::vector<XrSpace> retiredSpaces;
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
@@ -372,6 +380,7 @@ struct State {
     std::mutex frameMutex;
     bool frameBegun = false;
     DWORD frameOwner = 0;
+    XrSession frameSession = XR_NULL_HANDLE;  // sessione in cui il frame aperto e' iniziato
     double frameBeginMs = 0.0, lastEndMs = 0.0;
     XrFrameState frameState = {};
     XrTime lastPredicted = 0;
@@ -379,6 +388,7 @@ struct State {
     unsigned frames = 0, eyeFrames = 0, keepalives = 0;
     // Occhi.
     Swap eye[2];
+    std::vector<Swap> retiredSwaps;  // vedi endInFlight
     struct EyeSubmit {
         ID3D11Texture2D* tex = nullptr;
         vr::VRTextureBounds_t bounds = {0, 0, 1, 1};
@@ -492,7 +502,10 @@ AimMeasure g_aimMeasure[2];
 bool CreateHandSpaces() {
     for (int h = 0; h < 2; ++h) g_aimMeasure[h].ResetSpace();  // spazio della mano nuovo (openxrgrip): si rimisura
     for (int h = 0; h < 2; ++h) {
-        if (g.handSpace[h]) fn.xrDestroySpace(g.handSpace[h]);
+        if (g.handSpace[h]) {
+            if (g.endInFlight.load()) g.retiredSpaces.push_back(g.handSpace[h]);  // un layer puo' citarlo
+            else fn.xrDestroySpace(g.handSpace[h]);
+        }
         g.handSpace[h] = XR_NULL_HANDLE;
         XrActionSpaceCreateInfo ci = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
         ci.action = g.action[h][kActPose];
@@ -674,6 +687,16 @@ void DestroySwap(Swap& s) {
     s.images.clear();
     if (s.sc) fn.xrDestroySwapchain(s.sc);
     s = Swap();
+}
+
+// Da un thread che non chiude il frame (sotto g.mutex): con xrEndFrame in corso la swapchain puo' essere in un layer.
+void RetireSwap(Swap& s) {
+    if (g.endInFlight.load()) {
+        if (s.sc) g.retiredSwaps.push_back(s);
+        s = Swap();
+    } else {
+        DestroySwap(s);
+    }
 }
 
 bool EnsureSwap(Swap& s, uint32_t w, uint32_t h, int64_t fmt) {
@@ -1379,6 +1402,8 @@ void UploadOverlays() {
     }
 }
 
+void PumpEvents();
+
 // Con g.frameMutex preso: xrWaitFrame + xrBeginFrame e viste del frame.
 bool WaitFrameLocked() {
     XrFrameWaitInfo wi = {XR_TYPE_FRAME_WAIT_INFO};
@@ -1399,6 +1424,7 @@ bool WaitFrameLocked() {
     g.lastPredicted = fs.predictedDisplayTime;
     g.lastPeriod = fs.predictedDisplayPeriod;
     g.frameBegun = true;
+    g.frameSession = g.session;
     g.frameOwner = GetCurrentThreadId();
     g.frameBeginMs = QpcMs();
     if (!g.extRefreshRate && fs.predictedDisplayPeriod > 0) g.hz = static_cast<float>(1e9 / fs.predictedDisplayPeriod);
@@ -1442,8 +1468,24 @@ void EndFrameLocked(bool newEyes) {
     std::vector<XrCompositionLayerQuad> quads;
     std::vector<OverlayItem*> ovs;
     XrTime display = 0;
+    XrSession session = XR_NULL_HANDLE;
+    State::EyeSubmit eyes[2];
+    bool writeEyes = false;
+    // xrendunlock off: come prima, mutex tenuto per tutta la fine del frame (recursive, i blocchi sotto restano validi).
+    std::unique_lock<std::recursive_mutex> wholeEnd(g.mutex, std::defer_lock);
+    if (!vr::control::g_xrEndUnlocked.load()) wholeEnd.lock();
+    const double tStart = QpcMs();
     {
         std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        session = g.session;
+        if (!session || session != g.frameSession) {  // sessione chiusa o rifatta (DestroyAll) con il frame aperto: non c'e' niente da chiudere
+            g.frameBegun = false;
+            g.frameOwner = 0;
+            g.submit[0].set = g.submit[1].set = false;
+            if (wholeEnd.owns_lock()) wholeEnd.unlock();
+            g.frameMutex.unlock();
+            return;
+        }
         display = g.frameState.predictedDisplayTime;
         // Overscan acceso/spento con "submitpose": il mod ricalcola la proiezione.
         if (g.overscan != vr::control::g_submitWithPose.load()) {
@@ -1462,14 +1504,33 @@ void EndFrameLocked(bool newEyes) {
             vr::log::Line("OPENXR: overscan " + std::to_string(g.overscanDeg) + " deg per side.");
         }
         SyncActions(false);
-        if (newEyes && g.submit[0].set && g.submit[1].set && g.eyeFormat) {
-            bool ok = true;
-            for (int e = 0; e < 2 && ok; ++e) {
-                State::EyeSubmit& s = g.submit[e];
-                D3D11_TEXTURE2D_DESC d;
-                s.tex->GetDesc(&d);
-                ok = EnsureSwap(g.eye[e], d.Width, d.Height, g.eyeFormat) && WriteSwap(g.eye[e], s.tex, nullptr, 0);
-                if (!ok) break;
+        writeEyes = newEyes && g.submit[0].set && g.submit[1].set && g.eyeFormat;
+        if (writeEyes) {
+            eyes[0] = g.submit[0];
+            eyes[1] = g.submit[1];
+        }
+        g.submit[0].set = g.submit[1].set = false;
+        g.endInFlight = true;
+    }
+    const double tSync = QpcMs();
+    // Copia negli occhi senza mutex: xrWaitSwapchainImage puo' aspettare il runtime. g.eye lo tocca solo chi tiene il
+    // frame (DestroyAll aspetta endInFlight); g.ctx e' protetto da ID3D11Multithread.
+    bool eyesOk = false;
+    D3D11_TEXTURE2D_DESC eyeDesc[2] = {};
+    if (writeEyes) {
+        eyesOk = true;
+        for (int e = 0; e < 2 && eyesOk; ++e) {
+            eyes[e].tex->GetDesc(&eyeDesc[e]);
+            eyesOk = EnsureSwap(g.eye[e], eyeDesc[e].Width, eyeDesc[e].Height, g.eyeFormat) && WriteSwap(g.eye[e], eyes[e].tex, nullptr, 0);
+        }
+    }
+    const double tEyes = QpcMs();
+    {
+        std::lock_guard<std::recursive_mutex> lock(g.mutex);
+        if (eyesOk) {
+            for (int e = 0; e < 2; ++e) {
+                const State::EyeSubmit& s = eyes[e];
+                const D3D11_TEXTURE2D_DESC& d = eyeDesc[e];
                 XrCompositionLayerProjectionView& pv = g.projViews[e];
                 pv = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
                 pv.subImage.swapchain = g.eye[e].sc;
@@ -1490,13 +1551,10 @@ void EndFrameLocked(bool newEyes) {
                 // piccola, salto di scala entrando e uscendo dal cannocchiale.
                 if (g.renderFovValid) pv.fov = g.renderFov[e];
             }
-            if (ok) {
-                g.projValid = true;
-                g.projMs = QpcMs();
-                ++g.eyeFrames;
-            }
+            g.projValid = true;
+            g.projMs = QpcMs();
+            ++g.eyeFrames;
         }
-        g.submit[0].set = g.submit[1].set = false;
         UpdatePointer(display);
         UploadOverlays();
         if (g.projValid && QpcMs() - g.projMs < 500.0 && g.eye[0].released && g.eye[1].released) {
@@ -1547,15 +1605,22 @@ void EndFrameLocked(bool newEyes) {
         }
         for (auto& q : quads) layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&q));
     }
-    // Sotto g.mutex anche xrEndFrame: nessun overlay (e la sua swapchain) puo'
-    // sparire mentre il layer lo cita.
-    std::unique_lock<std::recursive_mutex> endLock(g.mutex);
+    const double tCompose = QpcMs();
+    // Stallo simulato del runtime (xrendstall <ms> <ogni N frame>, collaudo: il fake runtime non passa da qui).
+    if (const int stall = vr::control::g_xrEndStallMs.load(); stall > 0) {
+        static unsigned stallCount = 0;
+        if (++stallCount % static_cast<unsigned>((std::max)(1, vr::control::g_xrEndStallEvery.load())) == 0) Sleep(static_cast<DWORD>(stall));
+    }
+    // xrEndFrame senza mutex: VDXR ci resta anche decine di ms e il thread di gioco non deve aspettarlo. I layer citano
+    // swapchain e spazi tenuti vivi da endInFlight; projViews lo scrive solo chi tiene il frame.
     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
     ei.displayTime = display;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = static_cast<uint32_t>(layers.size());
     ei.layers = layers.data();
-    XrResult r = fn.xrEndFrame(g.session, &ei);
+    XrResult r = fn.xrEndFrame(session, &ei);
+    const double tEnd = QpcMs();
+    std::unique_lock<std::recursive_mutex> endLock(g.mutex);
     if (XR_FAILED(r)) {
         static double lastLog = 0.0;
         if (QpcMs() - lastLog > 5000.0) {
@@ -1565,9 +1630,39 @@ void EndFrameLocked(bool newEyes) {
         if (r == XR_ERROR_SESSION_LOST || r == XR_ERROR_INSTANCE_LOST) g.dead = true;
     }
     {
+        for (Swap& dead : g.retiredSwaps) DestroySwap(dead);
+        g.retiredSwaps.clear();
+        for (XrSpace dead : g.retiredSpaces) fn.xrDestroySpace(dead);
+        g.retiredSpaces.clear();
+        g.endInFlight = false;
         g.frameBegun = false;
         g.frameOwner = 0;
         g.lastEndMs = QpcMs();
+        // Dove va il tempo della fine del frame (chi tiene il frame, un thread alla volta): riga ogni 10 s.
+        static struct EndStats {
+            double sum[4] = {}, top[4] = {};
+            unsigned n = 0;
+            double logMs = 0.0;
+        } st;
+        const double part[4] = {tSync - tStart, tEyes - tSync, tCompose - tEyes, tEnd - tCompose};
+        for (int i = 0; i < 4; ++i) {
+            st.sum[i] += part[i];
+            st.top[i] = (std::max)(st.top[i], part[i]);
+        }
+        ++st.n;
+        const double nowMs = QpcMs();
+        if (st.logMs <= 0.0) st.logMs = nowMs;
+        if (nowMs - st.logMs >= 10000.0) {
+            char sb[300];
+            std::snprintf(sb, sizeof(sb),
+                          "OPENXR: end of frame over %.0f s, %u frames, mean/max ms: actions %.2f/%.1f, eye copy %.2f/%.1f, layers %.2f/%.1f, "
+                          "xrEndFrame %.2f/%.1f (mutex %s)",
+                          (nowMs - st.logMs) * 0.001, st.n, st.sum[0] / st.n, st.top[0], st.sum[1] / st.n, st.top[1], st.sum[2] / st.n,
+                          st.top[2], st.sum[3] / st.n, st.top[3], vr::control::g_xrEndUnlocked.load() ? "released" : "held");
+            vr::log::Line(sb);
+            st = EndStats();
+            st.logMs = nowMs;
+        }
         if (g.frames == 1 || g.frames % 600 == 0) {
             char b[240];
             std::snprintf(b, sizeof(b), "OPENXR: frame %u: %u with eyes, %u keepalive, %u layers, state %d, hands %c%c, %.0f Hz.",
@@ -1576,7 +1671,10 @@ void EndFrameLocked(bool newEyes) {
             vr::log::Line(b);
         }
     }
+    // Nessun frame aperto e nessun xrEndFrame in corso: il punto sicuro anche per xrEndSession.
+    if (g.pumpPending.exchange(false)) PumpEvents();
     endLock.unlock();
+    if (wholeEnd.owns_lock()) wholeEnd.unlock();
     g.frameMutex.unlock();
 }
 
@@ -1668,6 +1766,10 @@ void OnSessionState(XrSessionState s) {
 
 void PumpEvents() {
     if (!g.instance) return;
+    if (g.endInFlight.load()) {  // xrEndSession non incrocia xrEndFrame: li legge chi chiude il frame
+        g.pumpPending = true;
+        return;
+    }
     XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
     while (fn.xrPollEvent(g.instance, &ev) == XR_SUCCESS) {
         switch (ev.type) {
@@ -1729,9 +1831,19 @@ void DestroyAll() {
     g.stop = true;
     if (g.keepalive.joinable()) g.keepalive.join();
     g.stop = false;
-    std::lock_guard<std::recursive_mutex> lock(g.mutex);
+    std::unique_lock<std::recursive_mutex> lock(g.mutex);
+    // Fine del frame in corso sull'altro thread: i suoi layer citano le swapchain (attesa limitata, runtime bloccato).
+    for (int i = 0; g.endInFlight.load() && i < 2000; ++i) {
+        lock.unlock();
+        Sleep(1);
+        lock.lock();
+    }
     g.running = false;
     g.focused = false;
+    for (Swap& dead : g.retiredSwaps) DestroySwap(dead);
+    g.retiredSwaps.clear();
+    for (XrSpace dead : g.retiredSpaces) fn.xrDestroySpace(dead);
+    g.retiredSpaces.clear();
     for (auto& kv : g.overlays) {
         DestroySwap(kv.second.swap);
         if (kv.second.tex) kv.second.tex->Release();
@@ -1763,7 +1875,9 @@ void DestroyAll() {
     g.instance = XR_NULL_HANDLE;
     g.system = XR_NULL_SYSTEM_ID;
     g.state = XR_SESSION_STATE_UNKNOWN;
-    g.frameBegun = false;
+    // frameBegun resta: chi ha il frame aperto tiene g.frameMutex e lo rilascia solo in EndFrameLocked (che vede la
+    // sessione cambiata). Azzerato qui, al riavvio della sessione quel thread si bloccava su se stesso in BeginFrameForCaller.
+    g.pumpPending = false;
     g.frameViewsValid = g.eyeInHeadValid = false;
     g.events.clear();
     g.ham[0].clear();
@@ -1928,7 +2042,7 @@ void SystemShim::GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin, fl
     TimedLock lock;
     if (!g.running) return;
     XrTime t = Now() + static_cast<XrTime>(predictSec * 1e9f);
-    auto fill = [&](XrSpace space, vr::TrackedDevicePose_t* p) {
+    auto fill = [&](XrSpace space, vr::TrackedDevicePose_t* p, bool isHand) {
         if (!space) return;
         XrSpaceVelocity vel = {XR_TYPE_SPACE_VELOCITY};
         XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
@@ -1938,7 +2052,10 @@ void SystemShim::GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin, fl
                   (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
         p->bDeviceIsConnected = true;
         p->bPoseIsValid = ok;
-        p->eTrackingResult = ok ? vr::TrackingResult_Running_OK : vr::TrackingResult_Running_OutOfRange;
+        // Controller con la posizione valida ma non tracciata (stimata: coperto dall'altro): come il fallback di SteamVR.
+        p->eTrackingResult = !ok ? vr::TrackingResult_Running_OutOfRange
+                             : (!isHand || (loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT)) ? vr::TrackingResult_Running_OK
+                                                                                                         : vr::TrackingResult_Fallback_RotationOnly;
         if (!ok) return;
         p->mDeviceToAbsoluteTracking = FromPose(loc.pose);
         if (vel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)
@@ -1946,7 +2063,7 @@ void SystemShim::GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin, fl
         if (vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)
             p->vAngularVelocity = {vel.angularVelocity.x, vel.angularVelocity.y, vel.angularVelocity.z};
     };
-    fill(g.view, &poses[kHmd]);
+    fill(g.view, &poses[kHmd], false);
     for (int h = 0; h < 2; ++h) {
         vr::TrackedDeviceIndex_t idx = h == 0 ? kLeft : kRight;
         if (idx >= count) break;
@@ -1954,7 +2071,7 @@ void SystemShim::GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin, fl
             poses[idx].bDeviceIsConnected = g.hand[h].connected;
             continue;
         }
-        fill(g.handSpace[h], &poses[idx]);
+        fill(g.handSpace[h], &poses[idx], true);
     }
 }
 
@@ -2301,7 +2418,7 @@ vr::EVROverlayError OverlayShim::CreateOverlay(const char* key, const char* name
 
 vr::EVROverlayError OverlayShim::DestroyOverlay(vr::VROverlayHandle_t h) {
     OV_LOCK_FIND(h);
-    DestroySwap(o->swap);
+    RetireSwap(o->swap);
     if (o->tex) o->tex->Release();
     g.overlays.erase(h);
     return vr::VROverlayError_None;
@@ -2520,7 +2637,7 @@ vr::EVROverlayError OverlayShim::ClearOverlayTexture(vr::VROverlayHandle_t h) {
     o->tex = nullptr;
     o->pixels.clear();
     o->pixW = o->pixH = 0;
-    DestroySwap(o->swap);
+    RetireSwap(o->swap);
     return vr::VROverlayError_None;
 }
 vr::EVROverlayError OverlayShim::SetOverlayRaw(vr::VROverlayHandle_t h, void* buf, uint32_t w, uint32_t h2, uint32_t bpp) {

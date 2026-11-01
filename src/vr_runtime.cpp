@@ -94,6 +94,15 @@ bool OpenVrInit(vr::EVRApplicationType type, std::string* error) {
 
 // vrserver.exe in esecuzione (per accorgersi di SteamVR morto senza evento).
 bool VrServerRunning() {
+    // Collaudo del caso Proton (vrserver e' un processo Linux, invisibile da Wine): file accanto alla dll.
+    static const bool hidden = [] {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string flag = exe;
+        flag = flag.substr(0, flag.find_last_of("\\/")) + "\\specopsvr_hidevrserver";
+        return GetFileAttributesA(flag.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }();
+    if (hidden) return false;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return true;  // nel dubbio: vivo
     PROCESSENTRY32W e = {sizeof(e)};
@@ -251,7 +260,18 @@ void Shutdown() {
 bool Alive() {
     if (g_active == Backend::OpenXR) return vr::xr::Alive();
     if (g_active == Backend::Fake) return vr::fake::Alive();
-    return VrServerRunning();
+    // Sotto Proton vrserver e' un processo Linux, invisibile da Wine (31/10, Steam
+    // Link su Linux): "runtime gone" falso e riconnessione ogni 14 s. Il controllo
+    // vale solo se il processo si e' visto almeno una volta; altrimenti resta
+    // l'evento di uscita di SteamVR.
+    static bool seen = false, reported = false;
+    const bool running = VrServerRunning();
+    if (running) seen = true;
+    if (!seen && !reported) {
+        reported = true;
+        vr::log::Line("OpenVR: vrserver.exe not visible from this process (Proton/Wine?): relying on SteamVR's quit event.");
+    }
+    return running || !seen;
 }
 
 // OpenXR e il runtime finto non hanno applicazioni "Background".

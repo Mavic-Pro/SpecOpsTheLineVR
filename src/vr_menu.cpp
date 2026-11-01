@@ -71,6 +71,7 @@ std::vector<Item> BasicItems() {
         {"snapturn", "Turning", "0 = smooth turning with the right stick, 30/45 = snap turns in degrees.", Kind::Choice, {"0", "30", "45"}},
         {"vignette", "Comfort vignette", "Darkens the edges while moving: 0 off, 0.5 light, 1 strong.", Kind::Choice, {"0", "0.5", "1"}},
         {"hud", "HUD size", "Scale of the game's HUD (ammo, objectives) towards the centre of your view: lower = ammo and weapon icons closer to the centre, easier to see, but smaller.", Kind::Choice, {"0.25 100", "0.3 100", "0.35 100", "0.4 100", "0.5 100", "0.6 100"}},
+        {"hitblood", "Blood on screen", "When you are hit: blood at the edges of your view and a red arc showing where the hit came from. Off = neither; your view still loses its colour when your health is low.", Kind::OnOff},
         {"fpbody", "Walker's body", "full = Walker's body under you, his eyes on yours and his neck under your neck; arms = only his arms, hands and gun (torso and legs hidden).", Kind::Choice, {"full", "arms"}},
         // Review 2 del follow-up (27/10): il corpo che torna sotto la testa cambia cio' che il corpo fa dopo ogni sguardo: Basic.
         {"bodyalign", "Body under the head", "Seconds your head must stay still before Walker's body turns back under it, so looking down shows your chest, not his shoulder (0 = off: it can stay up to 45 deg off). Only with tracked controllers; it waits while you aim or near a wall.", Kind::Choice, {"0", "0.4", "1"}},

@@ -9,4 +9,9 @@ namespace vr::screenshot {
 // a schermo intero esclusivo (a differenza di una cattura del desktop).
 bool SaveBackBuffer(IDirect3DDevice9* device, const std::string& path);
 
+// Collaudo: miniatura di ogni occhio a ogni frame per N frame ("thumbs N"), su file alla fine.
+void StartThumbs(int frames, const std::string& path);
+bool ThumbsActive();
+void ThumbFrame(IDirect3DDevice9* device, int eye, int pct);  // in Present, thread di rendering
+
 }  // namespace vr::screenshot

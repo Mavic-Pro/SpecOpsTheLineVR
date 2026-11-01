@@ -1,6 +1,7 @@
 #include "screenshot.h"
 #include "logger.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -115,6 +116,74 @@ bool SaveBackBuffer(IDirect3DDevice9* device, const std::string& path) {
     SafeRelease(resolved);
     SafeRelease(backBuffer);
     return ok;
+}
+
+// "thumbs N": miniatura di ogni occhio a ogni frame, quello che va al visore (1/11). Un frame sbagliato per una sola
+// volta (occhio zoomato a un cambio di ScreenPercentage) non si vede da nessun'altra misura ne' da uno "shot".
+// In memoria durante la cattura, su file alla fine: [eye, pct, n, 0] int32 + kThumbW*kThumbH*3 byte BGR, per frame.
+namespace {
+constexpr int kThumbW = 64, kThumbH = 64;
+std::atomic<int> g_thumbsLeft{0};
+std::string g_thumbsPath;
+std::vector<uint8_t> g_thumbs;
+int g_thumbCount = 0;
+IDirect3DSurface9* g_thumbRt = nullptr;
+IDirect3DSurface9* g_thumbSys = nullptr;
+}  // namespace
+
+void StartThumbs(int frames, const std::string& path) {
+    if (g_thumbsLeft.load() > 0 || frames <= 0) return;
+    g_thumbsPath = path;
+    g_thumbsLeft = frames;
+}
+
+bool ThumbsActive() { return g_thumbsLeft.load(std::memory_order_relaxed) > 0; }
+
+void ThumbFrame(IDirect3DDevice9* device, int eye, int pct) {
+    if (!g_thumbRt) {
+        if (FAILED(device->CreateRenderTarget(kThumbW, kThumbH, D3DFMT_X8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &g_thumbRt, nullptr)) ||
+            FAILED(device->CreateOffscreenPlainSurface(kThumbW, kThumbH, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &g_thumbSys, nullptr))) {
+            vr::log::Line("THUMBS: could not create the surfaces.");
+            SafeRelease(g_thumbSys);
+            SafeRelease(g_thumbRt);
+            g_thumbsLeft = 0;
+            return;
+        }
+        g_thumbs.clear();
+        g_thumbCount = 0;
+    }
+    IDirect3DSurface9* backBuffer = nullptr;
+    D3DLOCKED_RECT lr;
+    if (SUCCEEDED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) &&
+        SUCCEEDED(device->StretchRect(backBuffer, nullptr, g_thumbRt, nullptr, D3DTEXF_LINEAR)) &&
+        SUCCEEDED(device->GetRenderTargetData(g_thumbRt, g_thumbSys)) &&
+        SUCCEEDED(g_thumbSys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+        const int32_t head[4] = {eye, pct, g_thumbCount, 0};
+        const auto* hb = reinterpret_cast<const uint8_t*>(head);
+        g_thumbs.insert(g_thumbs.end(), hb, hb + sizeof(head));
+        for (int y = 0; y < kThumbH; ++y) {
+            const uint8_t* row = static_cast<const uint8_t*>(lr.pBits) + static_cast<size_t>(y) * lr.Pitch;
+            for (int x = 0; x < kThumbW; ++x) {
+                g_thumbs.push_back(row[x * 4]);
+                g_thumbs.push_back(row[x * 4 + 1]);
+                g_thumbs.push_back(row[x * 4 + 2]);
+            }
+        }
+        g_thumbSys->UnlockRect();
+        ++g_thumbCount;
+    }
+    SafeRelease(backBuffer);
+    if (g_thumbsLeft.fetch_sub(1) == 1) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, g_thumbsPath.c_str(), "wb") == 0 && f) {
+            fwrite(g_thumbs.data(), 1, g_thumbs.size(), f);
+            fclose(f);
+        }
+        vr::log::Line("THUMBS: " + std::to_string(g_thumbCount) + " frames saved: " + g_thumbsPath);
+        std::vector<uint8_t>().swap(g_thumbs);
+        SafeRelease(g_thumbSys);
+        SafeRelease(g_thumbRt);
+    }
 }
 
 }  // namespace vr::screenshot

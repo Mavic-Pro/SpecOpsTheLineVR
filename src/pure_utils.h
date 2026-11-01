@@ -4476,4 +4476,91 @@ inline float XfMoveAt(const Xf& m, const float p[3]) {
 }
 }  // namespace ue3m
 
+// Orologio del gioco (1/11; tester 7800X3D + 5090 "when moving the jittering is unchanged", arma che
+// trema a 90 fps stabili). UE3 fa avanzare il mondo del tempo vero fra due tick, ma il visore mostra i
+// frame a intervalli regolari: basta che un tick parta 6 ms piu' tardi (attesa del thread di rendering,
+// poi recuperata al tick dopo, nessun frame perso) e la vista avanza di 3,4 e poi 1 unita' invece di
+// 2,2 e 2,2: il mondo vicino salta di ~1 cm avanti e indietro. Qui il mondo avanza al passo del visore:
+// passo uguale finche' il gioco tiene la frequenza, a qualunque ritardo recuperato; i soli frame persi
+// davvero spostano l'orologio, recuperato piano (qualche % di velocita', invisibile) invece che con
+// un salto. Sotto la frequenza del visore il passo segue la media dei tick.
+struct GameClock {
+    bool valid = false;
+    double est = 0.0;  // periodo medio del tick (s)
+    double lag = 0.0;  // tempo vero non ancora dato al gioco (s)
+    double last = 0.0, least = 0.0;  // dopo una pausa, prima della media
+    int warm = 0;
+    int shortRun = 0, longRun = 0;  // tick di fila lontani dalla media
+
+    void Reset() {
+        valid = false;
+        warm = 0;
+        lag = 0.0;
+        shortRun = longRun = 0;
+    }
+
+    // raw = dt del motore (s); headsetPeriod = periodo del visore (s, 0 = sconosciuto).
+    float Step(float raw, float headsetPeriod) {
+        // Caricamenti, pausa lunga, finestra bloccata: com'e' (e si riparte).
+        if (!(raw > 0.0f) || raw > 0.25f) {
+            Reset();
+            return raw;
+        }
+        if (!valid) {
+            // Dopo una pausa il passo e' quello vero finche' due tick di fila non dicono lo stesso periodo (al massimo 8,
+            // poi il piu' corto). Il primo tick puo' essere lungo (fine del caricamento, salvataggio): preso come media dava
+            // al mondo quel passo sui tick normali seguenti, 110 + 98 ms a 11 ms reali e poi rallentatore per 2 s.
+            const double r = raw;
+            least = warm > 0 ? (std::min)(least, r) : r;
+            const bool agree = warm > 0 && std::fabs(r - last) < 0.3 * last;
+            if (agree || warm >= 8) {
+                valid = true;
+                est = agree ? r : least;
+                lag = 0.0;
+                warm = 0;
+            } else {
+                last = r;
+                ++warm;
+            }
+            return raw;
+        }
+        // Cambio di regime: tick di fila lontani dalla media (3 molto piu' corti, 6 molto piu' lunghi: 25 + 3 + 5 ms e tre
+        // frame persi non lo sono). La media lenta ci metteva un secondo, col mondo avanti o indietro di 200 ms.
+        if (raw < 0.6 * est) {
+            ++shortRun;
+            longRun = 0;
+        } else if (raw > 1.7 * est) {
+            ++longRun;
+            shortRun = 0;
+        } else {
+            shortRun = longRun = 0;
+        }
+        if (shortRun >= 3 || longRun >= 6) {
+            est = raw;
+            shortRun = longRun = 0;
+        }
+        // Media lenta: uno scatto da solo non la sposta oltre la finestra qui sotto.
+        const double clipped = (std::min)((std::max)(static_cast<double>(raw), est * 0.5), est * 1.5);
+        est += (clipped - est) * (1.0 - std::exp(-clipped / 0.33));
+        double base = est;
+        if (headsetPeriod > 0.0f && std::fabs(est - headsetPeriod) < 0.04 * headsetPeriod) base = headsetPeriod;
+        lag += raw;
+        const double over = lag - base;  // quello che resterebbe da dare dopo il passo normale
+        // Fascia morta di 1,5 periodi del visore: i ritardi recuperati non si vedono. Dentro, un recupero minimo (0,3% di
+        // velocita' al bordo) la tiene centrata: dopo un frame perso, o con un periodo vero appena diverso da quello
+        // dichiarato, resterebbe sul bordo e il ritardo seguente passerebbe.
+        const double unit = headsetPeriod > 0.0f ? (std::min)(base, static_cast<double>(headsetPeriod)) : base;
+        const double dead = 1.5 * unit;
+        double dt = base + over * 0.002;
+        if (over > dead) dt += (over - dead) * 0.1;  // indietro: si recupera piano
+        // Mai avanti al tempo vero oltre la fascia. Con la media ancora alta (fine di un caricamento: 90, 60, 40, 11 ms) il
+        // mondo andava avanti di 260 ms e poi al rallentatore per mezzo secondo.
+        dt = (std::min)(dt, lag + dead);
+        if (std::fabs(lag - dt) > 0.2) dt = lag;  // troppo lontano (serie di scatti lunghi): si riallinea
+        dt = (std::max)(dt, 0.25 * unit);
+        lag -= dt;
+        return static_cast<float>(dt);
+    }
+};
+
 }  // namespace vr::pure
